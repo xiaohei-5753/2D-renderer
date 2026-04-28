@@ -10,7 +10,6 @@ A lightweight, GPU-accelerated 2D ray tracer built with OpenGL compute shaders. 
 - **Semi-Transparent Materials** — Alpha-based light transmission with correct energy conservation
 - **Directional Sun Light** + **Ambient Wall Light** — Configurable direction, intensity, and color
 - **Pixel Self-Emission** — Each pixel can emit colored light independently
-- **Quadtree Acceleration** — Hierarchical spatial structure for CPU-side ray queries
 - **Configurable** — All rendering parameters via `cfg.txt`
 - **Interactive Paint Demo** — Brush, Line, Rectangle tools with 8 colors
 
@@ -105,7 +104,8 @@ User Draws → Canvas (CPU pixels)
         → Canvas edge: sun or wall light
       → Average all rays → mix with pixel color → output
   → renderDisplay() samples result via camera transform
-  → renderTextOverlay() via GDI+OpenGL hybrid
+  → [app] overlay.draw() renders GDI text overlay
+  → glfwSwapBuffers() presents frame
 ```
 
 ### Key Algorithms
@@ -115,7 +115,6 @@ User Draws → Canvas (CPU pixels)
 | Bresenham Circle | Shader `main()` | Generates 8R sample directions per pixel |
 | Bresenham Line | Shader `cR()` | Integer ray marching per direction |
 | Occupancy Skip | Shader `cR()` | Skips 4 empty pixels at once using occupancy texture |
-| Distance Transform | CPU `uploadCanvasTexture()` | Two-pass SDF computation for adaptive sampling (reserved) |
 
 ### Performance
 
@@ -150,7 +149,8 @@ E:\programming\CPP\2D-renderer\
 - **Compute Shader**: `#version 430 core`, workgroup size 8×8, renders into RGBA8 image
 - **No Blending**: Output is written directly to `u_out` image, then sampled by display shader
 - **Camera Model**: Orthographic with pan (arrow keys) and zoom (+/−)
-- **Text Overlay**: GDI rasterization → OpenGL texture → custom fragment shader
+- **Two-Layer Architecture**: `easy_renderer` is a standalone library; `paint_app.cpp` is the application layer (drawing, overlay, input)
+- **Text Overlay**: GDI rasterization → OpenGL texture → custom fragment shader (in paint_app.cpp)
 - **VSync**: Disabled for performance testing (`glfwSwapInterval(0)`)
 
 ## License

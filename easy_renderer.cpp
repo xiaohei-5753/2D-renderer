@@ -266,11 +266,17 @@ bool Canvas::rayTrace(int startX, int startY, int dirX, int dirY, int maxDist) c
 // Shader source codes (from original project)
 static const char* rayCompSrc = R"(#version 430 core
 layout(local_size_x = 8, local_size_y = 8) in;
-uniform sampler2D u_cc; uniform sampler2D u_cl;
+uniform sampler2D u_cc; uniform sampler2D u_cl; uniform sampler2D u_occ;
 uniform vec2 u_sd; uniform float u_ss;
 uniform vec3 u_sl; uniform vec3 u_wl;
 uniform int u_cr; uniform ivec2 u_cs; uniform float u_ep;
 layout(rgba8, binding = 0) writeonly uniform image2D u_out;
+
+// Occupancy check: 255 = has content, 0 = empty
+bool isEmptyRegion(ivec2 p) {
+    float occ = texelFetch(u_occ, p, 0).r;
+    return occ < 0.5;
+}
 
 vec3 cR(ivec2 o, ivec2 d) {
     vec3 light = vec3(0.0);
@@ -287,6 +293,19 @@ vec3 cR(ivec2 o, ivec2 d) {
             if (1.0 - dot(dn, u_sd) <= u_ss) light += trans * u_sl; else light += trans * u_wl;
             return light;
         }
+        
+        // Skip empty regions: advance 4 steps at once
+        if (isEmptyRegion(ivec2(x, y))) {
+            for (int s = 0; s < 4; s++) {
+                e2 = 2 * er;
+                if (e2 > -dy) { er -= dy; x += sx; }
+                if (e2 < dx) { er += dx; y += sy; }
+                if (x < 0 || x >= u_cs.x || y < 0 || y >= u_cs.y) break;
+                if (!isEmptyRegion(ivec2(x, y))) break;
+            }
+            continue;
+        }
+        
         vec4 c = texelFetch(u_cc, ivec2(x, y), 0);
         vec3 ref = texelFetch(u_cl, ivec2(x, y), 0).rgb;
         if (c.a >= 1.0) {
@@ -318,7 +337,7 @@ void main() {
         x++; if (m < 0) m += 2 * x + 1; else { y--; m += 2 * (x - y) + 1; }
     }
     a /= float(cnt);
-    // Self light (pixel's own emission) - NOT scaled by (1-alpha) to avoid double-scaling
+    // Self light (pixel's own emission)
     vec3 selfLight = texelFetch(u_cl, p, 0).rgb;
     a += selfLight;
     a = max(a, vec3(0.0));
@@ -418,7 +437,7 @@ bool Renderer::initGL() {
     }
     
     glfwMakeContextCurrent(window_);
-    glfwSwapInterval(1);
+    glfwSwapInterval(0);  // No VSync for performance testing
     
     // Set user pointer for callbacks
     glfwSetWindowUserPointer(window_, this);
@@ -677,6 +696,10 @@ void Renderer::renderRayTrace() {
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, cvsLightTex_);
     glUniform1i(glGetUniformLocation(rayProg_, "u_cl"), 1);
+    
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, cvsOccuTex_);
+    glUniform1i(glGetUniformLocation(rayProg_, "u_occ"), 2);
     
     glUniform2f(glGetUniformLocation(rayProg_, "u_sd"), (float)sunDirX, (float)sunDirY);
     glUniform1f(glGetUniformLocation(rayProg_, "u_ss"), sunSc);

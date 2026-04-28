@@ -289,4 +289,4 @@ See [`API.md`](API.md) for the complete library API documentation (bilingual CN/
 
 ## License
 
-MIT
+GPL v3

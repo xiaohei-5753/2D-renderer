@@ -19,8 +19,8 @@ A lightweight, GPU-accelerated 2D ray tracer built with OpenGL compute shaders.
   **方向光（阳光）+ 环境光（墙壁）** — 可配置
 - **Pixel Self-Emission** — each pixel emits colored light independently
   **像素自发光** — 每个像素独立发射彩色光
-- **Configurable** — all parameters via `cfg.txt`
-  **可配置** — 所有参数通过 `cfg.txt`
+- **API-driven Configuration** — library exposes setter API; `cfg.txt` parsing lives in app layer
+  **基于 API 的配置** — 库暴露 setter 接口；`cfg.txt` 解析在应用层
 - **Interactive Paint Demo** — Brush / Line / Rect / Eraser, 8 colors
   **交互式画板** — 画笔/直线/矩形/橡皮擦，8 种颜色
 
@@ -63,13 +63,16 @@ paint_app.exe
 
 ---
 
-## Configuration / 配置 (`cfg.txt`)
+## Configuration / 配置
+
+Configuration is **app-layer**: `paint_app.cpp` parses `cfg.txt` and applies values via the library API.
+配置属于 **应用层**：`paint_app.cpp` 解析 `cfg.txt`，通过库 API 设置参数。
 
 ```
 # Canvas / 画布
 512 512 64 1280 1280   # width height circleRadius windowW windowH
 
-# Wire alpha / 线条透明度
+# Wire alpha / 线条透明度  
 0.5
 
 # Colors / 颜色 (RGB 0–255)
@@ -201,7 +204,7 @@ Output: imageStore(u_out, pixel_pos, vec4(final_color, 1.0))
 │  - uploadCanvasTexture(): CPU→GPU data transfer    │
 │  - renderRayTrace(): compute shader dispatch       │
 │  - renderDisplay(): camera transform → screen      │
-│  - loadConfig(): config file parsing                │
+│  - Config API: setCircleRadius / setSunColor / …   │
 │  - Input hooks: onMouse*, onKey                    │
 │  - Core structs: Pixel, Camera                    │
 └──────────────────────────────────────────────────┘
@@ -257,11 +260,17 @@ E:\programming\CPP\2D-renderer\
 ├── paint_app.cpp         # Application / 应用
 ├── build.bat             # Build script / 构建脚本
 ├── cfg.txt               # Config / 配置
+├── API.md                # API reference / API 手册
 ├── .gitignore
 ├── README.md
 ├── include/              # GLFW + GLEW
 └── lib/                  # Libraries / 库文件
 ```
+
+## API Reference / API 参考
+
+See [`API.md`](API.md) for the complete library API documentation (bilingual CN/EN).
+完整的库 API 文档见 [`API.md`](API.md)（中英双语）。
 
 ## Technical Notes / 技术备忘
 

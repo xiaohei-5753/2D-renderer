@@ -308,7 +308,6 @@ void Renderer::render() {
         canvas_->markClean();
     }
     renderDisplay();
-    glfwSwapBuffers(window_);
 }
 
 bool Renderer::shouldClose() const {

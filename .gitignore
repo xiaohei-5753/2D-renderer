@@ -1,0 +1,20 @@
+# Build output
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
+
+# Temp files
+*.txt
+!cfg.txt
+!README.md
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Windows
+Thumbs.db

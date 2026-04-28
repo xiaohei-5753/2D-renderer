@@ -1,0 +1,32 @@
+# Easy Renderer Configuration File
+# Format: each line is a parameter or parameter group
+
+# Canvas and Window settings
+# [canvasWidth] [canvasHeight] [circleRadius] [windowWidth] [windowHeight]
+512 512 64 1280 1280
+
+# Rendering settings
+# [wireAlpha] - opacity of wire cells (0.0 - 1.0)
+0.5
+
+# Text overlay color (RGBA)
+255 255 255 255
+
+# Sun/light color (RGB) - multiplied for intensity
+255 255 255
+
+# Wall/ambient color (RGB)
+64 64 64
+
+# Adaptive sampling settings (CONTINUOUS)
+# [nearRays] [nearStep] [farRays] [farStep]
+# - nearRays: 边缘处采样数 (最精确)
+# - nearStep: 边缘处步长 (最精确)  
+# - farRays: 中心处采样数 (最快)
+# - farStep: 中心处步长 (最快)
+# 线性插值: 100-50 rays, 2-8 step
+100 2 50 8
+
+# Performance settings  
+# [showFPS] (0 or 1)
+1

@@ -5,10 +5,63 @@
 #include <iostream>
 #include <string>
 #include <algorithm>
+#include <fstream>
 #include <windows.h>
 #include <GLFW/glfw3native.h>
 
 using namespace easy_renderer;
+
+// ============================================================================
+// Config file parser — reads cfg.txt and calls Renderer API
+// ============================================================================
+
+struct AppConfig {
+    int canvasW = 512, canvasH = 512;
+    int winW = 1280, winH = 1280;
+    int circleR = 64;
+    float wireAlpha = 0.5f;
+    float textColor[4] = {1,1,1,1};
+    float sunColor[3] = {1,0.9f,0.7f};
+    float wallColor[3] = {0.3f,0.4f,0.5f};
+    bool showFPS = true;
+};
+
+static AppConfig loadConfig(const std::string& path) {
+    AppConfig cfg;
+    std::ifstream fin(path);
+    if (!fin) {
+        fprintf(stderr, "Failed to open config: %s, using defaults\n", path.c_str());
+        return cfg;
+    }
+
+    auto skip = [&]() {
+        int ch;
+        while ((ch = fin.peek()) != EOF) {
+            if (ch == '#') { fin.ignore(1024, '\n'); }
+            else if (ch == '\n' || ch == '\r') { fin.get(); }
+            else { break; }
+        }
+    };
+
+    skip(); fin >> cfg.canvasW >> cfg.canvasH >> cfg.circleR >> cfg.winW >> cfg.winH;
+    if (cfg.canvasW < 1) cfg.canvasW = 512; if (cfg.canvasH < 1) cfg.canvasH = 512;
+    if (cfg.circleR < 1) cfg.circleR = 64;
+    if (cfg.winW < 100) cfg.winW = 1280; if (cfg.winH < 100) cfg.winH = 1280;
+    std::string line; std::getline(fin, line);
+
+    skip(); fin >> cfg.wireAlpha;
+    skip(); float tr,tg,tb,ta; fin >> tr >> tg >> tb >> ta;
+    cfg.textColor[0]=tr/255;cfg.textColor[1]=tg/255;cfg.textColor[2]=tb/255;cfg.textColor[3]=ta/255;
+    skip(); float sr,sg,sb; fin >> sr >> sg >> sb;
+    cfg.sunColor[0]=sr/255*10;cfg.sunColor[1]=sg/255*10;cfg.sunColor[2]=sb/255*10;
+    skip(); float wr,wg,wb; fin >> wr >> wg >> wb;
+    cfg.wallColor[0]=wr/255*0.5f;cfg.wallColor[1]=wg/255*0.5f;cfg.wallColor[2]=wb/255*0.5f;
+    skip(); int a1,a2,a3,a4; fin>>a1>>a2>>a3>>a4;
+    skip(); int sf=1; fin>>sf; cfg.showFPS=(sf!=0);
+
+    fin.close();
+    return cfg;
+}
 
 // ============================================================================
 // Drawing helpers (moved from library to application layer)
@@ -203,8 +256,15 @@ public:
         : canvas_(nullptr), renderer_(nullptr)
         , currentTool_(Tool::Brush), currentColorIndex_(0) {
 
-        canvas_   = new Canvas(512, 512);
-        renderer_ = new Renderer(512, 512, 1280, 1280);
+        // Load config before creating anything
+        AppConfig cfg = loadConfig("cfg.txt");
+        wireAlpha_ = cfg.wireAlpha;
+
+        canvas_   = new Canvas(cfg.canvasW, cfg.canvasH);
+        renderer_ = new Renderer(cfg.canvasW, cfg.canvasH, cfg.winW, cfg.winH);
+        renderer_->setCircleRadius(cfg.circleR);
+        renderer_->setSunColor(cfg.sunColor[0], cfg.sunColor[1], cfg.sunColor[2]);
+        renderer_->setWallColor(cfg.wallColor[0], cfg.wallColor[1], cfg.wallColor[2]);
 
         colors_[0] = {0, 0, 0, 1, 0,   0,   0  };  // Black
         colors_[1] = {1, 0, 0, 1, 1,   0,   0  };  // Red
@@ -224,8 +284,6 @@ public:
     }
 
     bool init() {
-        renderer_->loadConfig("cfg.txt");
-
         if (!renderer_->init()) {
             std::cerr << "Renderer init failed\n";
             return false;

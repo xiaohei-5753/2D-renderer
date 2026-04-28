@@ -3,10 +3,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
-#include <sstream>
 #include <iostream>
 #include <algorithm>
-#include <fstream>
 
 namespace easy_renderer {
 
@@ -471,88 +469,19 @@ void Renderer::keyCallback(GLFWwindow* w, int key, int scancode, int action, int
 }
 
 // ============================================================================
-// Configuration
+// Configuration API
 // ============================================================================
 
-void Renderer::loadConfig(const std::string& configPath) {
-    std::ifstream fin(configPath);
-    if (!fin) {
-        fprintf(stderr, "Failed to open config file: %s, using defaults\n", configPath.c_str());
-        return;
-    }
+void Renderer::setCircleRadius(int r) {
+    if (r > 0) circleRadius_ = r;
+}
 
-    // Helper: read next non-comment line (skip lines starting with #)
-    auto skipComments = [&]() {
-        int ch;
-        while ((ch = fin.peek()) != EOF) {
-            if (ch == '#') {
-                fin.ignore(1024, '\n');  // skip comment line
-            } else if (ch == '\n' || ch == '\r') {
-                fin.get();  // skip empty lines
-            } else {
-                break;
-            }
-        }
-    };
+void Renderer::setSunColor(float r, float g, float b) {
+    sunColor_[0] = r; sunColor_[1] = g; sunColor_[2] = b;
+}
 
-    // Line 1: canvas and window settings
-    skipComments();
-    fin >> canvasWidth_ >> canvasHeight_ >> circleRadius_ >> windowWidth_ >> windowHeight_;
-
-    // Validate
-    if (canvasWidth_ < 1) canvasWidth_ = 512;
-    if (canvasHeight_ < 1) canvasHeight_ = 512;
-    if (circleRadius_ < 1) circleRadius_ = 64;
-    if (windowWidth_ < 100) windowWidth_ = 1280;
-    if (windowHeight_ < 100) windowHeight_ = 1280;
-
-    std::string line;
-    std::getline(fin, line);  // consume rest of line
-
-    // Wire alpha (local, ignored — kept for config file compatibility)
-    skipComments();
-    float localWireAlpha = 0.5f;
-    fin >> localWireAlpha;
-
-    // Text color (local, ignored — kept for config file compatibility)
-    skipComments();
-    float tr, tg, tb, ta;
-    fin >> tr >> tg >> tb >> ta;
-
-    // Sun color
-    skipComments();
-    float sr, sg, sb;
-    fin >> sr >> sg >> sb;
-    sunColor_[0] = sr / 255.f * 10.f;
-    sunColor_[1] = sg / 255.f * 10.f;
-    sunColor_[2] = sb / 255.f * 10.f;
-
-    // Wall color
-    skipComments();
-    float wr, wg, wb;
-    fin >> wr >> wg >> wb;
-    wallColor_[0] = wr / 255.f * 0.5f;
-    wallColor_[1] = wg / 255.f * 0.5f;
-    wallColor_[2] = wb / 255.f * 0.5f;
-
-    // Adaptive sampling (read into locals, ignored)
-    skipComments();
-    int ad1, ad2, ad3, ad4;
-    if (fin >> ad1 >> ad2 >> ad3 >> ad4) {
-        std::getline(fin, line);
-    }
-
-    // Show FPS (local, ignored)
-    skipComments();
-    int showFPS = 1;
-    fin >> showFPS;
-
-    fin.close();
-    printf("Loaded config: %s (canvas=%dx%d r=%d window=%dx%d, sun=(%.1f,%.1f,%.1f), wall=(%.3f,%.3f,%.3f))\n",
-        configPath.c_str(),
-        canvasWidth_, canvasHeight_, circleRadius_, windowWidth_, windowHeight_,
-        sunColor_[0], sunColor_[1], sunColor_[2],
-        wallColor_[0], wallColor_[1], wallColor_[2]);
+void Renderer::setWallColor(float r, float g, float b) {
+    wallColor_[0] = r; wallColor_[1] = g; wallColor_[2] = b;
 }
 
 } // namespace easy_renderer

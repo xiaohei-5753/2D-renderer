@@ -76,7 +76,9 @@ public:
     int getWindowHeight() const { return windowHeight_; }
 
     // --- Config ---------------------------------------------------
-    void loadConfig(const std::string& configPath);
+    void setCircleRadius(int r);
+    void setSunColor(float r, float g, float b);
+    void setWallColor(float r, float g, float b);
 
     // --- Read-only settings for the app ---------------------------
     int getCircleRadius() const { return circleRadius_; }

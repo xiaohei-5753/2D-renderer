@@ -105,8 +105,6 @@ private:
     GLuint cvsColorTex_ = 0;
     GLuint cvsLightTex_ = 0;
     GLuint cvsOccuTex_ = 0;              // occupancy (empty-region skip)
-GLuint cvsMipTex_  = 0;              // hierarchical occupancy mipmap
-int mipLevels_ = 0;                  // number of mip levels
     GLuint renderTex_   = 0;
     GLuint rayProg_     = 0;
     GLuint dispProg_    = 0;

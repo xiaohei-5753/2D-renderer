@@ -7,10 +7,10 @@ A lightweight, GPU-accelerated 2D ray tracer built with OpenGL compute shaders.
 
 ## Features / 特性
 
-- **GPU Ray Tracing** — per-pixel light simulation via compute shader, ~5000 FPS on empty canvas
-  **GPU 光线追踪** — 通过 Compute Shader 实现逐像素光照模拟，空白画布约 5000 FPS
-- **Bresenham Circle Sampling** — 8-symmetry ray casting for omnidirectional light accumulation
-  **Bresenham 圆采样** — 八对称光线投射实现全方位光照累积
+- **Scanline Light Propagation** — GPU forward propagation along parallel Bresenham lines, ~100× fewer texelFetch than per-pixel ray tracing
+  **扫描线光线传播** — 沿平行 Bresenham 线在 GPU 上正向传播光，texelFetch 比逐像素光线追踪少 ~100×
+- **Bresenham Direction Families** — full-circle direction families (configurable via circleRadius), each processed as independent parallel scanlines
+  **Bresenham 方向族** — 全圆方向族（通过 circleRadius 配置），每个方向族作为独立平行扫描线处理
 - **Occupancy Skip** — empty region stride (×4) via real-time occupancy texture
   **占空跳过** — 通过实时占空纹理实现空区域 4 像素步进跳过
 - **Semi-Transparent Materials** — alpha-based transmission with energy conservation
@@ -164,7 +164,27 @@ The occupancy texture is rebuilt every frame in `uploadCanvasTexture()`, based o
 
 占空纹理每帧在 `uploadCanvasTexture()` 中根据像素 Alpha 重建，与 CPU 端已移除的四叉树无关。
 
-### 4. Lighting Model / 光照模型
+### 4. Scanline Light Propagation / 扫描线光线传播
+
+```
+For each direction (dx, dy) from Bresenham circle:
+  // Parallel scanlines, 1 pixel apart, covering entire canvas
+  For each entry point on canvas boundary (W + H rays):
+    light = ambient
+    March along Bresenham line through canvas:
+      light = light × (1 - α_pixel) + emission_pixel
+      scanTex[pixel] += light × (1 / nDirs)    // accumulate
+```
+
+每个方向族一次 compute dispatch，完全并行。所有方向族累积到 float16 扫描纹理，最终 blend 到输出。
+Each direction family = one compute dispatch, fully parallel. All families accumulate to a float16 scan texture, then blended to output.
+
+**Complexity / 复杂度**:
+- Per-pixel ray tracing (old): O(pixels × rays × steps) ≈ **15B** texelFetch
+- Scanline (new): O(directions × (W+H) × steps) ≈ **80M** texelFetch
+- **~200× fewer** texture reads
+
+### 5. Lighting Model / 光照模型
 
 ```
 For each ray direction:
@@ -223,20 +243,17 @@ User Draws / 用户绘制
   ↓
 uploadCanvasTexture()  → upload color + light + occupancy → GPU textures
   ↓
-renderRayTrace()       → dispatch compute shader / 分发计算着色器
-  ↓  For each pixel / 每个像素:
-     ├─ Opaque (α≥1): write directly / 直接写入
-     └─ Else: cast ~64 Bresenham rays / 投射约64条光线
-         ├─ Empty: skip 4× / 空区域4倍步进
-         ├─ Semi: absorb & transmit / 半透明吸收与透射
-         ├─ Solid: reflect + emit / 实心反射与发光
-         └─ Edge: sun / wall light / 边界：阳光/环境光
+renderScanline()       → dispatch scanline propagation per direction family
+  ↓  For each direction:
+     ├─ Clear accumulation texture / 清空累积纹理
+     ├─ Dispatch W+H parallel rays / 分发 W+H 条平行射线
+     │  └─ Each ray: march Bresenham, carry ambient, absorb+emit, accumulate
+     │    每条射线：Bresenham 步进，携带环境光，吸收+发光，累积
+     └─ Memory barrier / 内存屏障
+  ↓
+blend shader           → mix scan light + color + emission → renderTex
   ↓
 renderDisplay()        → camera transform → screen / 相机变换→屏幕
-  ↓
-[app] TextOverlay      → GDI raster → GL texture → draw / GDI文字叠加
-  ↓
-glfwSwapBuffers()      → present / 呈现
 ```
 
 ---

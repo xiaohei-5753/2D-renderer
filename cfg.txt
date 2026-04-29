@@ -21,7 +21,7 @@
 # Performance settings
 # [barrierInterval] - glMemoryBarrier every N directions (0=per-direction, 16=recommended)
 # [colorPropagate] - 0=off 1=on: translucent pixels tint light with own color
-16 1
+16 0
 
 # Adaptive sampling settings (CONTINUOUS - unused in scanline mode)
 # [nearRays] [nearStep] [farRays] [farStep]

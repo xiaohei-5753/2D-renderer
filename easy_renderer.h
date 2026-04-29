@@ -79,9 +79,13 @@ public:
     void setCircleRadius(int r);
     void setSunColor(float r, float g, float b);
     void setWallColor(float r, float g, float b);
+    void setBarrierInterval(int n);   // glMemoryBarrier every N directions (0=per-direction)
+    void setColorPropagate(bool on);  // translucent pixels tint light with own color
 
     // --- Read-only settings for the app ---------------------------
-    int getCircleRadius() const { return circleRadius_; }
+    int  getCircleRadius() const { return circleRadius_; }
+    int  getBarrierInterval() const { return barrierInterval_; }
+    bool getColorPropagate() const { return colorPropagate_; }
 
 private:
     // GLFW callbacks (dispatch to std::function hooks)
@@ -105,9 +109,10 @@ private:
     GLuint cvsColorTex_ = 0;
     GLuint cvsLightTex_ = 0;
     GLuint cvsOccuTex_ = 0;              // occupancy (empty-region skip)
-GLuint cvsScanTex_ = 0;              // scanline light accumulation
-GLuint scanProg_ = 0;                // scanline shader program
-GLuint blendProg_ = 0;                // scan→renderTex blend shader
+    GLuint cvsScanTex_ = 0;              // scanline light accumulation
+    GLuint clearScanProg_ = 0;           // GPU clear for scan texture
+    GLuint scanProg_ = 0;                // scanline shader program
+    GLuint blendProg_ = 0;               // scan→renderTex blend shader
     GLuint renderTex_   = 0;
     GLuint rayProg_     = 0;
     GLuint dispProg_    = 0;
@@ -115,6 +120,8 @@ GLuint blendProg_ = 0;                // scan→renderTex blend shader
 
     // --- Settings -------------------------------------------------
     int circleRadius_ = 64;
+    int barrierInterval_ = 16;   // glMemoryBarrier every 16 directions
+    bool colorPropagate_ = true; // translucent pixels tint light
     float wireAlpha_  = 0.5f;
     float sunColor_[3]  = {1.0f, 0.9f, 0.7f};
     float wallColor_[3] = {0.3f, 0.4f, 0.5f};

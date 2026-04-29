@@ -178,16 +178,27 @@ For each direction (dx, dy) from Bresenham circle:
     light = ambient
     March along Bresenham line through canvas:
       light = light × (1 - α_pixel) + emission_pixel
+      + c.rgb × (1-α)               // optional color propagation
       scanTex[pixel] += light × (1 / nDirs)    // accumulate
 ```
 
 - **Unified march loop**: step unconditionally, process when (x,y) inside canvas, exit when past far edge
 - **统一步进循环**：无条件步进，在画布内时处理，越界时退出
+- **Color propagation**: translucent materials tint the passing light with their color (configurable)
+- **颜色传播**：半透明材质用自己的颜色染色通过的光线（可配置）
 - Zero edge-case duplicates compared to the old 2-edge mixed-entry scheme
   相比旧的双边混合入口方案，消除了所有边缘重复
 
 每个方向族一次 compute dispatch，完全并行。所有方向族累积到 float16 扫描纹理，最终 blend 到输出。
 Each direction family = one compute dispatch, fully parallel. All families accumulate to a float16 scan texture, then blended to output.
+
+**Performance optimizations (backported from TPT) / 性能优化（从 TPT 反向移植）**:
+
+| Optimization / 优化 | Before / 之前 | After / 之后 |
+|---|---|---|
+| **GPU zero-clear** / GPU 清零 | CPU `glTexSubImage2D` 1.8MB/frame | Compute shader, 0 DMA |
+| **Batch barriers** / 批次屏障 | 1 `glMemoryBarrier` per dir (≈500×) | Every 16 dirs (≈32×) |
+| **Color propagation** / 颜色传播 | Translucent pixels don't tint light | Optional, ~0 cost when off |
 
 **Complexity / 复杂度**:
 - Per-pixel ray tracing (old): O(pixels × rays × steps) ≈ **15B** texelFetch
@@ -255,11 +266,12 @@ uploadCanvasTexture()  → upload color + light + occupancy → GPU textures
   ↓
 renderScanline()       → dispatch scanline propagation per direction family
   ↓  For each direction:
-     ├─ Clear accumulation texture / 清空累积纹理
-      ├─ Dispatch 2H+1 or 2W+1 parallel rays / 分发 2H+1/2W+1 条平行射线
+     ├─ GPU clear accumulation texture / GPU 清零扫描纹理
+     ├─ Dispatch 2H+1 or 2W+1 parallel rays / 分发 2H+1/2W+1 条平行射线
      │  └─ Each ray: march Bresenham, carry ambient, absorb+emit, accumulate
      │    每条射线：Bresenham 步进，携带环境光，吸收+发光，累积
-     └─ Memory barrier / 内存屏障
+     ├─ Batch memory barrier every N directions / 每 N 个方向一次批次屏障
+     └─ (512 dirs → ~32 barriers with batch=16) / (512 方向→~32 次屏障)
   ↓
 blend shader           → mix scan light + color + emission → renderTex
   ↓

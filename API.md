@@ -102,7 +102,11 @@ while (!rdr.shouldClose()) {
 void setCircleRadius(int r);   // Ray count: ~8r per pixel / 光线数：每像素约 8r
 void setSunColor(float r, float g, float b);   // Sun light color / 阳光颜色
 void setWallColor(float r, float g, float b);  // Wall ambient color / 环境光颜色
+void setBarrierInterval(int n);   // glMemoryBarrier every N directions (0=per-direction)
+void setColorPropagate(bool on);  // Translucent pixels tint light with own color
 int  getCircleRadius() const;                   // Current radius / 当前半径
+int  getBarrierInterval() const;                // Current barrier interval / 当前屏障间隔
+bool getColorPropagate() const;                  // Color propagation enabled / 颜色传播启用
 ```
 
 **Parameter notes / 参数说明:**
@@ -112,6 +116,8 @@ int  getCircleRadius() const;                   // Current radius / 当前半径
 | `circleRadius` | 1–128+ | 64 | Larger = more rays = better quality, slower / 越大光线越多 = 质量越高、越慢 |
 | `sunColor` | any ≥ 0 | (10, 9, 7) | Brightness of directional sun light / 方向阳光的亮度 |
 | `wallColor` | any ≥ 0 | (0.15, 0.2, 0.25) | Brightness of ambient wall light / 环境光的亮度 |
+| `barrierInterval` | 0–128 | 16 | Batch memory barriers every N directions (0 = every direction) / 每 N 个方向插一次内存屏障（0=每个方向） |
+| `colorPropagate` | 0/1 | 1 | When on, translucent pixels tint the passing light with their own color / 开启后半透明像素用自己的颜色染色通过的光线 |
 
 ### Input Callbacks / 输入回调
 
@@ -190,12 +196,12 @@ User modifies Canvas pixels via setPixel()
       ├─ cvsColorTex_ (RGBA8) — pixel colors / 像素颜色
       ├─ cvsLightTex_  (RGB8)  — self-emission / 自发光
       └─ cvsOccuTex_   (R8)    — occupancy (alpha > 0.01) / 占空
-  → renderScanline() processes direction families:
-      ├─ Clears cvsScanTex_ (RGBA16F) to 0 / 清空扫描纹理
-      ├─ For each direction family (from Bresenham circle):
-      │    └─ Dispatch 2H+1/2W+1 parallel Bresenham rays with ambient light
-      │       Each ray carries light forward, accumulates to cvsScanTex_
-      └─ Memory barrier after each family / 每族后内存屏障
+   → renderScanline() processes direction families:
+       ├─ GPU clears cvsScanTex_ (RGBA16F) via compute shader / GPU 清零扫描纹理
+       ├─ For each direction family (from Bresenham circle):
+       │    └─ Dispatch 2H+1/2W+1 parallel Bresenham rays with ambient light
+       │       Each ray carries light forward, accumulates to cvsScanTex_
+       └─ Batch memory barrier every N directions / 每 N 个方向一次批次屏障
   → blend shader: reads cvsScanTex_ + cvsColorTex_ + cvsLightTex_
       → writes renderTex_ (final output)
   → renderDisplay() samples renderTex_ with camera transform

@@ -18,7 +18,12 @@
 # Wall/ambient color (RGB)
 64 64 64
 
-# Adaptive sampling settings (CONTINUOUS)
+# Performance settings
+# [barrierInterval] - glMemoryBarrier every N directions (0=per-direction, 16=recommended)
+# [colorPropagate] - 0=off 1=on: translucent pixels tint light with own color
+16 1
+
+# Adaptive sampling settings (CONTINUOUS - unused in scanline mode)
 # [nearRays] [nearStep] [farRays] [farStep]
 # - nearRays: 边缘处采样数 (最精确)
 # - nearStep: 边缘处步长 (最精确)  

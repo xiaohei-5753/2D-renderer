@@ -23,6 +23,8 @@ struct AppConfig {
     float textColor[4] = {1,1,1,1};
     float sunColor[3] = {1,0.9f,0.7f};
     float wallColor[3] = {0.3f,0.4f,0.5f};
+    int barrierInterval = 16;
+    bool colorPropagate = true;
     bool showFPS = true;
 };
 
@@ -56,6 +58,8 @@ static AppConfig loadConfig(const std::string& path) {
     cfg.sunColor[0]=sr/255*10;cfg.sunColor[1]=sg/255*10;cfg.sunColor[2]=sb/255*10;
     skip(); float wr,wg,wb; fin >> wr >> wg >> wb;
     cfg.wallColor[0]=wr/255*0.5f;cfg.wallColor[1]=wg/255*0.5f;cfg.wallColor[2]=wb/255*0.5f;
+    skip(); int bi,cp; fin>>bi>>cp;
+    cfg.barrierInterval = (bi<0)?0:bi; cfg.colorPropagate = (cp!=0);
     skip(); int a1,a2,a3,a4; fin>>a1>>a2>>a3>>a4;
     skip(); int sf=1; fin>>sf; cfg.showFPS=(sf!=0);
 
@@ -265,6 +269,8 @@ public:
         renderer_->setCircleRadius(cfg.circleR);
         renderer_->setSunColor(cfg.sunColor[0], cfg.sunColor[1], cfg.sunColor[2]);
         renderer_->setWallColor(cfg.wallColor[0], cfg.wallColor[1], cfg.wallColor[2]);
+        renderer_->setBarrierInterval(cfg.barrierInterval);
+        renderer_->setColorPropagate(cfg.colorPropagate);
 
         colors_[0] = {0, 0, 0, 1, 0,   0,   0  };  // Black
         colors_[1] = {1, 0, 0, 1, 1,   0,   0  };  // Red

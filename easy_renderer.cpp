@@ -122,6 +122,20 @@ void main() {
 }
 )";
 
+// ============================================================================
+// GPU clear shader — replaces CPU glTexSubImage2D zero-fill
+// ============================================================================
+static const char* clearCompSrc = R"(#version 430 core
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba16f, binding = 0) uniform image2D u_img;
+uniform ivec2 u_cs;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= u_cs.x || p.y >= u_cs.y) return;
+    imageStore(u_img, p, vec4(0.0));
+}
+)";
+
 // Scanline light propagation shader — replaces per-pixel ray tracing
 // Each work item = one Bresenham ray, carrying ambient light across the canvas
 static const char* scanCompSrc = R"(#version 430 core
@@ -132,6 +146,7 @@ uniform ivec2 u_cs;         // canvas size
 uniform vec3 u_ambient;     // ambient/wall light (entry brightness)
 uniform int u_rayCount;     // number of parallel rays in this family
 uniform int u_ndirs;        // total number of direction families (for normalization)
+uniform float u_colorPropagate;  // 0=off, 1=on: propagate pixel color through translucent pixels
 layout(rgba16f, binding = 0) uniform image2D u_scan;  // light accumulation (read+write)
 
 void main() {
@@ -169,6 +184,8 @@ void main() {
             vec4 c = texelFetch(u_cc, ivec2(x, y), 0);
             vec3 e = texelFetch(u_cl, ivec2(x, y), 0).rgb;
             light = light * (1.0 - c.a) + e;
+            // Optional: translucent pixels tint the light with their own color
+            light += c.rgb * (1.0 - c.a) * u_colorPropagate;
             
             vec4 prev = imageLoad(u_scan, ivec2(x, y));
             float w = 1.0 / float(u_ndirs);
@@ -325,7 +342,17 @@ bool Renderer::initShaders() {
 }
 
 bool Renderer::initScanShaders() {
-    GLuint cs = compileShader(scanCompSrc, GL_COMPUTE_SHADER);
+    // Clear shader
+    GLuint cs = compileShader(clearCompSrc, GL_COMPUTE_SHADER);
+    clearScanProg_ = glCreateProgram();
+    glAttachShader(clearScanProg_, cs);
+    glLinkProgram(clearScanProg_);
+    { GLint ok=0; glGetProgramiv(clearScanProg_, GL_LINK_STATUS, &ok);
+      if (!ok) { char log[4096]; GLsizei len=0; glGetProgramInfoLog(clearScanProg_,sizeof(log),&len,log); fprintf(stderr,"Clear shader link error:\n%s\n",log); }}
+    glDeleteShader(cs);
+    
+    // Scanline shader
+    cs = compileShader(scanCompSrc, GL_COMPUTE_SHADER);
     scanProg_ = glCreateProgram();
     glAttachShader(scanProg_, cs);
     glLinkProgram(scanProg_);
@@ -521,11 +548,12 @@ void Renderer::renderScanline() {
     int R = circleRadius_;
     float wc[3] = {wallColor_[0], wallColor_[1], wallColor_[2]};
     
-    // Clear light accumulation texture
-    int N = W * H;
-    std::vector<unsigned short> zero(N * 4, 0);  // half-float 0 = 0x0000
-    glBindTexture(GL_TEXTURE_2D, cvsScanTex_);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_HALF_FLOAT, zero.data());
+    // GPU clear: compute shader replaces CPU glTexSubImage2D zero-fill
+    glUseProgram(clearScanProg_);
+    glUniform2i(glGetUniformLocation(clearScanProg_, "u_cs"), W, H);
+    glBindImageTexture(0, cvsScanTex_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glDispatchCompute((W + 7) / 8, (H + 7) / 8, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     
     // Generate direction families from Bresenham circle (full density)
     std::vector<int> dirX, dirY;
@@ -546,8 +574,10 @@ void Renderer::renderScanline() {
     glUniform2i(glGetUniformLocation(scanProg_, "u_cs"), W, H);
     glUniform3fv(glGetUniformLocation(scanProg_, "u_ambient"), 1, wc);
     glUniform1i(glGetUniformLocation(scanProg_, "u_ndirs"), nDirs);
+    glUniform1f(glGetUniformLocation(scanProg_, "u_colorPropagate"), colorPropagate_ ? 1.0f : 0.0f);
     glBindImageTexture(0, cvsScanTex_, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
     
+    int bi = std::max(1, barrierInterval_);
     for (int d = 0; d < nDirs; d++) {
         int dx = dirX[d], dy = dirY[d];
         if (dx == 0 && dy == 0) continue;
@@ -556,11 +586,13 @@ void Renderer::renderScanline() {
         int rc = (abs(dx) >= abs(dy)) ? (2 * H + 1) : (2 * W + 1);
         glUniform1i(glGetUniformLocation(scanProg_, "u_rayCount"), rc);
         glDispatchCompute((rc + 255) / 256, 1, 1);
-        glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+        if ((d + 1) % bi == 0 || d == nDirs - 1)
+            glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
     }
     
     // Final blend: scan light → renderTex with color + emission mix
     glUseProgram(blendProg_);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, cvsColorTex_);
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, cvsColorTex_);
     glUniform1i(glGetUniformLocation(blendProg_, "u_cc"), 0);
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, cvsLightTex_);
@@ -667,6 +699,14 @@ void Renderer::setSunColor(float r, float g, float b) {
 
 void Renderer::setWallColor(float r, float g, float b) {
     wallColor_[0] = r; wallColor_[1] = g; wallColor_[2] = b;
+}
+
+void Renderer::setBarrierInterval(int n) {
+    barrierInterval_ = (n < 0) ? 0 : n;
+}
+
+void Renderer::setColorPropagate(bool on) {
+    colorPropagate_ = on;
 }
 
 } // namespace easy_renderer

@@ -141,56 +141,46 @@ void main() {
     int dx = abs(u_dir.x), dy = abs(u_dir.y);
     int sx = (u_dir.x >= 0) ? 1 : -1, sy = (u_dir.y >= 0) ? 1 : -1;
     
-    // Compute ray entry point on the canvas boundary
-    // Rays cover canvas: some enter from left/top, others from right/bottom
+    // Single-edge tiling: each ray enters from ONE edge only
+    // Shallow (dx>=dy): enter from LEFT/RIGHT edge, 2H+1 rays, y from -H to H
+    // Steep  (dx<dy):  enter from TOP/BOTTOM edge, 2W+1 rays, x from -W to W
     int W = u_cs.x, H = u_cs.y;
-    int x = 0, y = 0;
+    int x, y;
     int r = rayId;
     
-    // Axial: entry from left/right (x edge) or top/bottom (y edge)
-    if (dx == 0) {
-        // Vertical: entry from top or bottom
-        if (sy > 0) { x = r; y = 0; }
-        else        { x = r; y = H-1; }
-    } else if (dy == 0) {
-        // Horizontal: entry from left or right
-        if (sx > 0) { x = 0; y = r; }
-        else        { x = W-1; y = r; }
-    } else if (dx >= dy) {
-        // Shallow diagonal: entry from left (x edge) + top (y edge)
-        if (r < H) { x = sx > 0 ? 0 : W-1; y = r; }
-        else       { x = r-H; y = sy > 0 ? 0 : H-1; }
+    if (dx >= dy) {
+        // Shallow: enter from LEFT (sx>0) or RIGHT (sx<0) vertical edge
+        if (sx > 0) x = 0;
+        else        x = W - 1;
+        y = -H + r;  // r = 0..2H
     } else {
-        // Steep diagonal: entry from top (y edge) + left (x edge)
-        if (r < W) { x = r; y = sy > 0 ? 0 : H-1; }
-        else       { x = sx > 0 ? 0 : W-1; y = r-W; }
+        // Steep: enter from TOP (sy>0) or BOTTOM (sy<0) horizontal edge
+        x = -W + r;  // r = 0..2W
+        if (sy > 0) y = 0;
+        else        y = H - 1;
     }
     
-    // Initial light: ambient enters from the edge
     vec3 light = u_ambient;
-    
-    // Bresenham march
     int er = dx - dy;
-    int e2 = 2 * er;
-    if (e2 > -dy) { er -= dy; x += sx; }
-    if (e2 < dx) { er += dx; y += sy; }
     
-    while (x >= 0 && x < W && y >= 0 && y < H) {
-        vec4 c = texelFetch(u_cc, ivec2(x, y), 0);
-        vec3 e = texelFetch(u_cl, ivec2(x, y), 0).rgb;
+    // Unified march: step unconditionally, process when inside, exit when past far edge
+    while (true) {
+        if (x >= 0 && x < W && y >= 0 && y < H) {
+            vec4 c = texelFetch(u_cc, ivec2(x, y), 0);
+            vec3 e = texelFetch(u_cl, ivec2(x, y), 0).rgb;
+            light = light * (1.0 - c.a) + e;
+            
+            vec4 prev = imageLoad(u_scan, ivec2(x, y));
+            float w = 1.0 / float(u_ndirs);
+            imageStore(u_scan, ivec2(x, y), prev + vec4(light * w, 0.0));
+        }
         
-        // Forward light propagation: absorb color, add emission
-        light = light * (1.0 - c.a) + e;
-        
-        // Accumulate into scan texture (normalize per-direction)
-        vec4 prev = imageLoad(u_scan, ivec2(x, y));
-        float w = 1.0 / float(u_ndirs);
-        imageStore(u_scan, ivec2(x, y), prev + vec4(light * w, 0.0));
-        
-        // Advance one Bresenham step
-        e2 = 2 * er;
+        int e2 = 2 * er;
         if (e2 > -dy) { er -= dy; x += sx; }
-        if (e2 < dx) { er += dx; y += sy; }
+        if (e2 < dx)  { er += dx; y += sy; }
+        
+        if ((sx > 0 && x >= W) || (sx < 0 && x < 0) ||
+            (sy > 0 && y >= H) || (sy < 0 && y < 0)) break;
     }
 }
 )";
@@ -537,22 +527,16 @@ void Renderer::renderScanline() {
     glBindTexture(GL_TEXTURE_2D, cvsScanTex_);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_HALF_FLOAT, zero.data());
     
-    // Generate direction families from Bresenham circle
-    struct { int x, y; } dirs[64];
+    // Generate direction families from Bresenham circle (full density)
+    std::vector<int> dirX, dirY;
     int m = 1 - R, x = 0, y = R;
-    int nDirs = 0;
-    int stride = std::max(1, R / 4);  // fewer directions for speed
-    int cnt = 0;
-    while (x < y && nDirs < 56) {
-        if (cnt % stride == 0) {
-            dirs[nDirs++] = { x,  y}; dirs[nDirs++] = {-x,  y};
-            dirs[nDirs++] = { x, -y}; dirs[nDirs++] = {-x, -y};
-            dirs[nDirs++] = { y,  x}; dirs[nDirs++] = {-y,  x};
-            dirs[nDirs++] = { y, -x}; dirs[nDirs++] = {-y, -x};
-        }
-        cnt++; x++;
+    while (x < y) {
+        dirX.insert(dirX.end(), { x, -x,  x, -x,  y, -y,  y, -y});
+        dirY.insert(dirY.end(), { y,  y, -y, -y,  x,  x, -x, -x});
+        x++;
         if (m < 0) m += 2*x + 1; else { y--; m += 2*(x-y) + 1; }
     }
+    int nDirs = (int)dirX.size();
     
     glUseProgram(scanProg_);
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, cvsColorTex_);
@@ -560,18 +544,18 @@ void Renderer::renderScanline() {
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, cvsLightTex_);
     glUniform1i(glGetUniformLocation(scanProg_, "u_cl"), 1);
     glUniform2i(glGetUniformLocation(scanProg_, "u_cs"), W, H);
+    glUniform3fv(glGetUniformLocation(scanProg_, "u_ambient"), 1, wc);
+    glUniform1i(glGetUniformLocation(scanProg_, "u_ndirs"), nDirs);
     glBindImageTexture(0, cvsScanTex_, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
     
     for (int d = 0; d < nDirs; d++) {
-        int dx = dirs[d].x, dy = dirs[d].y;
+        int dx = dirX[d], dy = dirY[d];
         if (dx == 0 && dy == 0) continue;
         
         glUniform2i(glGetUniformLocation(scanProg_, "u_dir"), dx, dy);
-        glUniform3fv(glGetUniformLocation(scanProg_, "u_ambient"), 1, wc);
-        int nRays = W + H;
-        glUniform1i(glGetUniformLocation(scanProg_, "u_rayCount"), nRays);
-        glUniform1i(glGetUniformLocation(scanProg_, "u_ndirs"), nDirs);
-        glDispatchCompute((nRays + 255) / 256, 1, 1);
+        int rc = (abs(dx) >= abs(dy)) ? (2 * H + 1) : (2 * W + 1);
+        glUniform1i(glGetUniformLocation(scanProg_, "u_rayCount"), rc);
+        glDispatchCompute((rc + 255) / 256, 1, 1);
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
     }
     

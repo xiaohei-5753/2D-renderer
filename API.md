@@ -193,7 +193,7 @@ User modifies Canvas pixels via setPixel()
   → renderScanline() processes direction families:
       ├─ Clears cvsScanTex_ (RGBA16F) to 0 / 清空扫描纹理
       ├─ For each direction family (from Bresenham circle):
-      │    └─ Dispatch W+H parallel Bresenham rays with ambient light
+      │    └─ Dispatch 2H+1/2W+1 parallel Bresenham rays with ambient light
       │       Each ray carries light forward, accumulates to cvsScanTex_
       └─ Memory barrier after each family / 每族后内存屏障
   → blend shader: reads cvsScanTex_ + cvsColorTex_ + cvsLightTex_

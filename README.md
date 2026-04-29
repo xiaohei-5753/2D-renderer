@@ -166,22 +166,32 @@ The occupancy texture is rebuilt every frame in `uploadCanvasTexture()`, based o
 
 ### 4. Scanline Light Propagation / 扫描线光线传播
 
+Single-edge tiling: each direction family enters the canvas from **one edge only**, with 1-pixel spacing for perfect coverage.
+
+单边密铺：每个方向族**仅从一个边缘**进入画布，1 像素间距完美覆盖无重叠。
+
 ```
 For each direction (dx, dy) from Bresenham circle:
-  // Parallel scanlines, 1 pixel apart, covering entire canvas
-  For each entry point on canvas boundary (W + H rays):
+  // Shallow (dx>=dy):  enter from LEFT/RIGHT edge, 2H+1 rays, y = -H..H
+  // Steep  (dx<dy):    enter from TOP/BOTTOM edge, 2W+1 rays, x = -W..W
+  For each parallel entry point:
     light = ambient
     March along Bresenham line through canvas:
       light = light × (1 - α_pixel) + emission_pixel
       scanTex[pixel] += light × (1 / nDirs)    // accumulate
 ```
 
+- **Unified march loop**: step unconditionally, process when (x,y) inside canvas, exit when past far edge
+- **统一步进循环**：无条件步进，在画布内时处理，越界时退出
+- Zero edge-case duplicates compared to the old 2-edge mixed-entry scheme
+  相比旧的双边混合入口方案，消除了所有边缘重复
+
 每个方向族一次 compute dispatch，完全并行。所有方向族累积到 float16 扫描纹理，最终 blend 到输出。
 Each direction family = one compute dispatch, fully parallel. All families accumulate to a float16 scan texture, then blended to output.
 
 **Complexity / 复杂度**:
 - Per-pixel ray tracing (old): O(pixels × rays × steps) ≈ **15B** texelFetch
-- Scanline (new): O(directions × (W+H) × steps) ≈ **80M** texelFetch
+- Scanline (new): O(directions × (2W+2H) × steps) ≈ **80M** texelFetch
 - **~200× fewer** texture reads
 
 ### 5. Lighting Model / 光照模型
@@ -246,7 +256,7 @@ uploadCanvasTexture()  → upload color + light + occupancy → GPU textures
 renderScanline()       → dispatch scanline propagation per direction family
   ↓  For each direction:
      ├─ Clear accumulation texture / 清空累积纹理
-     ├─ Dispatch W+H parallel rays / 分发 W+H 条平行射线
+      ├─ Dispatch 2H+1 or 2W+1 parallel rays / 分发 2H+1/2W+1 条平行射线
      │  └─ Each ray: march Bresenham, carry ambient, absorb+emit, accumulate
      │    每条射线：Bresenham 步进，携带环境光，吸收+发光，累积
      └─ Memory barrier / 内存屏障

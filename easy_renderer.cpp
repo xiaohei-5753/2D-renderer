@@ -41,15 +41,29 @@ void Canvas::clear(float r, float g, float b, float a) {
 static const char* rayCompSrc = R"(#version 430 core
 layout(local_size_x = 8, local_size_y = 8) in;
 uniform sampler2D u_cc; uniform sampler2D u_cl; uniform sampler2D u_occ;
+uniform sampler2D u_mip;
 uniform vec2 u_sd; uniform float u_ss;
 uniform vec3 u_sl; uniform vec3 u_wl;
 uniform int u_cr; uniform ivec2 u_cs; uniform float u_ep;
+uniform int u_mipMax;  // max mip level (log2(max(w,h)))
 layout(rgba8, binding = 0) writeonly uniform image2D u_out;
 
-// Occupancy check: 255 = has content, 0 = empty
+// Occupancy check at level 0: per-pixel
 bool isEmptyRegion(ivec2 p) {
     float occ = texelFetch(u_occ, p, 0).r;
     return occ < 0.5;
+}
+
+// Mip-accelerated empty-region skip: returns how many Bresenham steps to advance
+int mipSkipDistance(ivec2 pos) {
+    for (int level = 0; level <= u_mipMax; level++) {
+        int scale = 1 << level;
+        ivec2 mipCoord = ivec2(pos.x / scale, pos.y / scale);
+        if (texelFetch(u_mip, mipCoord, level).r > 0) {
+            return level == 0 ? 0 : (1 << (level - 1));
+        }
+    }
+    return 9999; // all levels empty
 }
 
 vec3 cR(ivec2 o, ivec2 d) {
@@ -68,14 +82,20 @@ vec3 cR(ivec2 o, ivec2 d) {
             return light;
         }
         
-        // Skip empty regions: advance 4 steps at once
+        // Skip empty regions: mipmap-accelerated adaptive skip
         if (isEmptyRegion(ivec2(x, y))) {
-            for (int s = 0; s < 4; s++) {
+            int skip = mipSkipDistance(ivec2(x, y));
+            if (skip > 0) {
+                for (int s = 0; s < skip; s++) {
+                    e2 = 2 * er;
+                    if (e2 > -dy) { er -= dy; x += sx; }
+                    if (e2 < dx) { er += dx; y += sy; }
+                    if (x < 0 || x >= u_cs.x || y < 0 || y >= u_cs.y) break;
+                }
+            } else {
                 e2 = 2 * er;
                 if (e2 > -dy) { er -= dy; x += sx; }
                 if (e2 < dx) { er += dx; y += sy; }
-                if (x < 0 || x >= u_cs.x || y < 0 || y >= u_cs.y) break;
-                if (!isEmptyRegion(ivec2(x, y))) break;
             }
             continue;
         }
@@ -148,7 +168,8 @@ Renderer::~Renderer() {
     if (cvsColorTex_) glDeleteTextures(1, &cvsColorTex_);
     if (cvsLightTex_) glDeleteTextures(1, &cvsLightTex_);
     if (cvsOccuTex_) glDeleteTextures(1, &cvsOccuTex_);
-    if (renderTex_) glDeleteTextures(1, &renderTex_);
+    if (cvsMipTex_)  glDeleteTextures(1, &cvsMipTex_);
+    if (renderTex_)   glDeleteTextures(1, &renderTex_);
     if (rayProg_) glDeleteProgram(rayProg_);
     if (dispProg_) glDeleteProgram(dispProg_);
     if (fullVAO_) glDeleteVertexArrays(1, &fullVAO_);
@@ -262,6 +283,18 @@ bool Renderer::initTextures() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+    // Hierarchical occupancy mipmap (for accelerated empty-region skip)
+    glGenTextures(1, &cvsMipTex_);
+    glBindTexture(GL_TEXTURE_2D, cvsMipTex_);
+    mipLevels_ = 1 + (int)std::floor(std::log2((double)std::max(canvasWidth_, canvasHeight_)));
+    glTexStorage2D(GL_TEXTURE_2D, mipLevels_, GL_R8, canvasWidth_, canvasHeight_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, mipLevels_ - 1);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
     // Render texture - initialize to black
     glGenTextures(1, &renderTex_);
     glBindTexture(GL_TEXTURE_2D, renderTex_);
@@ -349,6 +382,34 @@ void Renderer::uploadCanvasTexture() {
     }
     glBindTexture(GL_TEXTURE_2D, cvsOccuTex_);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, canvasWidth_, canvasHeight_, GL_RED, GL_UNSIGNED_BYTE, occ.data());
+
+    // Build and upload hierarchical occupancy mipmap (max-filter for empty-region fast skip)
+    glBindTexture(GL_TEXTURE_2D, cvsMipTex_);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, canvasWidth_, canvasHeight_, GL_RED, GL_UNSIGNED_BYTE, occ.data());
+    int W = canvasWidth_, H = canvasHeight_;
+    std::vector<unsigned char> prevLevel = occ;
+    for (int level = 1; level < mipLevels_; level++) {
+        int pw = std::max(1, W >> (level - 1));
+        int ph = std::max(1, H >> (level - 1));
+        int cw = std::max(1, W >> level);
+        int ch = std::max(1, H >> level);
+        std::vector<unsigned char> cur(cw * ch, 0);
+        for (int y = 0; y < ch; y++) {
+            for (int x = 0; x < cw; x++) {
+                unsigned char m = 0;
+                for (int dy = 0; dy < 2; dy++) {
+                    for (int dx = 0; dx < 2; dx++) {
+                        int sx = std::min(x * 2 + dx, pw - 1);
+                        int sy = std::min(y * 2 + dy, ph - 1);
+                        m = std::max(m, prevLevel[sy * pw + sx]);
+                    }
+                }
+                cur[y * cw + x] = m;
+            }
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, level, 0, 0, cw, ch, GL_RED, GL_UNSIGNED_BYTE, cur.data());
+        prevLevel = std::move(cur);
+    }
 }
 
 void Renderer::renderRayTrace() {
@@ -376,6 +437,10 @@ void Renderer::renderRayTrace() {
     glBindTexture(GL_TEXTURE_2D, cvsOccuTex_);
     glUniform1i(glGetUniformLocation(rayProg_, "u_occ"), 2);
 
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, cvsMipTex_);
+    glUniform1i(glGetUniformLocation(rayProg_, "u_mip"), 3);
+
     glUniform2f(glGetUniformLocation(rayProg_, "u_sd"), (float)sunDirX, (float)sunDirY);
     glUniform1f(glGetUniformLocation(rayProg_, "u_ss"), sunSc);
     glUniform3fv(glGetUniformLocation(rayProg_, "u_sl"), 1, sunClr);
@@ -383,6 +448,7 @@ void Renderer::renderRayTrace() {
     glUniform1i(glGetUniformLocation(rayProg_, "u_cr"), circleRadius_);
     glUniform2i(glGetUniformLocation(rayProg_, "u_cs"), canvasWidth_, canvasHeight_);
     glUniform1f(glGetUniformLocation(rayProg_, "u_ep"), eps_l);
+    glUniform1i(glGetUniformLocation(rayProg_, "u_mipMax"), mipLevels_ - 1);
 
     glDispatchCompute((canvasWidth_ + 7) / 8, (canvasHeight_ + 7) / 8, 1);
     glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);

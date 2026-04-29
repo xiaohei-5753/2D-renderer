@@ -122,6 +122,102 @@ void main() {
 }
 )";
 
+// Scanline light propagation shader — replaces per-pixel ray tracing
+// Each work item = one Bresenham ray, carrying ambient light across the canvas
+static const char* scanCompSrc = R"(#version 430 core
+layout(local_size_x = 256) in;
+uniform sampler2D u_cc; uniform sampler2D u_cl;
+uniform ivec2 u_dir;        // direction vector (dx, dy) for this ray family
+uniform ivec2 u_cs;         // canvas size
+uniform vec3 u_ambient;     // ambient/wall light (entry brightness)
+uniform int u_rayCount;     // number of parallel rays in this family
+uniform int u_ndirs;        // total number of direction families (for normalization)
+layout(rgba16f, binding = 0) uniform image2D u_scan;  // light accumulation (read+write)
+
+void main() {
+    int rayId = int(gl_GlobalInvocationID.x);
+    if (rayId >= u_rayCount) return;
+    
+    int dx = abs(u_dir.x), dy = abs(u_dir.y);
+    int sx = (u_dir.x >= 0) ? 1 : -1, sy = (u_dir.y >= 0) ? 1 : -1;
+    
+    // Compute ray entry point on the canvas boundary
+    // Rays cover canvas: some enter from left/top, others from right/bottom
+    int W = u_cs.x, H = u_cs.y;
+    int x = 0, y = 0;
+    int r = rayId;
+    
+    // Axial: entry from left/right (x edge) or top/bottom (y edge)
+    if (dx == 0) {
+        // Vertical: entry from top or bottom
+        if (sy > 0) { x = r; y = 0; }
+        else        { x = r; y = H-1; }
+    } else if (dy == 0) {
+        // Horizontal: entry from left or right
+        if (sx > 0) { x = 0; y = r; }
+        else        { x = W-1; y = r; }
+    } else if (dx >= dy) {
+        // Shallow diagonal: entry from left (x edge) + top (y edge)
+        if (r < H) { x = sx > 0 ? 0 : W-1; y = r; }
+        else       { x = r-H; y = sy > 0 ? 0 : H-1; }
+    } else {
+        // Steep diagonal: entry from top (y edge) + left (x edge)
+        if (r < W) { x = r; y = sy > 0 ? 0 : H-1; }
+        else       { x = sx > 0 ? 0 : W-1; y = r-W; }
+    }
+    
+    // Initial light: ambient enters from the edge
+    vec3 light = u_ambient;
+    
+    // Bresenham march
+    int er = dx - dy;
+    int e2 = 2 * er;
+    if (e2 > -dy) { er -= dy; x += sx; }
+    if (e2 < dx) { er += dx; y += sy; }
+    
+    while (x >= 0 && x < W && y >= 0 && y < H) {
+        vec4 c = texelFetch(u_cc, ivec2(x, y), 0);
+        vec3 e = texelFetch(u_cl, ivec2(x, y), 0).rgb;
+        
+        // Forward light propagation: absorb color, add emission
+        light = light * (1.0 - c.a) + e;
+        
+        // Accumulate into scan texture (normalize per-direction)
+        vec4 prev = imageLoad(u_scan, ivec2(x, y));
+        float w = 1.0 / float(u_ndirs);
+        imageStore(u_scan, ivec2(x, y), prev + vec4(light * w, 0.0));
+        
+        // Advance one Bresenham step
+        e2 = 2 * er;
+        if (e2 > -dy) { er -= dy; x += sx; }
+        if (e2 < dx) { er += dx; y += sy; }
+    }
+}
+)";
+
+// Blend shader: copy scan light to renderTex, mixing with color + emission
+static const char* blendCompSrc = R"(#version 430 core
+layout(local_size_x = 8, local_size_y = 8) in;
+uniform sampler2D u_cc;   // color
+uniform sampler2D u_cl;   // emission
+uniform sampler2D u_scan; // accumulated scan light
+uniform ivec2 u_cs;
+layout(rgba8, binding = 0) writeonly uniform image2D u_out;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= u_cs.x || p.y >= u_cs.y) return;
+    vec4 c = texelFetch(u_cc, p, 0);
+    if (c.a >= 1.0) { imageStore(u_out, p, c); return; }
+    vec3 e   = texelFetch(u_cl, p, 0).rgb;
+    vec3 scan = texelFetch(u_scan, p, 0).rgb;
+    vec3 result = mix(scan, c.rgb, c.a) + e;
+    float ov = max(max(result.r, result.g), result.b);
+    if (ov > 1.0) result /= ov;
+    imageStore(u_out, p, vec4(result, 1.0));
+}
+)";
+
 static const char* dispVertSrc = R"(#version 330 core
 layout(location = 0) in vec2 aP; layout(location = 1) in vec2 aU;
 out vec2 vU;
@@ -148,7 +244,10 @@ Renderer::~Renderer() {
     if (cvsColorTex_) glDeleteTextures(1, &cvsColorTex_);
     if (cvsLightTex_) glDeleteTextures(1, &cvsLightTex_);
     if (cvsOccuTex_) glDeleteTextures(1, &cvsOccuTex_);
-    if (renderTex_) glDeleteTextures(1, &renderTex_);
+    if (cvsScanTex_) glDeleteTextures(1, &cvsScanTex_);
+    if (renderTex_)   glDeleteTextures(1, &renderTex_);
+    if (scanProg_) glDeleteProgram(scanProg_);
+    if (blendProg_) glDeleteProgram(blendProg_);
     if (rayProg_) glDeleteProgram(rayProg_);
     if (dispProg_) glDeleteProgram(dispProg_);
     if (fullVAO_) glDeleteVertexArrays(1, &fullVAO_);
@@ -164,6 +263,7 @@ Renderer::~Renderer() {
 bool Renderer::init() {
     if (!initGL()) return false;
     if (!initShaders()) return false;
+    if (!initScanShaders()) return false;
     if (!initTextures()) return false;
     return true;
 }
@@ -234,6 +334,35 @@ bool Renderer::initShaders() {
     return true;
 }
 
+bool Renderer::initScanShaders() {
+    GLuint cs = compileShader(scanCompSrc, GL_COMPUTE_SHADER);
+    scanProg_ = glCreateProgram();
+    glAttachShader(scanProg_, cs);
+    glLinkProgram(scanProg_);
+    GLint ok = 0;
+    glGetProgramiv(scanProg_, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096]; GLsizei len = 0;
+        glGetProgramInfoLog(scanProg_, sizeof(log), &len, log);
+        fprintf(stderr, "Scan shader link error:\n%s\n", log);
+    }
+    glDeleteShader(cs);
+    // Blend shader
+    cs = compileShader(blendCompSrc, GL_COMPUTE_SHADER);
+    blendProg_ = glCreateProgram();
+    glAttachShader(blendProg_, cs);
+    glLinkProgram(blendProg_);
+    ok = 0;
+    glGetProgramiv(blendProg_, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096]; GLsizei len = 0;
+        glGetProgramInfoLog(blendProg_, sizeof(log), &len, log);
+        fprintf(stderr, "Blend shader link error:\n%s\n", log);
+    }
+    glDeleteShader(cs);
+    return true;
+}
+
 bool Renderer::initTextures() {
     // Color texture
     glGenTextures(1, &cvsColorTex_);
@@ -257,6 +386,15 @@ bool Renderer::initTextures() {
     glGenTextures(1, &cvsOccuTex_);
     glBindTexture(GL_TEXTURE_2D, cvsOccuTex_);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, canvasWidth_, canvasHeight_, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // Scanline light accumulation texture (float, for additive blending)
+    glGenTextures(1, &cvsScanTex_);
+    glBindTexture(GL_TEXTURE_2D, cvsScanTex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, canvasWidth_, canvasHeight_, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -302,7 +440,7 @@ void Renderer::render() {
     if (!canvas_ || !window_) return;
     if (canvas_->isDirty()) {
         uploadCanvasTexture();
-        renderRayTrace();
+        renderScanline();
         canvas_->markClean();
     }
     renderDisplay();
@@ -385,6 +523,69 @@ void Renderer::renderRayTrace() {
     glUniform1f(glGetUniformLocation(rayProg_, "u_ep"), eps_l);
 
     glDispatchCompute((canvasWidth_ + 7) / 8, (canvasHeight_ + 7) / 8, 1);
+    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+}
+
+void Renderer::renderScanline() {
+    int W = canvasWidth_, H = canvasHeight_;
+    int R = circleRadius_;
+    float wc[3] = {wallColor_[0], wallColor_[1], wallColor_[2]};
+    
+    // Clear light accumulation texture
+    int N = W * H;
+    std::vector<unsigned short> zero(N * 4, 0);  // half-float 0 = 0x0000
+    glBindTexture(GL_TEXTURE_2D, cvsScanTex_);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_HALF_FLOAT, zero.data());
+    
+    // Generate direction families from Bresenham circle
+    struct { int x, y; } dirs[64];
+    int m = 1 - R, x = 0, y = R;
+    int nDirs = 0;
+    int stride = std::max(1, R / 4);  // fewer directions for speed
+    int cnt = 0;
+    while (x < y && nDirs < 56) {
+        if (cnt % stride == 0) {
+            dirs[nDirs++] = { x,  y}; dirs[nDirs++] = {-x,  y};
+            dirs[nDirs++] = { x, -y}; dirs[nDirs++] = {-x, -y};
+            dirs[nDirs++] = { y,  x}; dirs[nDirs++] = {-y,  x};
+            dirs[nDirs++] = { y, -x}; dirs[nDirs++] = {-y, -x};
+        }
+        cnt++; x++;
+        if (m < 0) m += 2*x + 1; else { y--; m += 2*(x-y) + 1; }
+    }
+    
+    glUseProgram(scanProg_);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, cvsColorTex_);
+    glUniform1i(glGetUniformLocation(scanProg_, "u_cc"), 0);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, cvsLightTex_);
+    glUniform1i(glGetUniformLocation(scanProg_, "u_cl"), 1);
+    glUniform2i(glGetUniformLocation(scanProg_, "u_cs"), W, H);
+    glBindImageTexture(0, cvsScanTex_, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
+    
+    for (int d = 0; d < nDirs; d++) {
+        int dx = dirs[d].x, dy = dirs[d].y;
+        if (dx == 0 && dy == 0) continue;
+        
+        glUniform2i(glGetUniformLocation(scanProg_, "u_dir"), dx, dy);
+        glUniform3fv(glGetUniformLocation(scanProg_, "u_ambient"), 1, wc);
+        int nRays = W + H;
+        glUniform1i(glGetUniformLocation(scanProg_, "u_rayCount"), nRays);
+        glUniform1i(glGetUniformLocation(scanProg_, "u_ndirs"), nDirs);
+        glDispatchCompute((nRays + 255) / 256, 1, 1);
+        glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+    }
+    
+    // Final blend: scan light → renderTex with color + emission mix
+    glUseProgram(blendProg_);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, cvsColorTex_);
+    glUniform1i(glGetUniformLocation(blendProg_, "u_cc"), 0);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, cvsLightTex_);
+    glUniform1i(glGetUniformLocation(blendProg_, "u_cl"), 1);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, cvsScanTex_);
+    glUniform1i(glGetUniformLocation(blendProg_, "u_scan"), 2);
+    glUniform2i(glGetUniformLocation(blendProg_, "u_cs"), W, H);
+    glBindImageTexture(0, renderTex_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glDispatchCompute((W + 7) / 8, (H + 7) / 8, 1);
     glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
 }
 

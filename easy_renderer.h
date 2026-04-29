@@ -105,6 +105,9 @@ private:
     GLuint cvsColorTex_ = 0;
     GLuint cvsLightTex_ = 0;
     GLuint cvsOccuTex_ = 0;              // occupancy (empty-region skip)
+GLuint cvsScanTex_ = 0;              // scanline light accumulation
+GLuint scanProg_ = 0;                // scanline shader program
+GLuint blendProg_ = 0;                // scan→renderTex blend shader
     GLuint renderTex_   = 0;
     GLuint rayProg_     = 0;
     GLuint dispProg_    = 0;
@@ -119,9 +122,11 @@ private:
     // --- Private helpers ------------------------------------------
     bool initGL();
     bool initShaders();
+    bool initScanShaders();  // NEW: scanline light propagation
     bool initTextures();
     void uploadCanvasTexture();
-    void renderRayTrace();
+    void renderRayTrace();     // [legacy] per-pixel ray tracing
+    void renderScanline();     // scanline light propagation
     void renderDisplay();
 
     GLuint compileShader(const char* src, GLenum type);

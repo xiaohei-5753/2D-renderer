@@ -198,6 +198,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "ImGui 初始化失败\n");
         return 1;
     }
+    // 字体没加载上就得在界面上报出来（双击启动看不到控制台）
+    a.fontWarning = uiCtx.fontWarning();
 
     gfx::LightSweep sweep;
     if (!sweep.init(cw, ch)) {

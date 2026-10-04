@@ -596,6 +596,35 @@ void drawUi(App& a) {
 
     ImGui::End();
 
+    // --- 字体加载失败：必须显式告诉用户 ---
+    //
+    // 双击 exe 启动时没有控制台，如果只在 stderr 里报一句，用户只会看到满屏 '?'
+    // 而完全不知道发生了什么。
+    //
+    // 注意这里的文案**全部是 ASCII**：这个弹窗要报告的问题就是"中文字形不可用"，
+    // 文案要是用中文写，弹窗本身就会变成一片 '?'，等于没报。
+    if (!a.fontWarning.empty()) {
+        if (!a.fontWarningShown) {
+            ImGui::OpenPopup("UI font not found");
+            a.fontWarningShown = true;
+        }
+        if (ImGui::BeginPopupModal("UI font not found", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.55f, 0.40f, 1.0f));
+            ImGui::TextUnformatted("Chinese UI text cannot be rendered.");
+            ImGui::PopStyleColor();
+            ImGui::Separator();
+            ImGui::TextUnformatted(a.fontWarning.c_str());
+            ImGui::Spacing();
+            ImGui::TextDisabled("The app looks for assets in: exe dir -> its parent -> cwd,");
+            ImGui::TextDisabled("so keeping the font in the project root also works.");
+            ImGui::Spacing();
+            if (ImGui::Button("OK", ImVec2(a.ui(120.0f), 0.0f)))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+    }
+
     // --- 对话框 ---
     if (g_openShortcuts) ImGui::OpenPopup("快捷键一览");
     if (g_openShortcuts && ImGui::BeginPopupModal("快捷键一览", &g_openShortcuts,

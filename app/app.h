@@ -82,6 +82,11 @@ struct App {
     bool demo = false;
     bool requestQuit = false;
     std::string lastAction;   // 状态栏短暂显示的提示
+
+    // 字体加载失败时的说明（由 main 从 UiContext 填入）。
+    // 界面必须把它显示出来：双击启动没有控制台，否则用户只看到满屏 '?'。
+    std::string fontWarning;
+    bool fontWarningShown = false;
 };
 
 }  // namespace pb::app

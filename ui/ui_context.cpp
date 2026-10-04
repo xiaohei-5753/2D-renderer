@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 
+#include "core/paths.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
@@ -176,23 +177,50 @@ bool UiContext::loadFont(const UiConfig& cfg, float scale) {
     const float size = std::max(9.0f, cfg.fontPixelSize * scale);
 
     // 1.92 起字形范围是 AddFontFromFileTTF 的参数（ImFontConfig::GlyphRanges 已标记 LEGACY）
-    const ImWchar* ranges = nullptr;
-    if (cfg.fullCjk) {
-        ranges = io.Fonts->GetGlyphRangesChineseFull();
-    } else {
-        ranges = io.Fonts->GetGlyphRangesChineseSimplifiedCommon();
+    const ImWchar* ranges = cfg.fullCjk ? io.Fonts->GetGlyphRangesChineseFull()
+                                        : io.Fonts->GetGlyphRangesChineseSimplifiedCommon();
+
+    // ⚠️ 必须按"可执行文件目录"去找，不能直接用相对路径。
+    // 相对路径是相对**当前工作目录**的：从项目根目录运行能读到字体，
+    // 双击 build\paintboard.exe 时工作目录变成 build\，就读不到——
+    // 表现为字体加载失败、界面中文全部变成 '?'。
+    const std::string resolved = findAsset(cfg.fontPath);
+    ImFont* f = nullptr;
+    if (!resolved.empty()) {
+        f = io.Fonts->AddFontFromFileTTF(resolved.c_str(), size, &fc, ranges);
     }
 
-    ImFont* f = io.Fonts->AddFontFromFileTTF(cfg.fontPath.c_str(), size, &fc, ranges);
     if (f) {
         fontLoaded_ = true;
-        fontPathUsed_ = cfg.fontPath;
+        fontPathUsed_ = resolved;
+        if (resolved != cfg.fontPath) {
+            // 说明是从别的目录找回来的，值得报一下，便于排查部署问题
+            printf("[ui] 字体解析：'%s' -> '%s'\n", cfg.fontPath.c_str(), resolved.c_str());
+        }
         return true;
     }
 
-    // 回退：内置字体（不含中文），至少让程序能跑起来并报出原因
-    fprintf(stderr, "[ui] 无法加载字体 '%s'（%s），回退到内置字体，中文将显示为方块\n",
-            cfg.fontPath.c_str(), "确认工作目录下有该文件");
+    // 回退：内置字体（不含中文），至少让程序能跑起来。
+    //
+    // ⚠️ 这条警告必须是**纯 ASCII**：它要报告的问题恰恰是"中文字形不可用"，
+    // 如果它自己用中文写，用户只会看到一个满是 '?' 的弹窗，还是不知道发生了什么。
+    // （这个坑是实测字体缺失路径时才暴露出来的。）
+    const std::string exeDir = executableDir();
+    fontWarning_ = "Could not load the UI font file:\n    " + cfg.fontPath + "\n\n" +
+                   "Chinese text will be displayed as '?' because the built-in\n"
+                   "fallback font has no CJK glyphs.\n\n"
+                   "Searched these locations:\n"
+                   "    1. current working directory\n";
+    if (!exeDir.empty()) {
+        fontWarning_ += "    2. " + exeDir + "\n";
+        fontWarning_ += "    3. " + exeDir + "..\\\n";
+    }
+    fontWarning_ += "\nCopy the font file next to paintboard.exe (or one level above it).";
+
+    fprintf(stderr,
+            "[ui] 无法加载字体 '%s'，回退到内置字体，界面中文将显示为 '?'\n%s\n",
+            cfg.fontPath.c_str(), fontWarning_.c_str());
+
     io.Fonts->AddFontDefault();
     fontLoaded_ = false;
     fontPathUsed_.clear();

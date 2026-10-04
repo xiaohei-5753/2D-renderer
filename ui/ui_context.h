@@ -55,6 +55,10 @@ public:
     bool fontLoaded() const { return fontLoaded_; }
     const std::string& fontPathUsed() const { return fontPathUsed_; }
 
+    // 字体加载失败时的说明（含已尝试过的路径）。非空表示界面中文会显示成 '?'，
+    // 界面必须把这件事**显示出来**——双击启动时没有控制台，用户只会看到满屏问号。
+    const std::string& fontWarning() const { return fontWarning_; }
+
 private:
     void applyTheme(float scale);
     bool loadFont(const UiConfig& cfg, float scale);
@@ -64,6 +68,7 @@ private:
     float dpiScale_ = 1.0f;
     bool fontLoaded_ = false;
     std::string fontPathUsed_;
+    std::string fontWarning_;
 };
 
 }  // namespace pb::ui

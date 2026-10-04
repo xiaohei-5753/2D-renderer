@@ -133,6 +133,7 @@ int main(int argc, char** argv) {
     bool forceVisible = false, forceHidden = false;
     int framesToRun = 0;
     int paletteIndex = -1;
+    app::LightMode startMode = app::LightMode::Sweep;
     std::string outFile;
 
     for (int i = 1; i < argc; i++) {
@@ -151,6 +152,12 @@ int main(int argc, char** argv) {
             outFile = argv[++i];
         } else if (std::strcmp(argv[i], "--palette") == 0 && i + 1 < argc) {
             paletteIndex = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            const char* m = argv[++i];
+            if (std::strcmp(m, "pathtrace") == 0 || std::strcmp(m, "pt") == 0)
+                startMode = app::LightMode::PathTrace;
+            else
+                startMode = app::LightMode::Sweep;
         } else if (std::strcmp(argv[i], "--visible") == 0) {
             forceVisible = true;
         } else if (std::strcmp(argv[i], "--hidden") == 0) {
@@ -179,6 +186,7 @@ int main(int argc, char** argv) {
     a.history.reset();
     a.opts.color = a.palette.current();
     a.demo = demo;
+    a.lightMode = startMode;
 
     // 自动化/回归用：直接切到某一套色板（例如 NES 55 色，验证色块网格的自动换行）
     if (paletteIndex >= 0) {
@@ -217,11 +225,23 @@ int main(int argc, char** argv) {
         fprintf(stderr, "光照管线初始化失败\n");
         return 1;
     }
+    // 扫描 GI 默认环境光压得比较低（它靠方向累积出亮度）
     sweep.settings().rayRadius = 128;
     sweep.settings().ambient[0] = 0.08f;
     sweep.settings().ambient[1] = 0.08f;
     sweep.settings().ambient[2] = 0.10f;
     a.sweep = &sweep;
+
+    gfx::PathTrace pt;
+    if (!pt.init(cw, ch)) {
+        fprintf(stderr, "路径追踪初始化失败\n");
+        return 1;
+    }
+    // 路径追踪是"收集"式的：空白处的亮度就等于环境光，所以这一项决定背景明暗
+    pt.settings().ambient[0] = 0.12f;
+    pt.settings().ambient[1] = 0.12f;
+    pt.settings().ambient[2] = 0.14f;
+    a.pt = &pt;
 
     gfx::Viewport vp;
     if (!vp.init()) {
@@ -266,17 +286,39 @@ int main(int argc, char** argv) {
         // --- 4. 构建 UI（顺带确定画布矩形）---
         app::drawUi(a);
 
+        // 第一次拿到画布矩形后做一次整数倍缩放并居中（像素画必须整数倍，
+        // 否则 NEAREST 采样会让像素列宽不均，表现为竖条纹）。之后不再干预用户。
+        if (!a.cameraInitialized && a.canvasVisible) {
+            vp.fitIntegerZoom();
+            a.cameraInitialized = true;
+        }
+
         // --- 5. 上传画布（只传脏矩形）+ 光照 ---
         const Rect dirty = a.canvas.takeDirty();
         if (!dirty.empty()) {
+            // 两个渲染器都保持同步：脏矩形通常很小，双份上传的代价可以忽略，
+            // 换来的好处是切换模式时无需重新上传整张画布。
             sweep.upload(a.canvas.image(), a.canvas.materialData(), dirty);
+            pt.upload(a.canvas.image(), a.canvas.materialData(), dirty);
             a.lightDirty = true;
+            // 画布一变，旧的累积样本就和新几何对不上了（会拖影），必须重置
+            pt.resetAccumulation();
         }
-        if (a.lightOn && a.lightDirty && a.canvasVisible) {
-            lightTimer.begin();
-            sweep.render();
-            lightTimer.end();
-            a.lightDirty = false;
+
+        if (a.lightOn && a.canvasVisible) {
+            if (a.lightMode == app::LightMode::Sweep) {
+                if (a.lightDirty) {
+                    lightTimer.begin();
+                    sweep.render();
+                    lightTimer.end();
+                    a.lightDirty = false;
+                }
+            } else if (!pt.converged()) {
+                // 路径追踪每帧累积一个样本，直到收敛；收敛后不再浪费 GPU
+                lightTimer.begin();
+                pt.render();
+                lightTimer.end();
+            }
         }
         // 计时器结果要下一帧才可用（不阻塞管线）
         {
@@ -297,7 +339,10 @@ int main(int argc, char** argv) {
         glClearColor(0.031f, 0.031f, 0.039f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         if (a.canvasVisible) {
-            const GLuint shown = a.lightOn ? sweep.resultTexture() : sweep.canvasTexture();
+            const bool ptMode = (a.lightMode == app::LightMode::PathTrace);
+            GLuint shown;
+            if (!a.lightOn) shown = ptMode ? pt.albedoTexture() : sweep.canvasTexture();
+            else shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
             vp.draw(shown);
         }
 
@@ -336,6 +381,7 @@ int main(int argc, char** argv) {
 
     vp.shutdown();
     sweep.shutdown();
+    pt.shutdown();
     lightTimer.shutdown();
     uiCtx.shutdown();
     ctx.destroy();

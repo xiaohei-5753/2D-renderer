@@ -126,6 +126,20 @@ const char* lightModeName(LightMode m) {
 
 void requestNewCanvasDialog() { g_openNewCanvas = true; }
 
+void actSetLightMode(App& a, LightMode mode) {
+    if (a.lightMode == mode) return;
+    a.lightMode = mode;
+    a.lightDirty = true;
+    // 两种模式的样本语义完全不同，切换时必须清空累积，否则会短暂显示混合结果
+    if (a.pt) a.pt->resetAccumulation();
+    a.lastAction = std::string("照明模式 ") + lightModeName(mode);
+}
+
+void actLightSettingsChanged(App& a) {
+    a.lightDirty = true;
+    if (a.pt) a.pt->resetAccumulation();
+}
+
 // ---------------------------------------------------------------------------
 // 动作
 // ---------------------------------------------------------------------------
@@ -187,7 +201,7 @@ void actClearCanvas(App& a) {
 }
 
 void actResetCamera(App& a) {
-    if (a.vp) a.vp->resetCamera();
+    if (a.vp) a.vp->fitIntegerZoom();
 }
 
 void actNewCanvas(App& a, int w, int h) {
@@ -200,6 +214,7 @@ void actNewCanvas(App& a, int w, int h) {
     if (a.vp) a.vp->setCanvasSize(w, h);
     a.lightDirty = true;
     a.lastAction = "新建画布";
+    a.cameraInitialized = false;   // 新画布重新做一次整数倍适配
     printf("[画布] 新建 %dx%d\n", w, h);
 }
 
@@ -613,7 +628,8 @@ const MaterialPreset kMaterialPresets[] = {
     {"空气", "完全通透，不挡光也不发光（等于擦除）", 0, 0, 1.0f, 0},
     {"半透明", "只挡一部分光，自己不发光", 128, 0, 1.0f, 0},
     {"霓虹管", "半透明 + 强自发光，会点亮周围", 110, 170, 1.0f, 0},
-    {"彩色玻璃", "半透明 + 带色，透过的光被染色", 120, 0, 1.5f, 0},
+    {"彩色玻璃", "半透明 + 带色，透过的光被染色。建议用于细线/薄片："
+                 "遮挡是逐格吸收的，大块填充会因厚度而变得不透明", 120, 0, 1.5f, 0},
     {"实心墙", "完全挡光，画面显示自身颜色", 255, 0, 1.0f, 0},
     {"镜面", "完全挡光 + 反射（反射需 P2 的光追通道）", 255, 0, 1.0f,
      Material::kReflective},
@@ -680,11 +696,12 @@ void drawMaterialSection(App& a) {
     bool solid = m.solid();
     if (ImGui::Checkbox("强制实心", &solid)) m.setSolid(solid);
 
-    // 如实标注哪些参数已经生效——否则用户调了折射率却看不到变化，会以为坏了
+    // 如实标注哪些参数在哪个模式下生效——否则用户调了折射率却看不到变化，会以为坏了
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.35f, 1.0f));
-    ImGui::TextWrapped("当前生效：遮挡、自发光、强制实心（扫描 GI）。"
-                       "折射与反射需要 P2 的逐像素光追通道，现在改了不起作用。");
+    ImGui::TextWrapped("遮挡与自发光：两种模式都生效。"
+                       "反射与折射：只在「路径追踪」模式下生效"
+                       "（扫描 GI 是直线扫描，物理上做不了弯曲光路）。");
     ImGui::PopStyleColor();
 
     // ------------------------------------------------------------------
@@ -740,9 +757,127 @@ void drawMaterialSection(App& a) {
 }
 
 void drawLightingSection(App& a) {
-    ImGui::TextDisabled("光照面板待实现（UI-3）");
-    ImGui::TextDisabled("模式：%s，扫描 GI 共 %d 个方向", lightModeName(a.lightMode),
-                        a.sweep ? a.sweep->directionCount() : 0);
+    // ------------------------------------------------------------------
+    // 1. 照明模式
+    // ------------------------------------------------------------------
+    ImGui::TextDisabled("照明模式");
+    const float mw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) *
+                     0.5f;
+    const bool isSweep = (a.lightMode == LightMode::Sweep);
+    if (ui::toolButton("modeSweep", "扫描 GI", isSweep, "每帧沿 N 个方向扫描，极快，无反射",
+                       ImVec2(mw, a.ui(26.0f))))
+        actSetLightMode(a, LightMode::Sweep);
+    ImGui::SameLine();
+    if (ui::toolButton("modePt", "路径追踪", !isSweep,
+                       "每条射线可反射/漫反射/折射，逐步累积收敛", ImVec2(mw, a.ui(26.0f))))
+        actSetLightMode(a, LightMode::PathTrace);
+
+    ImGui::Spacing();
+    ImGui::Checkbox("开启光照", &a.lightOn);
+    if (ImGui::IsItemEdited()) a.lightDirty = true;
+    ImGui::SameLine();
+    if (ImGui::Button("重置累积")) actLightSettingsChanged(a);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("清空时间累积，重新从第 1 个样本开始收敛");
+
+    // ------------------------------------------------------------------
+    // 2. 公共参数
+    // ------------------------------------------------------------------
+    ImGui::SeparatorText("公共");
+    {
+        float amb[3] = {0.0f, 0.0f, 0.0f};
+        if (isSweep && a.sweep) {
+            amb[0] = a.sweep->settings().ambient[0];
+            amb[1] = a.sweep->settings().ambient[1];
+            amb[2] = a.sweep->settings().ambient[2];
+        } else if (!isSweep && a.pt) {
+            amb[0] = a.pt->settings().ambient[0];
+            amb[1] = a.pt->settings().ambient[1];
+            amb[2] = a.pt->settings().ambient[2];
+        }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::ColorEdit3("##ambient", amb, ImGuiColorEditFlags_InputRGB)) {
+            if (isSweep && a.sweep) {
+                for (int i = 0; i < 3; i++) a.sweep->settings().ambient[i] = amb[i];
+            } else if (!isSweep && a.pt) {
+                for (int i = 0; i < 3; i++) a.pt->settings().ambient[i] = amb[i];
+            }
+            actLightSettingsChanged(a);
+        }
+        ImGui::TextDisabled("环境光（逃出画布的射线得到的亮度）");
+
+        float em = isSweep && a.sweep ? a.sweep->settings().emitScale
+                                      : (a.pt ? a.pt->settings().emitScale : 1.0f);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderFloat("##emit", &em, 0.0f, 4.0f, "自发光倍率 %.2f")) {
+            if (isSweep && a.sweep) a.sweep->settings().emitScale = em;
+            else if (a.pt) a.pt->settings().emitScale = em;
+            actLightSettingsChanged(a);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 3. 模式专属参数
+    // ------------------------------------------------------------------
+    if (isSweep && a.sweep) {
+        ImGui::SeparatorText("扫描 GI");
+        gfx::LightSettings& s = a.sweep->settings();
+        int r = s.rayRadius;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderInt("##radius", &r, 4, 512, "方向表半径 %d",
+                             ImGuiSliderFlags_AlwaysClamp)) {
+            s.rayRadius = r;
+            actLightSettingsChanged(a);
+        }
+        ImGui::TextDisabled("当前 %d 个方向（半径越大越平滑、越慢）",
+                            a.sweep->directionCount());
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderFloat("##cp", &s.propagate, 0.5f, 2.0f, "沿程增益 %.2f")) {
+            actLightSettingsChanged(a);
+        }
+    } else if (a.pt) {
+        ImGui::SeparatorText("路径追踪");
+        gfx::PathTraceSettings& s = a.pt->settings();
+
+        int steps = s.maxSteps;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderInt("##steps", &steps, 16, 512, "最大步长 %d",
+                             ImGuiSliderFlags_AlwaysClamp)) {
+            s.maxSteps = steps;
+            actLightSettingsChanged(a);
+        }
+        int bounces = s.maxBounces;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderInt("##bounces", &bounces, 1, 8, "最大弹射 %d",
+                             ImGuiSliderFlags_AlwaysClamp)) {
+            s.maxBounces = bounces;
+            actLightSettingsChanged(a);
+        }
+        ImGui::TextDisabled("弹射 = 反射 / 折射 / 漫反射的次数");
+
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderFloat("##exposure", &s.exposure, 0.2f, 5.0f, "曝光 %.2f")) {
+            actLightSettingsChanged(a);
+        }
+        if (ImGui::Checkbox("色调映射（Reinhard）", &s.tonemap)) actLightSettingsChanged(a);
+        ImGui::TextDisabled("累积值可能远超 1，关掉会丢掉高光");
+
+        // 收敛进度
+        ImGui::Spacing();
+        const int n = a.pt->sampleCount();
+        const float frac = (float)n / (float)gfx::PathTrace::kConvergedSamples;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%d / %d 样本", n,
+                      gfx::PathTrace::kConvergedSamples);
+        ImGui::ProgressBar(frac, ImVec2(-1.0f, a.ui(14.0f)), buf);
+        if (a.pt->converged())
+            ImGui::TextDisabled("已收敛，停止继续采样（省 GPU）");
+        else
+            ImGui::TextDisabled("每帧 1 条射线，靠时间累积收敛");
+    }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("光照 %.1f ms | 光照图层 %s", a.lightMs, a.lightOn ? "开" : "关");
 }
 
 // ---------------------------------------------------------------------------

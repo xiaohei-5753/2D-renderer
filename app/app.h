@@ -13,6 +13,7 @@
 #include "core/types.h"
 #include "gfx/gl_context.h"
 #include "gfx/light_sweep.h"
+#include "gfx/path_trace.h"
 #include "gfx/viewport.h"
 
 namespace pb::app {
@@ -33,6 +34,7 @@ struct App {
     // --- 渲染对象（由 main 填充，不持有所有权）---
     gfx::GLContext* ctx = nullptr;
     gfx::LightSweep* sweep = nullptr;
+    gfx::PathTrace* pt = nullptr;
     gfx::Viewport* vp = nullptr;
 
     // --- 面板布局（可拖拽调宽 / 折叠）---
@@ -57,6 +59,8 @@ struct App {
 
     // --- 视图选项 ---
     bool showPixelGrid = false;
+    // 首次拿到画布矩形后自动做一次整数倍缩放（像素画必须），之后不再干预用户
+    bool cameraInitialized = false;
 
     // --- 画布视口矩形（逻辑坐标，左上原点），由画布面板每帧写入 ---
     float canvasX = 0.0f, canvasY = 0.0f, canvasW = 0.0f, canvasH = 0.0f;

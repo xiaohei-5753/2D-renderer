@@ -80,6 +80,19 @@ void Viewport::zoomBy(double factor) {
     cam_.zoom = std::clamp(cam_.zoom, 0.02, 64.0);
 }
 
+void Viewport::fitIntegerZoom() {
+    cam_.x = 0.5;
+    cam_.y = 0.5;
+    const double ppc = pixelsPerCell();
+    if (!(ppc > 1e-6)) return;
+
+    // 目标：pixelsPerCell 变成最接近的整数（至少 1）。
+    // 缩得很小（<1 像素/格）时保持连续缩放，因为那时整数吸附只会让画布缩成一小团。
+    double target = std::floor(ppc + 0.5);
+    if (target < 1.0) return;
+    cam_.zoom *= ppc / target;
+}
+
 void Viewport::viewUV(float& du, float& dv) const {
     const float a = (float)vw_ / (float)cw_;
     const float b = (float)vh_ / (float)ch_;

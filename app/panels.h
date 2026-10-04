@@ -38,6 +38,12 @@ void actResetCamera(App& a);
 // 把颜色记入"最近使用"（去重，最新在前）。所有改色的入口都应调用它。
 void pushRecentColor(App& a, RGBA8 c);
 
+// 切换照明模式（会重置路径追踪的累积，否则两种模式的样本会混在一起）
+void actSetLightMode(App& a, LightMode mode);
+
+// 光照参数变了：标记需要重算（路径追踪还要重置累积，否则新旧参数会混叠）
+void actLightSettingsChanged(App& a);
+
 // 请求打开"新建画布"对话框（快捷键与菜单共用同一个入口）
 void requestNewCanvasDialog();
 

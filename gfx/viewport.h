@@ -59,6 +59,13 @@ public:
     void panByUV(double du, double dv) { cam_.x += du; cam_.y += dv; }
     void zoomBy(double factor);
 
+    // 把缩放吸附到"一个画布像素 = 整数个屏幕像素"，并让画布居中。
+    //
+    // 像素画必须这样：非整数倍下 NEAREST 采样会让像素列宽忽大忽小（有的列占 2 个屏幕
+    // 像素、有的占 3 个），表现为整片竖条纹。扫描 GI 输出平滑时看不出来，
+    // 路径追踪带噪声时就很明显。
+    void fitIntegerZoom();
+
     // --- 绘制目标 ---
     // 逻辑坐标（左上原点）的矩形：所有屏幕<->画布换算都以它为基准
     void setViewRect(double x, double y, double w, double h);

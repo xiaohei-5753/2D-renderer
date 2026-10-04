@@ -21,6 +21,7 @@
 #include "gfx/gl_context.h"
 #include "gfx/gl_texture.h"
 #include "gfx/light_sweep.h"
+#include "gfx/path_trace.h"
 
 using namespace pb;
 
@@ -34,6 +35,11 @@ struct Options {
     float ambient[3] = {0.10f, 0.10f, 0.12f};
     std::string out = "out.png";
     std::string dumpCanvas;   // 非空则额外导出未受光的画布原图
+    std::string mode = "sweep";   // sweep | pathtrace
+    int samples = 64;             // pathtrace 的累积样本数
+    int bounces = 4;
+    int steps = 240;
+    float ptAmbient = 0.42f;
 };
 
 void usage() {
@@ -85,6 +91,14 @@ bool parseArgs(int argc, char** argv, Options& o) {
             const char* v = next("--out"); if (!v) return false; o.out = v;
         } else if (a == "--dump-canvas") {
             const char* v = next("--dump-canvas"); if (!v) return false; o.dumpCanvas = v;
+        } else if (a == "--mode") {
+            const char* v = next("--mode"); if (!v) return false; o.mode = v;
+        } else if (a == "--samples") {
+            const char* v = next("--samples"); if (!v) return false; o.samples = atoi(v);
+        } else if (a == "--bounces") {
+            const char* v = next("--bounces"); if (!v) return false; o.bounces = atoi(v);
+        } else if (a == "--steps") {
+            const char* v = next("--steps"); if (!v) return false; o.steps = atoi(v);
         } else {
             fprintf(stderr, "[cli] 未知参数: %s\n", a.c_str());
             usage();
@@ -200,26 +214,68 @@ int main(int argc, char** argv) {
     }
 
     // --- 3. 跑光照 ---
-    gfx::LightSweep sweep;
-    if (!sweep.init(opt.w, opt.h)) {
-        fprintf(stderr, "[cli] 光照管线初始化失败\n");
-        return 1;
+    const bool usePt = (opt.mode == "pathtrace" || opt.mode == "pt");
+    if (!usePt && opt.mode != "sweep") {
+        fprintf(stderr, "[cli] 未知模式 '%s'（可用 sweep / pathtrace）\n", opt.mode.c_str());
+        return 2;
     }
-    sweep.settings().rayRadius = opt.radius;
-    sweep.settings().emitScale = opt.emit;
-    for (int i = 0; i < 3; i++) sweep.settings().ambient[i] = opt.ambient[i];
-    sweep.uploadAll(canvas.image(), canvas.materialData());
 
-    const auto t0 = std::chrono::steady_clock::now();
-    sweep.render();
-    glFinish();
-    const auto t1 = std::chrono::steady_clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    printf("[cli] 光照耗时 %.2f ms（%d 个方向）\n", ms, sweep.directionCount());
+    gfx::LightSweep sweep;
+    gfx::PathTrace pt;
+    GLuint srcTex = 0;
+
+    if (!usePt) {
+        if (!sweep.init(opt.w, opt.h)) {
+            fprintf(stderr, "[cli] 扫描 GI 初始化失败\n");
+            return 1;
+        }
+        sweep.settings().rayRadius = opt.radius;
+        sweep.settings().emitScale = opt.emit;
+        for (int i = 0; i < 3; i++) sweep.settings().ambient[i] = opt.ambient[i];
+        sweep.uploadAll(canvas.image(), canvas.materialData());
+
+        const auto t0 = std::chrono::steady_clock::now();
+        sweep.render();
+        glFinish();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        printf("[cli] 扫描 GI 耗时 %.2f ms（%d 个方向）\n", ms, sweep.directionCount());
+        srcTex = sweep.resultTexture();
+    } else {
+        if (!pt.init(opt.w, opt.h)) {
+            fprintf(stderr, "[cli] 路径追踪初始化失败\n");
+            return 1;
+        }
+        pt.settings().maxBounces = opt.bounces;
+        pt.settings().maxSteps = opt.steps;
+        pt.settings().emitScale = opt.emit;
+        for (int i = 0; i < 3; i++) pt.settings().ambient[i] = opt.ptAmbient;
+        pt.uploadAll(canvas.image(), canvas.materialData());
+        pt.resetAccumulation();
+
+        // 每帧累积一个样本：先测单帧耗时（实时性），再累积到目标样本数（画质）
+        const auto t0 = std::chrono::steady_clock::now();
+        pt.render();
+        glFinish();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double frameMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        const int n = std::max(1, opt.samples);
+        const auto t2 = std::chrono::steady_clock::now();
+        for (int i = 1; i < n; i++) pt.render();
+        glFinish();
+        const auto t3 = std::chrono::steady_clock::now();
+        const double totalMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+        printf("[cli] 路径追踪：单帧 %.2f ms（%.0f fps 实时性），%d 样本共 %.1f ms\n",
+               frameMs, frameMs > 0.0 ? 1000.0 / frameMs : 0.0, n, totalMs);
+        printf("[cli] 参数：弹射 %d，最大步长 %d\n", opt.bounces, opt.steps);
+        srcTex = pt.resultTexture();
+    }
 
     // --- 4. 回读并写 PNG ---
     Image result(opt.w, opt.h);
-    if (!gfx::readbackTexture(sweep.resultTexture(), opt.w, opt.h, result.data())) {
+    if (!gfx::readbackTexture(srcTex, opt.w, opt.h, result.data())) {
         fprintf(stderr, "[cli] 回读渲染结果失败\n");
         return 1;
     }

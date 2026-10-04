@@ -1,0 +1,19 @@
+# --- 构建产物 ---
+/build/
+/out/
+*.o
+*.a
+*.exe
+*.dll
+
+# --- 截图 / 渲染输出 ---
+*.tga
+*.png.tmp
+
+# --- 归档的旧代码与实验残骸（保留在 git 历史里，不在工作区） ---
+/_attic/
+
+# --- 小熊猫 C++ / Dev-C++ IDE 状态文件 ---
+*.layout
+*.bookmarks
+*.debug

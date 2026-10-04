@@ -1,0 +1,42 @@
+# Project: magic-simulator
+# Makefile created by Red Panda C++ 3.4.3279
+
+CXX      = "g++.exe"
+CC       = "gcc.exe"
+WINDRES  = "windres.exe"
+RM       = del /q /f
+CD       = cd /d
+LIBS     = "-Wl,--stack,12582912" "-s" "-lglfw3" "-lglew32" "-lopengl32" "-lwinmm" "-lgdi32" "-static" "-static"
+INCS     = 
+CXXINCS  = 
+CXXFLAGS = $(CXXINCS) "-fno-ms-extensions" "-O2" "-pipe" "-Werror=return-type" "-Werror=vla"
+CFLAGS   = $(INCS) "-fno-ms-extensions" "-O2" "-pipe" "-Werror=implicit-int" "-Werror=return-type" "-Werror=vla"
+NASM_FLAGS   =  "-f" "elf64"
+WINDRESFLAGS = 
+OBJ      = renderer.o simulation.o config.o main.o
+BIN      = magic-simulator.exe
+LINKOBJ  = "renderer.o" "simulation.o" "config.o" "main.o"
+CLEANOBJ = "renderer.o" "simulation.o" "config.o" "main.o" "magic-simulator.exe"
+
+.PHONY: all all-before all-after clean clean-custom
+
+all: all-before $(BIN) all-after
+
+clean: clean-custom
+	-$(RM) $(CLEANOBJ) >NUL 2>&1
+
+magic-simulator.exe: $(OBJ)
+
+	$(CXX) $(LINKOBJ) -o "magic-simulator.exe" $(LIBS)
+
+renderer.o: renderer.cpp renderer.h
+	$(CXX) -c "renderer.cpp" -o "renderer.o" $(CXXFLAGS)  -finput-charset=UTF-8 -fexec-charset=gbk
+
+simulation.o: simulation.cpp simulation.h grid.h
+	$(CXX) -c "simulation.cpp" -o "simulation.o" $(CXXFLAGS)  -finput-charset=UTF-8 -fexec-charset=gbk
+
+config.o: config.cpp config.h
+	$(CXX) -c "config.cpp" -o "config.o" $(CXXFLAGS)  -finput-charset=UTF-8 -fexec-charset=gbk
+
+main.o: main.cpp simulation.h renderer.h grid.h config.h
+	$(CXX) -c "main.cpp" -o "main.o" $(CXXFLAGS)  -finput-charset=UTF-8 -fexec-charset=gbk

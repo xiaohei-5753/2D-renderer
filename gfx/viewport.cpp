@@ -67,16 +67,25 @@ void Viewport::setCanvasSize(int w, int h) {
     ch_ = std::max(1, h);
 }
 
+void Viewport::setViewRect(double x, double y, double w, double h) {
+    vx_ = x;
+    vy_ = y;
+    vw_ = std::max(1.0, w);
+    vh_ = std::max(1.0, h);
+}
+
 void Viewport::zoomBy(double factor) {
     if (!(factor > 0.0)) return;
     cam_.zoom *= factor;
     cam_.zoom = std::clamp(cam_.zoom, 0.02, 64.0);
 }
 
-void Viewport::viewUV(int fbW, int fbH, float& du, float& dv) const {
-    const float a = (float)fbW / (float)cw_;
-    const float b = (float)fbH / (float)ch_;
-    const float m = std::max(a, b);
+void Viewport::viewUV(float& du, float& dv) const {
+    const float a = (float)vw_ / (float)cw_;
+    const float b = (float)vh_ / (float)ch_;
+    // Contain 取 min：一个轴恰好铺满，另一个轴留边，于是整块画布都看得见。
+    // Cover   取 max：一个轴恰好铺满，另一个轴溢出被裁掉（原行为）。
+    const float m = (fit_ == FitMode::Contain) ? std::min(a, b) : std::max(a, b);
     if (!(m > 0.0f)) {
         du = dv = 1.0f;
         return;
@@ -87,20 +96,23 @@ void Viewport::viewUV(int fbW, int fbH, float& du, float& dv) const {
     dv = (b / m) * (float)z;
 }
 
-void Viewport::screenToCanvasF(double sx, double sy, int winW, int winH, int fbW,
-                               int fbH, double& cx, double& cy) const {
-    cx = cy = 0.0;
-    if (winW <= 0 || winH <= 0) return;
-    if (fbW <= 0 || fbH <= 0) {
-        fbW = winW;
-        fbH = winH;
-    }
+double Viewport::pixelsPerCell() const {
+    float du = 1.0f, dv = 1.0f;
+    viewUV(du, dv);
+    const double visW = (double)du * (double)cw_;   // 可见范围相当于多少画布像素宽
+    if (!(visW > 0.0)) return 1.0;
+    return vw_ / visW;
+}
 
-    const double u = sx / (double)winW;
-    const double v = 1.0 - sy / (double)winH;   // 屏幕 Y 向下，UV 的 V 向上
+void Viewport::screenToCanvasF(double sx, double sy, double& cx, double& cy) const {
+    cx = cy = 0.0;
+    if (!(vw_ > 0.0) || !(vh_ > 0.0)) return;
+
+    const double u = (sx - vx_) / vw_;
+    const double v = 1.0 - (sy - vy_) / vh_;   // 屏幕 Y 向下，UV 的 V 向上
 
     float du = 1.0f, dv = 1.0f;
-    viewUV(fbW, fbH, du, dv);
+    viewUV(du, dv);
 
     const double abx = (double)du * (u - 0.5) + cam_.x;
     const double aby = (double)dv * (v - 0.5) + cam_.y;
@@ -109,53 +121,50 @@ void Viewport::screenToCanvasF(double sx, double sy, int winW, int winH, int fbW
     cy = aby * (double)ch_;
 }
 
-void Viewport::screenToCanvas(double sx, double sy, int winW, int winH, int fbW, int fbH,
-                              int& cx, int& cy) const {
+void Viewport::screenToCanvas(double sx, double sy, int& cx, int& cy) const {
     double fx = 0.0, fy = 0.0;
-    screenToCanvasF(sx, sy, winW, winH, fbW, fbH, fx, fy);
-    if (winW <= 0 || winH <= 0) {
-        cx = cy = 0;
-        return;
-    }
+    screenToCanvasF(sx, sy, fx, fy);
     cx = std::clamp((int)fx, 0, cw_ - 1);
     cy = std::clamp((int)fy, 0, ch_ - 1);
 }
 
-void Viewport::canvasToFramebuffer(double cx, double cy, int fbW, int fbH, double& fx,
-                                   double& fy) const {
-    fx = fy = 0.0;
-    if (fbW <= 0 || fbH <= 0) return;
-
+void Viewport::canvasToViewUV(double cx, double cy, double& u, double& v) const {
     float du = 1.0f, dv = 1.0f;
-    viewUV(fbW, fbH, du, dv);
-    if (!(du > 0.0f) || !(dv > 0.0f)) return;
-
-    const double abx = cx / (double)cw_;
-    const double aby = cy / (double)ch_;
-    const double u = (abx - cam_.x) / (double)du + 0.5;
-    const double v = (aby - cam_.y) / (double)dv + 0.5;
-
-    fx = u * (double)fbW;
-    fy = (1.0 - v) * (double)fbH;   // 帧缓冲的 y 轴向下，UV 的 V 向上
+    viewUV(du, dv);
+    u = (cx / (double)cw_ - cam_.x) / (double)du + 0.5;
+    v = (cy / (double)ch_ - cam_.y) / (double)dv + 0.5;
 }
 
-double Viewport::pixelsPerCell(int fbW, int fbH) const {
-    float du = 1.0f, dv = 1.0f;
-    viewUV(fbW, fbH, du, dv);
-    const double visW = (double)du * (double)cw_;   // 可见范围相当于多少画布像素宽
-    if (!(visW > 0.0)) return 1.0;
-    return (double)fbW / visW;
+void Viewport::viewRectToFramebuffer(double& fx, double& fy, double& fw, double& fh) const {
+    fx = vx_ * fbScale_;
+    fy = vy_ * fbScale_;
+    fw = vw_ * fbScale_;
+    fh = vh_ * fbScale_;
 }
 
-void Viewport::draw(GLuint texture, int fbW, int fbH) {
-    if (!prog_ || fbW <= 0 || fbH <= 0) return;
+void Viewport::draw(GLuint texture) {
+    if (!prog_ || !viewRectValid() || fbHeight_ <= 0) return;
 
-    glViewport(0, 0, fbW, fbH);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    double fx = 0.0, fy = 0.0, fw = 0.0, fh = 0.0;
+    viewRectToFramebuffer(fx, fy, fw, fh);
+
+    const int x0 = (int)std::lround(fx);
+    const int y0 = (int)std::lround(fy);
+    const int rw = std::max(1, (int)std::lround(fw));
+    const int rh = std::max(1, (int)std::lround(fh));
+
+    // 逻辑坐标是左上原点，GL 的视口是左下原点，这里翻转
+    const int glY = fbHeight_ - (y0 + rh);
+
+    glViewport(x0, glY, rw, rh);
+    // 关键：scissor 保证画布不会溢出到 ImGui 面板上
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x0, glY, rw, rh);
+    glClearColor(0.031f, 0.031f, 0.039f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     float du = 1.0f, dv = 1.0f;
-    viewUV(fbW, fbH, du, dv);
+    viewUV(du, dv);
 
     glUseProgram(prog_);
     glActiveTexture(GL_TEXTURE0);
@@ -168,6 +177,8 @@ void Viewport::draw(GLuint texture, int fbW, int fbH) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
     glUseProgram(0);
+
+    glDisable(GL_SCISSOR_TEST);
 }
 
 }  // namespace pb::gfx

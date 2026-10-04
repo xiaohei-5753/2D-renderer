@@ -169,7 +169,7 @@ function Get-ObjPath {
 }
 
 function Invoke-Compile {
-    param([string]$src)
+    param([string]$src, [string[]]$ExtraFlags = @())
     $obj = Get-ObjPath $src
     $need = $true
     if (Test-Path -LiteralPath $obj) {
@@ -179,13 +179,13 @@ function Invoke-Compile {
         }
     }
     if (-not $need) {
-        $script:skipCount++
+        $script:skipCount += 1
         return $obj
     }
     Write-Host ("  CXX  " + $src.Substring($root.Length).TrimStart('\', '/'))
-    $code = Invoke-Tool -Exe $gxx -ToolArgs (@('-c', $src, '-o', $obj) + $commonFlags)
+    $code = Invoke-Tool -Exe $gxx -ToolArgs (@('-c', $src, '-o', $obj) + $commonFlags + $ExtraFlags)
     if ($code -ne 0) { throw "compile failed: $src" }
-    $script:compileCount++
+    $script:compileCount += 1
     return $obj
 }
 
@@ -195,7 +195,24 @@ function Invoke-Compile {
 $libSources = @()
 $libSources += @(Get-ChildItem -Path (Join-Path $root 'core') -Filter '*.cpp' | ForEach-Object { $_.FullName })
 $libSources += @(Get-ChildItem -Path (Join-Path $root 'gfx')  -Filter '*.cpp' | ForEach-Object { $_.FullName })
+$libSources += @(Get-ChildItem -Path (Join-Path $root 'ui')   -Filter '*.cpp' | ForEach-Object { $_.FullName })
 if ($libSources.Count -eq 0) { Write-Error "no library sources found"; exit 1 }
+
+# Dear ImGui is compiled as its own set of translation units with -w: it is
+# upstream code we do not modify, and its warnings would drown out ours.
+$imguiSources = @(
+    'third_party\imgui\imgui.cpp',
+    'third_party\imgui\imgui_draw.cpp',
+    'third_party\imgui\imgui_tables.cpp',
+    'third_party\imgui\imgui_widgets.cpp',
+    'third_party\imgui\backends\imgui_impl_glfw.cpp',
+    'third_party\imgui\backends\imgui_impl_opengl3.cpp'
+) | ForEach-Object { Join-Path $root $_ }
+# the official demo window is a large extra TU; only useful while developing UI
+if ($Config -eq 'debug') { $imguiSources += (Join-Path $root 'third_party\imgui\imgui_demo.cpp') }
+foreach ($s in $imguiSources) {
+    if (-not (Test-Path -LiteralPath $s)) { Write-Error "missing vendored source: $s"; exit 1 }
+}
 
 $buildApp = -not $Cli
 $buildCli = -not $App
@@ -203,15 +220,29 @@ if (-not $App -and -not $Cli) { $buildApp = $true; $buildCli = $true }
 
 $t0 = Get-Date
 
-Write-Host "[1/3] compiling core + gfx ($($libSources.Count) files)"
+Write-Host "[1/3] compiling core + gfx + ui ($($libSources.Count) files)"
 $libObjs = @()
 foreach ($s in $libSources) { $libObjs += (Invoke-Compile $s) }
 
+Write-Host "      compiling vendored Dear ImGui ($($imguiSources.Count) files)"
+foreach ($s in $imguiSources) { $libObjs += (Invoke-Compile $s @('-w')) }
+
 if ($buildApp) {
     Write-Host "[2/3] building app"
-    $appObj = Invoke-Compile (Join-Path $root 'app\main.cpp')
+    $appSources = @(Get-ChildItem -Path (Join-Path $root 'app') -Filter '*.cpp' |
+                    Sort-Object Name | ForEach-Object { $_.FullName })
+    $appObjs = @()
+    foreach ($s in $appSources) { $appObjs += (Invoke-Compile $s) }
     $exe = Join-Path $buildDir 'paintboard.exe'
-    $code = Invoke-Tool -Exe $gxx -ToolArgs (@($libObjs + $appObj, '-o', $exe) + $linkFlags)
+    # Build the argument list explicitly. Writing `@($libObjs + $appObjs, '-o', $exe)`
+    # creates a NESTED array, and PowerShell splats a nested element as a single
+    # space-joined argument -- ld then reports "cannot find a.o b.o c.o".
+    $linkArgs = @()
+    $linkArgs += $libObjs
+    $linkArgs += $appObjs
+    $linkArgs += @('-o', $exe)
+    $linkArgs += $linkFlags
+    $code = Invoke-Tool -Exe $gxx -ToolArgs $linkArgs
     if ($code -ne 0) { throw "link failed: paintboard.exe" }
     Write-Host ("  LINK " + $exe)
 } else {
@@ -227,7 +258,12 @@ if ($buildCli) {
         $obj = Invoke-Compile $t
         $name = [System.IO.Path]::GetFileNameWithoutExtension($t)
         $exe = Join-Path $buildDir ($name + '.exe')
-        $code = Invoke-Tool -Exe $gxx -ToolArgs (@($libObjs + $obj, '-o', $exe) + $linkFlags)
+        $linkArgs = @()
+        $linkArgs += $libObjs
+        $linkArgs += $obj
+        $linkArgs += @('-o', $exe)
+        $linkArgs += $linkFlags
+        $code = Invoke-Tool -Exe $gxx -ToolArgs $linkArgs
         if ($code -ne 0) { throw "link failed: $name" }
         Write-Host ("  LINK " + $exe)
     }

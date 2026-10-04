@@ -17,3 +17,8 @@
 *.layout
 *.bookmarks
 *.debug
+
+# --- 运行时状态 ---
+# ImGui 会把面板宽度/折叠状态持久化到这里；它是每个用户各自的界面状态，不进版本库
+paintboard_layout.ini
+imgui.ini

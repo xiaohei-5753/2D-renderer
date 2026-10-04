@@ -25,18 +25,23 @@ gfx/     OpenGL，但 GLFW-agnostic —— 这就是游戏要复用的渲染库
   gl_context.{h,cpp}  窗口/上下文（离线渲染用隐藏窗口）
   shader.{h,cpp}      着色器编译链接 + 错误上报
   gl_texture.{h,cpp}  纹理分配 + 脏矩形上传 + 回读
+  gl_timer.{h,cpp}    GPU 侧计时（TIME_ELAPSED 查询，不阻塞管线）
   light_sweep.{h,cpp} 方向扫描式全局光照（实时模式）
-  viewport.{h,cpp}    相机、CROP 适配、显示、屏幕↔画布坐标换算
-  hud.{h,cpp}         屏幕空间极简 HUD（纯色矩形：色板条、笔刷光标）
-ui/      画板界面（P3 接入 Dear ImGui）
-app/     GLFW 外壳：窗口 + 输入 + 主循环 —— 画板应用本体
-  main.cpp       交互 + 演示/截图模式
+  viewport.{h,cpp}    相机、适配模式、显示到指定矩形、屏幕↔画布坐标换算
+ui/      通用 ImGui 管线（**不认识画板**）
+  ui_context.{h,cpp}  ImGui 生命周期、字体（unifont + 全量中文）、像素风主题、DPI
+  widgets.{h,cpp}     可拖拽分隔条、色块、工具按钮、状态点
+app/     画板应用本体
+  app.h           统一的 App 状态结构（面板直接读写它）
+  main.cpp        入口 + 主循环（每帧的顺序见文件头注释）
+  panels.{h,cpp}  各面板：菜单栏 / 工具栏 / 画布 / 属性面板 / 状态栏
+  input.{h,cpp}   GLFW 回调 + 键盘快捷键
 tools/   每个 .cpp 编译成一个独立可执行文件
   render_cli.cpp 离线渲染器（出 PNG，渲染效果的验证回路 + 游戏侧素材烘焙）
   core_test.cpp  core 层的 headless 测试（190 项断言）
 third_party/  Dear ImGui v1.92.9b + stb_image_write（源码内置，见其 README）
 _attic/  改造前的原始代码与实验残骸，不参与编译（被 gitignore）
-unifont-17.0.04.otf  UI 字体（P3 用 ImGui 加载中文）
+unifont-17.0.04.otf  UI 字体（中文界面用）
 ```
 
 **边界约束**：`core` 不 include GL，`gfx` 不 include GLFW（宿主提供上下文和尺寸）。
@@ -91,6 +96,55 @@ unifont-17.0.04.otf  UI 字体（P3 用 ImGui 加载中文）
 | 其它 | `Tab` 开关光照（关掉即显示干净原图）　`Ctrl+S` 存原始图　`Ctrl+Shift+S` 存受光图　`Ctrl+N` 清空　`ESC` 退出 |
 
 窗口标题栏实时显示：工具 / 颜色 / alpha / 自发光 / 笔刷 / 色板 / 撤销重做步数 / 光照开关 / fps / 画布尺寸。
+
+## 界面（Dear ImGui）
+
+内置的是 ImGui **v1.92.9b 官方发布版，不含 docking**（`DockSpace`/`DockNode` 只存在于
+docking 分支），所以布局是手工划分的固定三栏 + 可拖拽调宽 + 可折叠：
+
+```
+┌──────────────── 主菜单栏 ────────────────┐
+│ 工具栏 │◀▶│      画布      │◀▶│ 属性面板 │
+│ (左栏) │  │ (裸 GL 绘制)   │  │ (右栏)  │
+├──────────────── 状态栏 ──────────────────┤
+```
+
+### 进度
+
+| 部分 | 状态 |
+|---|---|
+| 工作区骨架（三栏 / 分隔条 / 折叠 / DPI / 主题 / 字体） | ✅ UI-0 |
+| 主菜单栏（文件 / 编辑 / 视图 / 光照 / 帮助） | ✅ UI-0 |
+| 左侧工具栏（10 工具 + 工具选项 + 颜色 + 撤销重做） | ✅ UI-0 |
+| 画布视口（像素网格 + 笔刷光标叠加层） | ✅ UI-0 |
+| 底部状态栏（坐标 / 颜色 / 材质 / 缩放 / 光照 / fps） | ✅ UI-0 |
+| 调色板面板（预设 + 色块网格 + 自由拾色 + hex 输入） | ⬜ UI-1 |
+| 材质面板（自发光 / 折射率 / 反射 / 材质预设） | ⬜ UI-2 |
+| 光照面板（模式切换 / 参数 / 累积状态 / 曝光） | ⬜ UI-3 |
+| 图层面板 + 选区 + 对话框完善 | ⬜ UI-4（P4 范围） |
+
+### 四个必须知道的 ImGui 集成坑（都已踩过并写进注释）
+
+1. **画布输入不能用 `io.WantCaptureMouse` 判断。**
+   画布是一个 ImGui child 窗口，鼠标悬停其上时 `WantCaptureMouse` 会变成 `true`，
+   用它做闸门会导致**永远画不上东西**。正确判据是"画布是不是当前被悬停的窗口"
+   （`ImGui::IsWindowHovered()`）——它在被别的窗口 / 弹出层 / 正在拖拽的控件挡住时返回 false。
+   键盘快捷键则用 `io.WantTextInput` 让路（在输入框里打字不该触发工具切换）。
+
+2. **工作区窗口必须设成透明背景。**
+   画布是裸 GL 画的，而 ImGui 在 GL **之后**渲染。保留不透明 `WindowBg` 会把画布
+   整块盖住（实测表现为画布全黑）。
+
+3. **回调安装顺序：先装宿主的，再让 ImGui 接管。**
+   ImGui 的 GLFW 后端会保存并链式调用先前安装的回调（源码里的 `PrevUserCallback*`），
+   所以 `installCallbacks()` 必须排在 `UiContext::init()` 之前。
+
+4. **所有固定像素尺寸都要乘 DPI 缩放。**
+   ImGui 坐标是物理像素（本程序 DPI-aware），字体与 style 已按 `uiScale` 放大；
+   面板宽度若不同步放大，就会出现"字比面板宽"的溢出。
+
+另外：刻意**关闭** `ImGuiConfigFlags_NavEnableKeyboard`，因为键盘导航会占用
+Tab（切换焦点）与方向键（在控件间移动），而画板要用 Tab 开关光照、方向键平移视图。
 
 ## 光照模型
 
@@ -183,9 +237,9 @@ build\core_test.exe      # 或 .\build.ps1 -Test
 ## 路线图
 
 - [x] **P0** 清理与地基：git 版本控制、`build.ps1`、模块骨架、离线渲染 CLI 验证回路
-- [x] **P1** `core`：动态 Canvas + 材质通道 + 调色板 + 全套绘图工具 + 撤销重做 + 相机缩放 + HUD
+- [x] **P1** `core`：动态 Canvas + 材质通道 + 调色板 + 全套绘图工具 + 撤销重做 + 相机缩放
 - [ ] **P2** `gfx`：光照与 albedo 解耦，材质纹理；扫描 GI 与**渐进式逐像素 2D 光追**双模式一键切换
-- [ ] **P3** Dear ImGui 界面：调色板 / 工具栏 / 图层面板（用 `unifont` 加载中文）
+- [~] **P3** Dear ImGui 界面：✅ UI-0 骨架 ｜ ⬜ UI-1 调色板 ｜ ⬜ UI-2 材质 ｜ ⬜ UI-3 光照
 - [ ] **P4** 图层、选区变换、导出打磨
 
 ### P2 要解决的核心问题

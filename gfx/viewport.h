@@ -50,6 +50,18 @@ public:
     void screenToCanvas(double sx, double sy, int winW, int winH, int fbW, int fbH,
                         int& cx, int& cy) const;
 
+    // 画布像素坐标 -> 帧缓冲像素坐标（HUD 叠加绘制用）。与 screenToCanvas 互为逆运算。
+    void canvasToFramebuffer(double cx, double cy, int fbW, int fbH, double& fx,
+                             double& fy) const;
+
+    // 同 screenToCanvas，但不做边界夹取。
+    // 缩放锚定光标时需要真实的（可能越界的）画布坐标，夹取会让画面在边缘漂移。
+    void screenToCanvasF(double sx, double sy, int winW, int winH, int fbW, int fbH,
+                         double& cx, double& cy) const;
+
+    // 一个画布像素在帧缓冲上占多少像素（笔刷光标大小、命中判定都要用）
+    double pixelsPerCell(int fbW, int fbH) const;
+
     // 把纹理画满整个帧缓冲
     void draw(GLuint texture, int fbW, int fbH);
 

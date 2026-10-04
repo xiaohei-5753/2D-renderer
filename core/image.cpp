@@ -14,7 +14,9 @@ void Image::resize(int w, int h) {
     if (h < 0) h = 0;
     w_ = w;
     h_ = h;
-    px_.resize((size_t)w_ * (size_t)h_);
+    // 注意：std::vector::resize 会保留原有元素，尺寸变化后前后的像素会混在一起。
+    // 这里显式清空——"改变尺寸"在语义上是得到一块新缓冲，而不是裁切旧缓冲。
+    px_.assign((size_t)w_ * (size_t)h_, RGBA8{0, 0, 0, 0});
 }
 
 void Image::fill(RGBA8 c) {

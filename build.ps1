@@ -17,6 +17,7 @@ param(
     [switch]$App,
     [switch]$Cli,
     [switch]$Run,
+    [switch]$Test,
     [string]$Gxx = '',
     [string]$Config = 'release'   # release | debug
 )
@@ -218,18 +219,36 @@ if ($buildApp) {
 }
 
 if ($buildCli) {
-    Write-Host "[3/3] building offline renderer"
-    $cliObj = Invoke-Compile (Join-Path $root 'tools\render_cli.cpp')
-    $exe = Join-Path $buildDir 'paintboard_render.exe'
-    $code = Invoke-Tool -Exe $gxx -ToolArgs (@($libObjs + $cliObj, '-o', $exe) + $linkFlags)
-    if ($code -ne 0) { throw "link failed: paintboard_render.exe" }
-    Write-Host ("  LINK " + $exe)
+    # every tools/*.cpp becomes its own executable (offline renderer, core tests, ...)
+    $toolSources = @(Get-ChildItem -Path (Join-Path $root 'tools') -Filter '*.cpp' |
+                     Sort-Object Name | ForEach-Object { $_.FullName })
+    Write-Host "[3/3] building tools ($($toolSources.Count))"
+    foreach ($t in $toolSources) {
+        $obj = Invoke-Compile $t
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($t)
+        $exe = Join-Path $buildDir ($name + '.exe')
+        $code = Invoke-Tool -Exe $gxx -ToolArgs (@($libObjs + $obj, '-o', $exe) + $linkFlags)
+        if ($code -ne 0) { throw "link failed: $name" }
+        Write-Host ("  LINK " + $exe)
+    }
 } else {
-    Write-Host "[3/3] offline renderer skipped"
+    Write-Host "[3/3] tools skipped"
 }
 
 $dt = (Get-Date) - $t0
 Write-Host ("[done] compiled $script:compileCount, cached $script:skipCount, {0:N1}s" -f $dt.TotalSeconds)
+
+if ($Test) {
+    $exe = Join-Path $buildDir 'core_test.exe'
+    if (Test-Path -LiteralPath $exe) {
+        Write-Host "[test] $exe"
+        & $exe
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    } else {
+        Write-Error "core_test.exe was not built"
+        exit 1
+    }
+}
 
 if ($Run) {
     $exe = Join-Path $buildDir 'paintboard.exe'

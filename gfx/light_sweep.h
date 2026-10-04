@@ -54,6 +54,10 @@ public:
     // 结果纹理（RGBA8，尺寸 = 画布尺寸）
     GLuint resultTexture() const { return renderTex_; }
 
+    // 原始画布纹理（未受光）。画板需要能"关灯"看到干净的原图，
+    // 否则取色和导出都会被光照污染。
+    GLuint canvasTexture() const { return canvasTex_; }
+
     // 方向表中的方向数量（诊断/性能观察用）
     int directionCount() const { return dirCount_; }
 

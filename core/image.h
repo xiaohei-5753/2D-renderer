@@ -15,6 +15,7 @@ public:
     Image() = default;
     Image(int w, int h) { resize(w, h); }
 
+    // 改变尺寸并**清空**内容（不是裁切旧缓冲）。albedo 清成全透明。
     void resize(int w, int h);
     void fill(RGBA8 c);
 

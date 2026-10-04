@@ -87,9 +87,9 @@ void Viewport::viewUV(int fbW, int fbH, float& du, float& dv) const {
     dv = (b / m) * (float)z;
 }
 
-void Viewport::screenToCanvas(double sx, double sy, int winW, int winH, int fbW, int fbH,
-                              int& cx, int& cy) const {
-    cx = cy = 0;
+void Viewport::screenToCanvasF(double sx, double sy, int winW, int winH, int fbW,
+                               int fbH, double& cx, double& cy) const {
+    cx = cy = 0.0;
     if (winW <= 0 || winH <= 0) return;
     if (fbW <= 0 || fbH <= 0) {
         fbW = winW;
@@ -105,10 +105,46 @@ void Viewport::screenToCanvas(double sx, double sy, int winW, int winH, int fbW,
     const double abx = (double)du * (u - 0.5) + cam_.x;
     const double aby = (double)dv * (v - 0.5) + cam_.y;
 
-    cx = (int)(abx * cw_);
-    cy = (int)(aby * ch_);
-    cx = std::clamp(cx, 0, cw_ - 1);
-    cy = std::clamp(cy, 0, ch_ - 1);
+    cx = abx * (double)cw_;
+    cy = aby * (double)ch_;
+}
+
+void Viewport::screenToCanvas(double sx, double sy, int winW, int winH, int fbW, int fbH,
+                              int& cx, int& cy) const {
+    double fx = 0.0, fy = 0.0;
+    screenToCanvasF(sx, sy, winW, winH, fbW, fbH, fx, fy);
+    if (winW <= 0 || winH <= 0) {
+        cx = cy = 0;
+        return;
+    }
+    cx = std::clamp((int)fx, 0, cw_ - 1);
+    cy = std::clamp((int)fy, 0, ch_ - 1);
+}
+
+void Viewport::canvasToFramebuffer(double cx, double cy, int fbW, int fbH, double& fx,
+                                   double& fy) const {
+    fx = fy = 0.0;
+    if (fbW <= 0 || fbH <= 0) return;
+
+    float du = 1.0f, dv = 1.0f;
+    viewUV(fbW, fbH, du, dv);
+    if (!(du > 0.0f) || !(dv > 0.0f)) return;
+
+    const double abx = cx / (double)cw_;
+    const double aby = cy / (double)ch_;
+    const double u = (abx - cam_.x) / (double)du + 0.5;
+    const double v = (aby - cam_.y) / (double)dv + 0.5;
+
+    fx = u * (double)fbW;
+    fy = (1.0 - v) * (double)fbH;   // 帧缓冲的 y 轴向下，UV 的 V 向上
+}
+
+double Viewport::pixelsPerCell(int fbW, int fbH) const {
+    float du = 1.0f, dv = 1.0f;
+    viewUV(fbW, fbH, du, dv);
+    const double visW = (double)du * (double)cw_;   // 可见范围相当于多少画布像素宽
+    if (!(visW > 0.0)) return 1.0;
+    return (double)fbW / visW;
 }
 
 void Viewport::draw(GLuint texture, int fbW, int fbH) {

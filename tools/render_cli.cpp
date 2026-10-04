@@ -96,36 +96,51 @@ bool parseArgs(int argc, char** argv, Options& o) {
 
 RGBA8 rgb(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) { return RGBA8{r, g, b, a}; }
 
+// 自发光材质。传入强度 0..255。
+Material emissive(uint8_t e) {
+    Material m;
+    m.emission = e;
+    return m;
+}
+
 // --- 内置示例场景 ---
 //
-// 光照模型的要点：alpha 就是"在光路上的通透程度"。
-//   a = 255  实心：光被挡住，最终画面直接显示自身颜色（不受光照影响）
-//   a ≈ 90   半透明霓虹：光穿过，同时按 rgb*a*emit 自发光，于是周围被点亮
+// 光照模型现在有**两个独立的量**：
+//   alpha   = 光路上的通透程度（0=空气，255=完全遮挡）
+//   emission= 自发光强度（与 alpha 无关）
+// 于是可以表达两类原来表达不了的像素：
+//   不透明但发光（自发光屏）= a=255 + emission 高
+//   半透明但不发光（彩色玻璃）= a 中等 + emission 0
+//
+// 注意：emission 为 0 的像素**不发光**，场景里必须有材质才会亮起来。
 
 void sceneNeon(Canvas& c) {
     c.clear(RGBA8{0, 0, 0, 0});
     const uint8_t A = 90;
+    const Material lamp = emissive(170);
     // 三根不同颜色的霓虹管
-    c.drawLine(40, 30, 120, 30, rgb(80, 200, 255, A));
-    c.drawLine(200, 40, 280, 40, rgb(255, 90, 140, A));
-    c.drawLine(60, 150, 260, 150, rgb(255, 200, 90, A));
+    c.drawLine(40, 30, 120, 30, rgb(80, 200, 255, A), lamp);
+    c.drawLine(200, 40, 280, 40, rgb(255, 90, 140, A), lamp);
+    c.drawLine(60, 150, 260, 150, rgb(255, 200, 90, A), lamp);
     // 一个实心色块：用来对比"实心像素不受光"
     c.fillRect(140, 70, 180, 110, rgb(40, 40, 48, 255));
-    // 角落点一个高亮像素，观察方向性条纹
-    c.setPixel(159, 55, rgb(255, 255, 255, 180));
+    // 一个"不透明但发光"的像素——旧模型（em=rgb*a）根本表达不了这种情况
+    c.setPixel(159, 55, rgb(255, 255, 255, 255), emissive(255));
+    // 一块"半透明但不发光"的彩色玻璃
+    c.fillRect(30, 100, 60, 140, rgb(120, 220, 160, 110));
 }
 
 void sceneCornell(Canvas& c) {
     c.clear(RGBA8{0, 0, 0, 0});
     const int W = c.width(), H = c.height();
-    // 房间：四面实心墙
+    // 房间：四面实心墙（a=255 且不自发光 -> 挡光，画面显示自身颜色）
     const RGBA8 wall = rgb(70, 70, 76, 255);
     c.fillRect(0, 0, W - 1, 4, wall);
     c.fillRect(0, H - 5, W - 1, H - 1, wall);
     c.fillRect(0, 0, 4, H - 1, wall);
     c.fillRect(W - 5, 0, W - 1, H - 1, wall);
-    // 天花板上的灯：半透明自发光
-    c.fillRect(W / 2 - 40, 6, W / 2 + 40, 12, rgb(255, 240, 210, 140));
+    // 天花板上的灯：半透明 + 强自发光
+    c.fillRect(W / 2 - 40, 6, W / 2 + 40, 12, rgb(255, 240, 210, 140), emissive(235));
     // 两个实心盒子
     c.fillRect(70, H - 70, 120, H - 10, rgb(90, 80, 70, 255));
     c.fillRect(180, H - 100, 240, H - 10, rgb(70, 80, 95, 255));
@@ -134,10 +149,11 @@ void sceneCornell(Canvas& c) {
 void sceneChecker(Canvas& c) {
     c.clear(RGBA8{0, 0, 0, 0});
     const int W = c.width(), H = c.height();
+    const Material glow = emissive(110);
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
             const int cell = (x / 8 + y / 8) & 1;
-            if (cell) c.setPixelRaw(x, y, rgb(60, 90, 160, 100));
+            if (cell) c.setPixelRaw(x, y, rgb(60, 90, 160, 100), glow);
             else c.setPixelRaw(x, y, rgb(160, 70, 60, 100));
         }
     }
@@ -192,7 +208,7 @@ int main(int argc, char** argv) {
     sweep.settings().rayRadius = opt.radius;
     sweep.settings().emitScale = opt.emit;
     for (int i = 0; i < 3; i++) sweep.settings().ambient[i] = opt.ambient[i];
-    sweep.uploadAll(canvas.image());
+    sweep.uploadAll(canvas.image(), canvas.materialData());
 
     const auto t0 = std::chrono::steady_clock::now();
     sweep.render();

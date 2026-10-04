@@ -10,6 +10,7 @@
 #include "gl_common.h"
 
 #include "core/image.h"
+#include "core/material.h"
 #include "core/types.h"
 
 namespace pb::gfx {
@@ -45,8 +46,11 @@ public:
     const LightSettings& settings() const { return st_; }
 
     // 画布内容上传。dirty 为空表示没有变化，直接返回。
-    void upload(const Image& img, const Rect& dirty);
-    void uploadAll(const Image& img);
+    //
+    // mats 是逐像素的光学属性（可为 nullptr，表示全部按默认材质处理）。
+    // 把材质与 albedo 分开传，是为了让 gfx 层不依赖 core/Canvas 这个"文档"类型。
+    void upload(const Image& albedo, const Material* mats, const Rect& dirty);
+    void uploadAll(const Image& albedo, const Material* mats);
 
     // 跑一遍完整的光照管线，结果在 resultTexture()
     void render();
@@ -69,6 +73,7 @@ private:
     LightSettings st_;
 
     GLuint canvasTex_ = 0;   // RGBA8: albedo.rgb + 覆盖率.a
+    GLuint matTex_ = 0;      // RGBA8: r=自发光 g=折射率 b=标志位 a=备用
     GLuint scanTex_ = 0;     // RGBA16F: 扫描累积结果
     GLuint renderTex_ = 0;   // RGBA8: 最终输出
     GLuint scanSSBO_ = 0;    // R32UI 定点累积缓冲（原子加）
@@ -78,13 +83,13 @@ private:
 
     // 缓存的 uniform 位置（每帧都要设，避免反复字符串查找）
     struct {
-        GLint cc = -1, cs = -1, amb = -1, ndirs = -1, cp = -1, emit = -1;
+        GLint cc = -1, cs = -1, amb = -1, ndirs = -1, cp = -1, emit = -1, mat = -1;
     } uScan_;
     struct {
         GLint cs = -1;
     } uCopy_;
     struct {
-        GLint cc = -1, scan = -1, cs = -1, emit = -1;
+        GLint cc = -1, scan = -1, cs = -1, emit = -1, mat = -1;
     } uBlend_;
 
     int dirRadius_ = -1;  // 方向表当前对应的半径，用于判断是否需要重建

@@ -23,9 +23,12 @@ namespace pb::gfx {
 
 // 每条射线沿一个方向直线前进，遇到像素就按覆盖率衰减自身亮度并叠加自发光。
 // 累积结果用定点 u32 原子加：GL 4.3 不保证浮点原子加，所以走 0..65535 定点。
+//
+// u_mat 是逐像素材质（r=自发光 g=折射率 b=标志位）。遮挡与自发光在这里是**两个独立
+// 的量**，见下面 cov / em 的注释。
 static const char* kScanComp = R"(#version 430 core
 layout(local_size_x=256)in;
-uniform sampler2D u_cc;uniform ivec2 u_cs;
+uniform sampler2D u_cc,u_mat;uniform ivec2 u_cs;
 uniform vec3 u_ambient;uniform int u_ndirs;uniform float u_cp,u_emit;
 layout(std430,binding=0)buffer AccBuf{uint d[];};
 layout(std430,binding=1)readonly buffer DirBuf{ivec2 dirs[];};
@@ -44,8 +47,18 @@ void main(){
   while(true){
     if(x>=0&&x<W&&y>=0&&y<H){
       vec4 c=texelFetch(u_cc,ivec2(x,y),0);
-      vec3 em=c.rgb*c.a*u_emit;
-      lt=lt*(1.0-c.a)+em;lt+=em*(1.0-c.a)*u_cp;
+      vec4 mt=texelFetch(u_mat,ivec2(x,y),0);
+      int fl=int(mt.b*255.0+0.5);
+      // kSolid(bit1) 强制完全遮挡，忽略 alpha
+      float cov=((fl&2)!=0)?1.0:c.a;
+      // 自发光只取材质里的强度，**不再乘 alpha**。
+      // 旧实现是 rgb*a，导致表达不了"不透明但发光"（自发光屏）
+      // 和"半透明但不发光"（彩色玻璃）这两类像素。
+      vec3 em=c.rgb*mt.r*u_emit;
+      // 透射部分按 albedo **染色**：cov 越大染色越强，cov=1 时完全阻断。
+      // 只做 (1-cov) 衰减的话，彩色玻璃会变成一块灰色滤镜，
+      // 而 mix(1, rgb, cov) 让它像真正的有色吸收介质。
+      lt=lt*mix(vec3(1.0),c.rgb,cov)*(1.0-cov)+em;lt+=em*(1.0-cov)*u_cp;
       int bi=(y*W+x)*3;
       vec3 add=lt*invN;
       atomicAdd(d[bi],uint(clamp(add.r,0.0,1.0)*65535.0));
@@ -68,20 +81,34 @@ void main(){
   imageStore(u_img,p,vec4(vec3(float(d[bi])/65535.0,float(d[bi+1])/65535.0,float(d[bi+2])/65535.0),0));
 })";
 
-// 合成：覆盖率 >= 1 的实心像素直接显示自身 albedo（不受光影响），
-// 其余像素把扫描光照与自发光按覆盖率混合，并做峰值归一防止过曝。
+// 合成：
+//   coverage >= 1 的实心像素显示自身 albedo；若它还自发光（"自发光屏"），
+//   把颜色推向白——这正是旧模型（em = rgb*a）表达不了的那类像素。
+//   其余像素把扫描光照与自发光按覆盖率混合，并做峰值归一防止过曝。
 static const char* kBlendComp = R"(#version 430 core
 layout(local_size_x=8,local_size_y=8)in;
-uniform sampler2D u_cc,u_scan;uniform ivec2 u_cs;
+uniform sampler2D u_cc,u_scan,u_mat;uniform ivec2 u_cs;
 layout(rgba8,binding=0)writeonly uniform image2D u_out;
 uniform float u_emit;
 void main(){
   ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(p.x>=u_cs.x||p.y>=u_cs.y)return;
   vec4 c=texelFetch(u_cc,p,0);
-  if(c.a>=1.0){imageStore(u_out,p,c);return;}
+  vec4 mt=texelFetch(u_mat,p,0);
+  int fl=int(mt.b*255.0+0.5);
+  float cov=((fl&2)!=0)?1.0:c.a;
+  vec3 e=c.rgb*mt.r*u_emit;
+  if(cov>=1.0){
+    vec3 r=mix(c.rgb,vec3(1.0),clamp(mt.r,0.0,1.0)*0.85);
+    imageStore(u_out,p,vec4(r,1.0));return;
+  }
   vec3 s=texelFetch(u_scan,p,0).rgb;
-  vec3 e=c.rgb*c.a*u_emit;
-  vec3 r=mix(s,e,c.a)+e;
+  // ⚠️ 已知问题（继承自原实现，留给 P2 的光传输重写解决）：
+  // scan 通道在算某个像素时，已经用该像素自己的 cov 衰减并叠加过 em 了
+  // （lt = lt*mix(1,rgb,cov)*(1-cov) + em，然后把 lt 加到该像素）。
+  // 这里又做了一次 mix(s,e,cov)+e，等于对半透明像素**二次衰减、二次叠加自发光**。
+  // 视觉上表现为霓虹偏亮、彩色玻璃偏暗。要修就得同时重新标定整套参数，
+  // 不适合塞进"接入材质"这一步，故先如实记录。
+  vec3 r=mix(s,e,cov)+e;
   float pk=max(max(r.r,r.g),r.b);
   if(pk>1.0)r/=pk;
   imageStore(u_out,p,vec4(r,1.0));
@@ -103,14 +130,16 @@ bool LightSweep::init(int w, int h) {
     h_ = h;
 
     canvasTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
+    matTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
     scanTex_ = createTexture(GL_RGBA16F, w, h, GL_RGBA, GL_HALF_FLOAT);
     renderTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
 
-    // glTexImage2D 传 nullptr 得到的是未定义内容；画布先清成全透明，
+    // glTexImage2D 传 nullptr 得到的是未定义内容；两张输入纹理先清零，
     // 这样即使调用方忘了 uploadAll()，渲染出来的也是干净的黑场而不是垃圾数据。
     {
         std::vector<RGBA8> zero((size_t)w * h, RGBA8{0, 0, 0, 0});
         uploadSubImage(canvasTex_, zero.data(), w, h, Rect{0, 0, w - 1, h - 1});
+        uploadSubImage(matTex_, zero.data(), w, h, Rect{0, 0, w - 1, h - 1});
     }
 
     // 3 个 u32 通道（定点，范围 0..65535）的累积缓冲
@@ -134,6 +163,7 @@ bool LightSweep::init(int w, int h) {
     }
 
     uScan_.cc = glGetUniformLocation(scanProg_, "u_cc");
+    uScan_.mat = glGetUniformLocation(scanProg_, "u_mat");
     uScan_.cs = glGetUniformLocation(scanProg_, "u_cs");
     uScan_.amb = glGetUniformLocation(scanProg_, "u_ambient");
     uScan_.ndirs = glGetUniformLocation(scanProg_, "u_ndirs");
@@ -142,6 +172,7 @@ bool LightSweep::init(int w, int h) {
     uCopy_.cs = glGetUniformLocation(copyProg_, "u_cs");
     uBlend_.cc = glGetUniformLocation(blendProg_, "u_cc");
     uBlend_.scan = glGetUniformLocation(blendProg_, "u_scan");
+    uBlend_.mat = glGetUniformLocation(blendProg_, "u_mat");
     uBlend_.cs = glGetUniformLocation(blendProg_, "u_cs");
     uBlend_.emit = glGetUniformLocation(blendProg_, "u_emit");
 
@@ -151,6 +182,7 @@ bool LightSweep::init(int w, int h) {
 
 void LightSweep::shutdown() {
     if (canvasTex_) glDeleteTextures(1, &canvasTex_);
+    if (matTex_) glDeleteTextures(1, &matTex_);
     if (scanTex_) glDeleteTextures(1, &scanTex_);
     if (renderTex_) glDeleteTextures(1, &renderTex_);
     if (scanSSBO_) glDeleteBuffers(1, &scanSSBO_);
@@ -158,7 +190,7 @@ void LightSweep::shutdown() {
     if (scanProg_) glDeleteProgram(scanProg_);
     if (copyProg_) glDeleteProgram(copyProg_);
     if (blendProg_) glDeleteProgram(blendProg_);
-    canvasTex_ = scanTex_ = renderTex_ = 0;
+    canvasTex_ = matTex_ = scanTex_ = renderTex_ = 0;
     scanSSBO_ = dirSSBO_ = 0;
     scanProg_ = copyProg_ = blendProg_ = 0;
     w_ = h_ = 0;
@@ -214,18 +246,38 @@ void LightSweep::ensureDirectionTable() {
 // 上传与渲染
 // ---------------------------------------------------------------------------
 
-void LightSweep::upload(const Image& img, const Rect& dirty) {
-    if (!canvasTex_) return;
-    if (img.width() != w_ || img.height() != h_) {
+void LightSweep::upload(const Image& albedo, const Material* mats, const Rect& dirty) {
+    if (!canvasTex_ || !matTex_) return;
+    if (albedo.width() != w_ || albedo.height() != h_) {
         fprintf(stderr, "[sweep] upload size mismatch: image %dx%d, target %dx%d\n",
-                img.width(), img.height(), w_, h_);
+                albedo.width(), albedo.height(), w_, h_);
         return;
     }
-    uploadSubImage(canvasTex_, img.data(), w_, h_, dirty);
+
+    Rect r = dirty;
+    r.clipTo(w_, h_);
+    if (r.empty()) return;
+
+    uploadSubImage(canvasTex_, albedo.data(), w_, h_, r);
+    if (!mats) return;
+
+    // 把材质打包进一张 RGBA8：r=自发光 g=折射率 b=标志位 a=备用。
+    // 只打包脏矩形那一块（紧凑缓冲），避免为了一次小改动准备整张图。
+    const int bw = r.width(), bh = r.height();
+    static std::vector<RGBA8> pack;
+    pack.resize((size_t)bw * (size_t)bh);
+    for (int y = 0; y < bh; y++) {
+        const Material* src = mats + (size_t)(r.y0 + y) * (size_t)w_ + (size_t)r.x0;
+        RGBA8* dst = pack.data() + (size_t)y * (size_t)bw;
+        for (int x = 0; x < bw; x++) {
+            dst[x] = RGBA8{src[x].emission, src[x].ior, src[x].flags, 255};
+        }
+    }
+    uploadSubImagePacked(matTex_, r.x0, r.y0, bw, bh, pack.data());
 }
 
-void LightSweep::uploadAll(const Image& img) {
-    upload(img, Rect{0, 0, w_ - 1, h_ - 1});
+void LightSweep::uploadAll(const Image& albedo, const Material* mats) {
+    upload(albedo, mats, Rect{0, 0, w_ - 1, h_ - 1});
 }
 
 void LightSweep::render() {
@@ -246,6 +298,9 @@ void LightSweep::render() {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, canvasTex_);
     glUniform1i(uScan_.cc, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, matTex_);
+    glUniform1i(uScan_.mat, 1);
     glUniform2i(uScan_.cs, w_, h_);
     glUniform3fv(uScan_.amb, 1, st_.ambient);
     glUniform1i(uScan_.ndirs, dirCount_);
@@ -273,6 +328,9 @@ void LightSweep::render() {
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, scanTex_);
     glUniform1i(uBlend_.scan, 1);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, matTex_);
+    glUniform1i(uBlend_.mat, 2);
     glUniform2i(uBlend_.cs, w_, h_);
     glUniform1f(uBlend_.emit, st_.emitScale);
     glBindImageTexture(0, renderTex_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);

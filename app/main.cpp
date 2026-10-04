@@ -69,7 +69,9 @@ void buildDemoScene(app::App& a) {
     };
 
     Material glow;
-    glow.emission = 220;
+    // 自发光与遮挡解耦之后，emission 是独立强度（不再隐含乘 alpha），
+    // 所以这里给的是"发光强度"而不是原来的 alpha 值。
+    glow.emission = 150;
     Material none;
 
     stroke(ToolId::Line, W / 8, H / 4, W - W / 8, H / 4, RGBA8{90, 200, 255, 110}, 3, false,
@@ -267,7 +269,7 @@ int main(int argc, char** argv) {
         // --- 5. 上传画布（只传脏矩形）+ 光照 ---
         const Rect dirty = a.canvas.takeDirty();
         if (!dirty.empty()) {
-            sweep.upload(a.canvas.image(), dirty);
+            sweep.upload(a.canvas.image(), a.canvas.materialData(), dirty);
             a.lightDirty = true;
         }
         if (a.lightOn && a.lightDirty && a.canvasVisible) {

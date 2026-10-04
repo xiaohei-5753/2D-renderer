@@ -17,6 +17,10 @@ GLuint createTextureWithStorage(GLenum internalFormat, int w, int h, int levels)
 // 只上传 dirty 指定的子矩形。dirty 为空则什么都不做。
 void uploadSubImage(GLuint tex, const RGBA8* pixels, int w, int h, const Rect& dirty);
 
+// 上传一块**紧凑**数据（bw*bh，不是全图）到纹理的子矩形。
+// 用于逐像素打包出来的副通道（例如材质），避免为了上传一小块而准备整张图。
+void uploadSubImagePacked(GLuint tex, int x0, int y0, int bw, int bh, const RGBA8* tight);
+
 // 把纹理内容读回 CPU（离线渲染出图用）
 bool readbackTexture(GLuint tex, int w, int h, RGBA8* out);
 

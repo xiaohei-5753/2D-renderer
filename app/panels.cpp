@@ -395,15 +395,9 @@ void drawToolbarPanel(App& a) {
         ImGui::TextDisabled("a=%d  e=%d", a.opts.color.a, a.opts.material.emission);
         ImGui::EndGroup();
     }
-
-    ImGui::SetNextItemWidth(-1);
-    int alpha = a.opts.color.a;
-    if (ImGui::SliderInt("##alpha", &alpha, 0, 255, "遮挡 alpha %d",
-                         ImGuiSliderFlags_AlwaysClamp)) {
-        a.opts.color.a = (uint8_t)alpha;
-    }
-    // TextWrapped 按可用宽度折行，避免超出面板被裁掉
-    ImGui::TextWrapped("alpha 同时是光照模型里的\"通透程度\"：0=空气，255=实心挡光。");
+    // 遮挡 alpha / 自发光 / 折射率都在右侧「材质」面板里编辑。
+    // 这里刻意不再放一份滑块：同一个值有两个入口，早晚会出现"改了这边忘了那边"。
+    ImGui::TextDisabled("遮挡与自发光见右侧「材质」面板");
 
     ImGui::Spacing();
     if (ImGui::Button("撤销", ImVec2(btnW, 0))) actUndo(a);
@@ -602,10 +596,147 @@ void drawPaletteSection(App& a) {
     }
 }
 
+// 材质预设：一次性套用 (遮挡 alpha, 自发光, 折射率, 标志位) 的一组取值。
+//
+// 这些不是"随便起的名字"，每一个都对应光照模型里一种真实的像素行为；
+// 特别是「霓虹管」与「彩色玻璃」正是把自发光和遮挡解耦之后才能区分的两类像素。
+struct MaterialPreset {
+    const char* name;
+    const char* desc;
+    uint8_t alpha;
+    uint8_t emission;
+    float ior;      // 1.0 = 不折射
+    uint8_t flags;
+};
+
+const MaterialPreset kMaterialPresets[] = {
+    {"空气", "完全通透，不挡光也不发光（等于擦除）", 0, 0, 1.0f, 0},
+    {"半透明", "只挡一部分光，自己不发光", 128, 0, 1.0f, 0},
+    {"霓虹管", "半透明 + 强自发光，会点亮周围", 110, 170, 1.0f, 0},
+    {"彩色玻璃", "半透明 + 带色，透过的光被染色", 120, 0, 1.5f, 0},
+    {"实心墙", "完全挡光，画面显示自身颜色", 255, 0, 1.0f, 0},
+    {"镜面", "完全挡光 + 反射（反射需 P2 的光追通道）", 255, 0, 1.0f,
+     Material::kReflective},
+    {"自发光屏", "不透明但自发光 —— 旧模型表达不了的一类像素", 255, 230, 1.0f, 0},
+};
+const int kMaterialPresetCount = (int)(sizeof(kMaterialPresets) / sizeof(kMaterialPresets[0]));
+
+void applyMaterialPreset(App& a, int i) {
+    if (i < 0 || i >= kMaterialPresetCount) return;
+    const MaterialPreset& p = kMaterialPresets[i];
+    a.opts.color.a = p.alpha;
+    a.opts.material.emission = p.emission;
+    a.opts.material.setIorValue(p.ior);
+    a.opts.material.flags = p.flags;
+    a.lastAction = std::string("材质 ") + p.name;
+}
+
 void drawMaterialSection(App& a) {
-    ImGui::TextDisabled("材质面板待实现（UI-2）");
-    ImGui::TextDisabled("自发光 %d / 折射率 %.2f / 反射 %s", a.opts.material.emission,
-                        a.opts.material.iorValue(), a.opts.material.reflective() ? "是" : "否");
+    Material& m = a.opts.material;
+
+    // ------------------------------------------------------------------
+    // 1. 材质预设
+    // ------------------------------------------------------------------
+    ImGui::TextDisabled("预设（一键套用一组参数）");
+    const float pw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) *
+                     0.5f;
+    for (int i = 0; i < kMaterialPresetCount; i++) {
+        const MaterialPreset& p = kMaterialPresets[i];
+        if (ImGui::Button(p.name, ImVec2(pw, 0.0f))) applyMaterialPreset(a, i);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.desc);
+        if ((i & 1) == 0 && i + 1 < kMaterialPresetCount) ImGui::SameLine();
+    }
+
+    // ------------------------------------------------------------------
+    // 2. 逐项参数
+    // ------------------------------------------------------------------
+    ImGui::Spacing();
+    ImGui::SeparatorText("参数");
+
+    int alpha = a.opts.color.a;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderInt("##matAlpha", &alpha, 0, 255, "遮挡 alpha %d",
+                         ImGuiSliderFlags_AlwaysClamp)) {
+        a.opts.color.a = (uint8_t)alpha;
+    }
+    ImGui::TextDisabled("0 = 空气，255 = 完全挡光");
+
+    int em = m.emission;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderInt("##matEm", &em, 0, 255, "自发光 %d", ImGuiSliderFlags_AlwaysClamp)) {
+        m.emission = (uint8_t)em;
+    }
+    ImGui::TextDisabled("与遮挡**独立**：不透明也能发光（自发光屏）");
+
+    float ior = m.iorValue();
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderFloat("##matIor", &ior, 1.0f, 3.55f, "折射率 %.2f")) {
+        m.setIorValue(ior);
+    }
+
+    bool refl = m.reflective();
+    if (ImGui::Checkbox("反射", &refl)) m.setReflective(refl);
+    ImGui::SameLine();
+    bool solid = m.solid();
+    if (ImGui::Checkbox("强制实心", &solid)) m.setSolid(solid);
+
+    // 如实标注哪些参数已经生效——否则用户调了折射率却看不到变化，会以为坏了
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.35f, 1.0f));
+    ImGui::TextWrapped("当前生效：遮挡、自发光、强制实心（扫描 GI）。"
+                       "折射与反射需要 P2 的逐像素光追通道，现在改了不起作用。");
+    ImGui::PopStyleColor();
+
+    // ------------------------------------------------------------------
+    // 3. 当前材质预览
+    // ------------------------------------------------------------------
+    ImGui::Spacing();
+    ImGui::SeparatorText("预览");
+    {
+        // 预览块：底色是 albedo，自发光让它变亮趋白，遮挡越低棋盘露得越多
+        const float h = a.ui(28.0f);
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const float w = ImGui::GetContentRegionAvail().x;
+        ImGui::InvisibleButton("##matpreview", ImVec2(w, h));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p1(p0.x + w, p0.y + h);
+
+        // 棋盘底，用来直观看出遮挡程度
+        const float cell = a.ui(7.0f);
+        for (float y = 0; y < h; y += cell) {
+            for (float x = 0; x < w; x += cell) {
+                const bool odd = ((int)(x / cell) + (int)(y / cell)) & 1;
+                dl->AddRectFilled(
+                    ImVec2(p0.x + x, p0.y + y),
+                    ImVec2(std::min(p0.x + x + cell, p1.x), std::min(p0.y + y + cell, p1.y)),
+                    odd ? IM_COL32(58, 58, 62, 255) : IM_COL32(86, 86, 92, 255));
+            }
+        }
+        const float cov = (m.solid() ? 255.0f : (float)a.opts.color.a) / 255.0f;
+        const int er = (int)std::lround(a.opts.color.r * (1.0f - m.emission / 255.0f * 0.85f) +
+                                        255.0f * (m.emission / 255.0f * 0.85f));
+        const int eg = (int)std::lround(a.opts.color.g * (1.0f - m.emission / 255.0f * 0.85f) +
+                                        255.0f * (m.emission / 255.0f * 0.85f));
+        const int eb = (int)std::lround(a.opts.color.b * (1.0f - m.emission / 255.0f * 0.85f) +
+                                        255.0f * (m.emission / 255.0f * 0.85f));
+        dl->AddRectFilled(p0, p1, IM_COL32(std::clamp(er, 0, 255), std::clamp(eg, 0, 255),
+                                           std::clamp(eb, 0, 255),
+                                           (int)std::lround(cov * 255.0f)));
+        dl->AddRect(p0, p1, IM_COL32(120, 124, 134, 255));
+    }
+    ImGui::TextDisabled("预览块：棋盘透出的多少 = 遮挡程度，越白 = 自发光越强");
+
+    // ------------------------------------------------------------------
+    // 4. 从画布吸取材质
+    // ------------------------------------------------------------------
+    ImGui::Spacing();
+    if (ImGui::Button("吸取光标下的颜色与材质", ImVec2(-1.0f, 0.0f))) {
+        a.opts.color = a.cursorColor;
+        a.opts.material = a.cursorMaterial;
+        pushRecentColor(a, a.opts.color);
+        a.lastAction = "已吸取材质";
+    }
+    ImGui::TextDisabled("也可以直接用取色器工具（K）在画布上点");
 }
 
 void drawLightingSection(App& a) {

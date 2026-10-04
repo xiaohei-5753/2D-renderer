@@ -9,6 +9,7 @@
 // 用法：
 //   paintboard_render --scene neon --size 320x180 --radius 128 --out out.png
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -111,9 +112,19 @@ bool parseArgs(int argc, char** argv, Options& o) {
 RGBA8 rgb(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) { return RGBA8{r, g, b, a}; }
 
 // 自发光材质。传入强度 0..255。
+// 自发光材质：注意自发光是**独立的 RGB**，与 albedo 无关。
+// emissive()     给中性（灰白）自发光
+// emissiveFrom() 让自发光取某个颜色的色相（"这个颜色自己发光"）
 Material emissive(uint8_t e) {
     Material m;
-    m.emission = e;
+    m.setEmissionFrom(e, e, e);
+    return m;
+}
+Material emissiveFrom(RGBA8 c, uint8_t level) {
+    Material m;
+    const float k = level / 255.0f;
+    m.setEmissionFrom((uint8_t)std::lround(c.r * k), (uint8_t)std::lround(c.g * k),
+                      (uint8_t)std::lround(c.b * k));
     return m;
 }
 
@@ -131,14 +142,16 @@ Material emissive(uint8_t e) {
 void sceneNeon(Canvas& c) {
     c.clear(RGBA8{0, 0, 0, 0});
     const uint8_t A = 90;
-    const Material lamp = emissive(170);
+    // 让每根管子发**自己颜色**的光（自发光是独立 RGB，这里显式取该颜色的色相）
+    const RGBA8 c1 = rgb(80, 200, 255, A), c2 = rgb(255, 90, 140, A),
+                c3 = rgb(255, 200, 90, A);
     // 三根不同颜色的霓虹管
-    c.drawLine(40, 30, 120, 30, rgb(80, 200, 255, A), lamp);
-    c.drawLine(200, 40, 280, 40, rgb(255, 90, 140, A), lamp);
-    c.drawLine(60, 150, 260, 150, rgb(255, 200, 90, A), lamp);
+    c.drawLine(40, 30, 120, 30, c1, emissiveFrom(c1, 175));
+    c.drawLine(200, 40, 280, 40, c2, emissiveFrom(c2, 175));
+    c.drawLine(60, 150, 260, 150, c3, emissiveFrom(c3, 175));
     // 一个实心色块：用来对比"实心像素不受光"
     c.fillRect(140, 70, 180, 110, rgb(40, 40, 48, 255));
-    // 一个"不透明但发光"的像素——旧模型（em=rgb*a）根本表达不了这种情况
+    // 一个"不透明但发白光"的像素 —— 表面颜色与发光颜色完全独立
     c.setPixel(159, 55, rgb(255, 255, 255, 255), emissive(255));
     // 一块"半透明但不发光"的彩色玻璃
     c.fillRect(30, 100, 60, 140, rgb(120, 220, 160, 110));
@@ -189,7 +202,8 @@ void sceneHue(Canvas& c) {
         for (int k = 0; k < 3; k++) {
             const int x0 = W / 12 + k * (barW + W / 24);
             const int y0 = H / 8 + r * (barH + H / 12);
-            c.fillRect(x0, y0, x0 + barW, y0 + barH, hues[r], emissive(ems[k]));
+            c.fillRect(x0, y0, x0 + barW, y0 + barH, hues[r],
+                   emissiveFrom(hues[r], ems[k]));
         }
     }
     // 亮度对照的标签块：无彩色，用来检查自发光强度本身

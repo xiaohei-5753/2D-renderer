@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "gl_texture.h"
+#include "material_pack.h"
 #include "shader.h"
 
 namespace pb::gfx {
@@ -48,16 +49,13 @@ void main(){
     if(x>=0&&x<W&&y>=0&&y<H){
       vec4 c=texelFetch(u_cc,ivec2(x,y),0);
       vec4 mt=texelFetch(u_mat,ivec2(x,y),0);
-      int fl=int(mt.b*255.0+0.5);
+      int fl=int(floor(mt.a/8.0+0.5));
       // kSolid(bit1) 强制完全遮挡，忽略 alpha
       float cov=((fl&2)!=0)?1.0:c.a;
-      // 自发光只取材质里的强度，**不再乘 alpha**。
-      // 旧实现是 rgb*a，导致表达不了"不透明但发光"（自发光屏）
-      // 和"半透明但不发光"（彩色玻璃）这两类像素。
-      vec3 em=c.rgb*mt.r*u_emit;
-      // 透射部分按 albedo **染色**：cov 越大染色越强，cov=1 时完全阻断。
-      // 只做 (1-cov) 衰减的话，彩色玻璃会变成一块灰色滤镜，
-      // 而 mix(1, rgb, cov) 让它像真正的有色吸收介质。
+      // 自发光是**独立的 RGB**（mt.rgb），不再乘 albedo。
+      // albedo 只负责"显示成什么颜色 / 透光时过滤成什么颜色"。
+      vec3 em=mt.rgb*u_emit;
+      // 透射部分按 albedo 染色：cov 越大染色越强，cov=1 时完全阻断。
       lt=lt*mix(vec3(1.0),c.rgb,cov)*(1.0-cov)+em;lt+=em*(1.0-cov)*u_cp;
       int bi=(y*W+x)*3;
       vec3 add=lt*invN;
@@ -94,18 +92,14 @@ void main(){
   ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(p.x>=u_cs.x||p.y>=u_cs.y)return;
   vec4 c=texelFetch(u_cc,p,0);
   vec4 mt=texelFetch(u_mat,p,0);
-  int fl=int(mt.b*255.0+0.5);
+  int fl=int(floor(mt.a/8.0+0.5));
   float cov=((fl&2)!=0)?1.0:c.a;
-  vec3 e=c.rgb*mt.r*u_emit;
+  vec3 e=mt.rgb*u_emit;                 // 自发光：独立的 RGB
   if(cov>=1.0){
-    // 实心像素：以自身 albedo 为底色。
-    //
-    // 自发光必须在**自身颜色**上增亮，**不能**把颜色推向白。
-    // 原来的写法 mix(c.rgb, 1.0, mt.r*0.85) 会让亮度越大颜色越白——
-    // 用户选的红 + 高亮度会变成白色，等于"颜色"被"亮度"吃掉了。
-    // 颜色（albedo）与亮度（自发光）必须是两个独立的量。
+    // 实心像素：以自身 albedo 为底色，**加上独立的彩色自发光**。
+    // 两者相加而不是互相混合，所以"暗表面发绿光"这类组合才能表达出来。
     vec3 s=texelFetch(u_scan,p,0).rgb;
-    vec3 r=c.rgb*(1.0+mt.r*u_emit*1.7)+c.rgb*s*1.2;
+    vec3 r=c.rgb+e*1.7+c.rgb*s*1.2;
     float pk=max(max(r.r,r.g),r.b);
     if(pk>1.0)r/=pk;
     imageStore(u_out,p,vec4(r,1.0));return;
@@ -139,7 +133,9 @@ bool LightSweep::init(int w, int h) {
     h_ = h;
 
     canvasTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
-    matTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
+    // 材质用 RGBA32F：完全解耦后一个像素需要 5 个量（自发光 RGB + 折射率 + 标志位），
+    // RGBA8 装不下，硬塞就得量化折射率
+    matTex_ = createTexture(GL_RGBA32F, w, h, GL_RGBA, GL_FLOAT);
     scanTex_ = createTexture(GL_RGBA16F, w, h, GL_RGBA, GL_HALF_FLOAT);
     renderTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
 
@@ -148,7 +144,8 @@ bool LightSweep::init(int w, int h) {
     {
         std::vector<RGBA8> zero((size_t)w * h, RGBA8{0, 0, 0, 0});
         uploadSubImage(canvasTex_, zero.data(), w, h, Rect{0, 0, w - 1, h - 1});
-        uploadSubImage(matTex_, zero.data(), w, h, Rect{0, 0, w - 1, h - 1});
+        std::vector<float> zf((size_t)w * h * 4, 0.0f);
+        uploadSubImagePackedF(matTex_, 0, 0, w, h, zf.data());
     }
 
     // 3 个 u32 通道（定点，范围 0..65535）的累积缓冲
@@ -270,19 +267,11 @@ void LightSweep::upload(const Image& albedo, const Material* mats, const Rect& d
     uploadSubImage(canvasTex_, albedo.data(), w_, h_, r);
     if (!mats) return;
 
-    // 把材质打包进一张 RGBA8：r=自发光 g=折射率 b=标志位 a=备用。
-    // 只打包脏矩形那一块（紧凑缓冲），避免为了一次小改动准备整张图。
-    const int bw = r.width(), bh = r.height();
-    static std::vector<RGBA8> pack;
-    pack.resize((size_t)bw * (size_t)bh);
-    for (int y = 0; y < bh; y++) {
-        const Material* src = mats + (size_t)(r.y0 + y) * (size_t)w_ + (size_t)r.x0;
-        RGBA8* dst = pack.data() + (size_t)y * (size_t)bw;
-        for (int x = 0; x < bw; x++) {
-            dst[x] = RGBA8{src[x].emission, src[x].ior, src[x].flags, 255};
-        }
-    }
-    uploadSubImagePacked(matTex_, r.x0, r.y0, bw, bh, pack.data());
+    // 材质打包成 4 个 float/像素（见 gfx/material_pack.h），只打包脏矩形那一块
+    static std::vector<float> pack;
+    packMaterials(mats, w_, r, pack);
+    if (!pack.empty())
+        uploadSubImagePackedF(matTex_, r.x0, r.y0, r.width(), r.height(), pack.data());
 }
 
 void LightSweep::uploadAll(const Image& albedo, const Material* mats) {

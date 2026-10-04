@@ -87,4 +87,12 @@ void uploadSubImagePacked(GLuint tex, int x0, int y0, int bw, int bh, const RGBA
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+void uploadSubImagePackedF(GLuint tex, int x0, int y0, int bw, int bh, const float* tight) {
+    if (!tex || !tight || bw <= 0 || bh <= 0) return;
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, bw, bh, GL_RGBA, GL_FLOAT, tight);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 }  // namespace pb::gfx

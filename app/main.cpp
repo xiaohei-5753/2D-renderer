@@ -68,26 +68,35 @@ void buildDemoScene(app::App& a) {
         a.history.endStroke(a.canvas, toolName(t));
     };
 
-    Material glow;
-    // 自发光与遮挡解耦之后，emission 是独立强度（不再隐含乘 alpha），
-    // 所以这里给的是"发光强度"而不是原来的 alpha 值。
-    glow.emission = 150;
+    // 自发光是**独立的 RGB**，与 albedo 无关。
+    // 这个辅助函数让自发光取某个颜色的色相（"这个颜色自己发光"）——
+    // 这是最常用的组合，但不是唯一可能：也完全可以红表面发蓝光。
+    auto glowOf = [](RGBA8 c, float level) {
+        Material m;
+        const float k = level / 255.0f;
+        m.setEmissionFrom((uint8_t)std::lround(c.r * k), (uint8_t)std::lround(c.g * k),
+                          (uint8_t)std::lround(c.b * k));
+        return m;
+    };
     Material none;
 
-    stroke(ToolId::Line, W / 8, H / 4, W - W / 8, H / 4, RGBA8{90, 200, 255, 110}, 3, false,
-           glow);
-    stroke(ToolId::Line, W / 8, H - H / 4, W - W / 8, H - H / 4, RGBA8{255, 130, 80, 110}, 3,
-           false, glow);
+    const RGBA8 neonA{90, 200, 255, 110};
+    const RGBA8 neonB{255, 130, 80, 110};
+    const RGBA8 glassC{220, 190, 90, 160};
+
+    stroke(ToolId::Line, W / 8, H / 4, W - W / 8, H / 4, neonA, 3, false, glowOf(neonA, 175));
+    stroke(ToolId::Line, W / 8, H - H / 4, W - W / 8, H - H / 4, neonB, 3, false,
+           glowOf(neonB, 175));
     stroke(ToolId::Rect, W / 2 - 26, H / 2 - 20, W / 2 + 26, H / 2 + 20,
            RGBA8{44, 44, 54, 255}, 1, true, none);
-    stroke(ToolId::Ellipse, W / 8, H / 2 - 30, W / 4, H / 2 + 30, RGBA8{220, 190, 90, 160}, 1,
-           false, glow);
+    stroke(ToolId::Ellipse, W / 8, H / 2 - 30, W / 4, H / 2 + 30, glassC, 1, false,
+           glowOf(glassC, 150));
     for (int i = 0; i < 6; i++) {
         o.tool = ToolId::Dither;
         o.color = RGBA8{(uint8_t)(60 + i * 30), 90, (uint8_t)(200 - i * 25), 130};
         o.brushSize = 12;
         o.ditherLevel = 100 - i * 16;
-        o.material = glow;
+        o.material = glowOf(o.color, 120);
         a.history.beginStroke(a.canvas);
         s.begin(a.canvas, o, W - W / 6, H / 2 - 30 + i * 10);
         s.end();

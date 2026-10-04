@@ -407,7 +407,7 @@ void drawToolbarPanel(App& a) {
         ImGui::SameLine();
         ImGui::BeginGroup();
         ImGui::Text("前景 #%02X%02X%02X", a.opts.color.r, a.opts.color.g, a.opts.color.b);
-        ImGui::TextDisabled("a=%d  e=%d", a.opts.color.a, a.opts.material.emission);
+        ImGui::TextDisabled("a=%d  em=%d", a.opts.color.a, a.opts.material.emissionLevel());
         ImGui::EndGroup();
     }
     // 遮挡 alpha / 自发光 / 折射率都在右侧「材质」面板里编辑。
@@ -641,7 +641,9 @@ void applyMaterialPreset(App& a, int i) {
     if (i < 0 || i >= kMaterialPresetCount) return;
     const MaterialPreset& p = kMaterialPresets[i];
     a.opts.color.a = p.alpha;
-    a.opts.material.emission = p.emission;
+    // 预设给的是中性自发光（灰白），用户可以随后把它的颜色改成任意值 ——
+    // 这正是"完全解耦"的意义：表面颜色与发光颜色互不影响。
+    a.opts.material.setEmissionFrom(p.emission, p.emission, p.emission);
     a.opts.material.setIorValue(p.ior);
     a.opts.material.flags = p.flags;
     a.lastAction = std::string("材质 ") + p.name;
@@ -684,33 +686,60 @@ void drawMaterialSection(App& a) {
     ImGui::TextWrapped("决定像素显示成什么颜色，以及半透明时把透过的光染成什么颜色。");
 
     // ==================================================================
-    // 轴 2：亮度（自发光）
+    // 轴 2：自发光（另一组 RGB，与 albedo 完全独立）
     // ==================================================================
-    // 与颜色**完全独立**：同一个颜色可以配任意亮度。
-    // 下面那条渐变就是"同一个颜色在 6 档亮度下的实际效果"，用的是和着色器一致的公式。
+    // 这是"完全解耦"的关键：自发光是**自己的一个 RGB 值**，不是从 albedo 派生的标量。
+    // 所以暗色表面可以发绿光、红表面可以发蓝光，两者互不约束。
     ImGui::Spacing();
-    ImGui::SeparatorText("亮度（自发光）");
-    int em = m.emission;
+    ImGui::SeparatorText("自发光（独立 RGB）");
+    float em[3] = {m.emR / 255.0f, m.emG / 255.0f, m.emB / 255.0f};
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::SliderInt("##emission", &em, 0, 255, "自发光 %d", ImGuiSliderFlags_AlwaysClamp)) {
-        m.emission = (uint8_t)em;
+    if (ImGui::ColorEdit3("##emcolor", em,
+                          ImGuiColorEditFlags_DisplayHex | ImGuiColorEditFlags_InputRGB |
+                              ImGuiColorEditFlags_PickerHueBar)) {
+        m.emR = (uint8_t)std::lround(em[0] * 255.0f);
+        m.emG = (uint8_t)std::lround(em[1] * 255.0f);
+        m.emB = (uint8_t)std::lround(em[2] * 255.0f);
     }
+    // 便捷：整条亮度缩放（仍然作用在那个 RGB 上，不引入新的耦合）
+    int level = m.emissionLevel();
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderInt("##emlevel", &level, 0, 255, "亮度 %d", ImGuiSliderFlags_AlwaysClamp)) {
+        if (m.emissionLevel() > 0) {
+            const float k = (float)level / (float)m.emissionLevel();
+            const int r = (int)std::lround(m.emR * k);
+            const int g = (int)std::lround(m.emG * k);
+            const int b = (int)std::lround(m.emB * k);
+            m.emR = (uint8_t)std::clamp(r, 0, 255);
+            m.emG = (uint8_t)std::clamp(g, 0, 255);
+            m.emB = (uint8_t)std::clamp(b, 0, 255);
+        } else if (level > 0) {
+            m.setEmissionFrom((uint8_t)level, (uint8_t)level, (uint8_t)level);
+        }
+    }
+    const float ew = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) *
+                     0.5f;
+    if (ImGui::Button("跟随表面颜色", ImVec2(ew, 0.0f)))
+        m.setEmissionFrom(col.r, col.g, col.b);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("把自发光设成与 albedo 相同 —— 这不是必须的，只是常用的一键操作");
+    ImGui::SameLine();
+    if (ImGui::Button("无自发光", ImVec2(ew, 0.0f))) m.clearEmission();
 
-    // 亮度渐变条：逐档用与 blend 通道相同的公式算颜色，
-    // 让"亮度只改变明暗、不改变色相"这件事直接看得见。
+    // 亮度渐变条：用与 blend 通道相同的公式画出"当前自发光在 6 档下的效果"
     {
         const int kSteps = 6;
-        const float h = a.ui(20.0f);
+        const float h = a.ui(18.0f);
         const float avail = ImGui::GetContentRegionAvail().x;
         const float w = (avail - a.ui(2.0f) * (kSteps - 1)) / kSteps;
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImDrawList* dl = ImGui::GetWindowDrawList();
         for (int i = 0; i < kSteps; i++) {
-            const float e = (float)i / (float)(kSteps - 1);
-            // 与 light_sweep blend 的实心分支同式：albedo*(1+e*1.7)，峰值归一
-            float r = col.r / 255.0f * (1.0f + e * 1.7f);
-            float g = col.g / 255.0f * (1.0f + e * 1.7f);
-            float b = col.b / 255.0f * (1.0f + e * 1.7f);
+            const float k = (float)i / (float)(kSteps - 1);
+            // 与 blend 的实心分支同式：albedo + 自发光*k*1.7，峰值归一
+            float r = col.r / 255.0f + m.emR / 255.0f * k * 1.7f;
+            float g = col.g / 255.0f + m.emG / 255.0f * k * 1.7f;
+            float b = col.b / 255.0f + m.emB / 255.0f * k * 1.7f;
             const float pk = std::max(std::max(r, g), b);
             if (pk > 1.0f) { r /= pk; g /= pk; b /= pk; }
             const ImVec2 q0(p0.x + (w + a.ui(2.0f)) * i, p0.y);
@@ -718,16 +747,12 @@ void drawMaterialSection(App& a) {
             dl->AddRectFilled(q0, q1,
                               IM_COL32((int)std::lround(r * 255), (int)std::lround(g * 255),
                                        (int)std::lround(b * 255), 255));
-            // 当前档位加个白框
-            if (std::abs(e * 255.0f - (float)m.emission) <= 25.0f)
-                dl->AddRect(q0, q1, IM_COL32(255, 255, 255, 255), 0.0f, 0, 2.0f);
-            else
-                dl->AddRect(q0, q1, IM_COL32(120, 124, 134, 255));
+            dl->AddRect(q0, q1, IM_COL32(120, 124, 134, 255));
         }
         ImGui::Dummy(ImVec2(avail, h));
     }
-    ImGui::TextWrapped("与颜色独立：同一个颜色可以配任意亮度。"
-                       "亮度提高时颜色会变亮而**不会变成白色**。");
+    ImGui::TextWrapped("自发光是**自己的一个 RGB 值**，与上面的颜色互不影响："
+                       "深色表面可以发绿光，红表面可以发蓝光。");
 
     // ==================================================================
     // 轴 3：遮挡（alpha）
@@ -797,11 +822,10 @@ void drawMaterialSection(App& a) {
         dl->AddRectFilled(l0, l1, IM_COL32(col.r, col.g, col.b, (int)std::lround(cov * 255.0f)));
         dl->AddRect(l0, l1, IM_COL32(120, 124, 134, 255));
 
-        // 右：加上亮度之后的外观（与着色器同式）
-        const float e = m.emission / 255.0f;
-        float r = col.r / 255.0f * (1.0f + e * 1.7f);
-        float g = col.g / 255.0f * (1.0f + e * 1.7f);
-        float b = col.b / 255.0f * (1.0f + e * 1.7f);
+        // 右：加上自发光之后的外观（与着色器同式：albedo + 自发光*1.7，峰值归一）
+        float r = col.r / 255.0f + m.emR / 255.0f * 1.7f;
+        float g = col.g / 255.0f + m.emG / 255.0f * 1.7f;
+        float b = col.b / 255.0f + m.emB / 255.0f * 1.7f;
         const float pk = std::max(std::max(r, g), b);
         if (pk > 1.0f) { r /= pk; g /= pk; b /= pk; }
         const ImVec2 r0(p0.x + w + a.ui(4.0f), p0.y), r1(r0.x + w, p0.y + h);
@@ -977,7 +1001,7 @@ void drawStatusBar(App& a) {
             ImGui::TextDisabled("空");
         else
             ImGui::Text("#%02X%02X%02X a=%d e=%d", c.r, c.g, c.b, c.a,
-                        a.cursorMaterial.emission);
+                        a.cursorMaterial.emissionLevel());
     }
 
     ImGui::SameLine(0, 12);

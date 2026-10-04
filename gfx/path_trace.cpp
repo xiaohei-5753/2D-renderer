@@ -50,7 +50,7 @@ float coverageOf(ivec2 p){
   p=clamp(p,ivec2(0),u_cs-1);
   vec4 a=texelFetch(u_alb,p,0);
   vec4 m=texelFetch(u_mat,p,0);
-  int fl=int(m.b*255.0+0.5);
+  int fl=int(floor(m.a/8.0+0.5));
   return ((fl&2)!=0)?1.0:a.a;
 }
 
@@ -80,7 +80,7 @@ void main(){
   // 收集到的入射辐照度再乘自己的 albedo（见循环之后的处理）。
   float cov0=coverageOf(px);
   bool primarySolid=(cov0>0.5);
-  int fl0=int(texelFetch(u_mat,px,0).b*255.0+0.5);
+  int fl0=int(floor(texelFetch(u_mat,px,0).a/8.0+0.5));
   bool primaryMirror=primarySolid&&((fl0&1)!=0);
   vec2 pos,dir;
   if(primarySolid){
@@ -139,11 +139,11 @@ void main(){
 
       vec4 a=texelFetch(u_alb,cell,0);
       vec4 m=texelFetch(u_mat,cell,0);
-      int fl=int(m.b*255.0+0.5);
+      int fl=int(floor(m.a/8.0+0.5));
       float cov=((fl&2)!=0)?1.0:a.a;
 
-      // 体积自发光：按射线在该格内的长度加权（这就是正确的体积积分）
-      rad+=tp*a.rgb*(m.r*u_emit)*dt;
+      // 体积自发光：**独立的 RGB**，按射线在该格内的长度加权
+      rad+=tp*m.rgb*u_emit*dt;
 
       if(cov>0.5){hit=true;hp=cell;break;}
       // 半透明介质：衰减 + 按 albedo 染色（彩色玻璃）
@@ -163,8 +163,9 @@ void main(){
     // ---- 表面交互 ----
     vec4 a=texelFetch(u_alb,hp,0);
     vec4 m=texelFetch(u_mat,hp,0);
-    int fl=int(m.b*255.0+0.5);
-    float iorv=1.0+m.g*2.55;
+    float aFl=floor(m.a/8.0+0.5);
+    int fl=int(aFl);
+    float iorv=m.a-aFl*8.0;          // 折射率就存在材质纹理的第 4 个通道里
     float wSpec=((fl&1)!=0)?1.0:0.0;
     float wRefr=(iorv>1.01)?0.85:0.0;
     float wDiff=1.0;
@@ -206,7 +207,7 @@ void main(){
   if(primarySolid){
     vec4 ap=texelFetch(u_alb,px,0);
     vec4 mp=texelFetch(u_mat,px,0);
-    vec3 selfEm=ap.rgb*(mp.r*u_emit);
+    vec3 selfEm=mp.rgb*u_emit;       // 自发光是独立的 RGB，与 albedo 无关
     if(primaryMirror){
       // 镜面保持全强度：乘 albedo 会让它和普通表面难以区分（当初就是这个原因
       // 让"反射看不见"）。这样镜面明显更亮、且显示的是正对的场景。
@@ -271,7 +272,8 @@ bool PathTrace::init(int w, int h) {
     h_ = h;
 
     albedoTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
-    matTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
+    // 材质用 RGBA32F：解耦后需要 5 个量（自发光 RGB + 折射率 + 标志位）
+    matTex_ = createTexture(GL_RGBA32F, w, h, GL_RGBA, GL_FLOAT);
     accumTex_ = createTexture(GL_RGBA16F, w, h, GL_RGBA, GL_HALF_FLOAT);
     displayTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
 
@@ -279,7 +281,8 @@ bool PathTrace::init(int w, int h) {
     {
         std::vector<RGBA8> zero((size_t)w * h, RGBA8{0, 0, 0, 0});
         uploadSubImage(albedoTex_, zero.data(), w, h, Rect{0, 0, w - 1, h - 1});
-        uploadSubImage(matTex_, zero.data(), w, h, Rect{0, 0, w - 1, h - 1});
+        std::vector<float> zf((size_t)w * h * 4, 0.0f);
+        uploadSubImagePackedF(matTex_, 0, 0, w, h, zf.data());
     }
 
     traceProg_ = createComputeProgram("pt/trace", kTraceComp);
@@ -345,10 +348,10 @@ void PathTrace::upload(const Image& albedo, const Material* mats, const Rect& di
     uploadSubImage(albedoTex_, albedo.data(), w_, h_, r);
 
     if (mats) {
-        static std::vector<RGBA8> pack;
+        static std::vector<float> pack;
         packMaterials(mats, w_, r, pack);
-        if (!pack.empty()) uploadSubImagePacked(matTex_, r.x0, r.y0, r.width(), r.height(),
-                                                pack.data());
+        if (!pack.empty())
+            uploadSubImagePackedF(matTex_, r.x0, r.y0, r.width(), r.height(), pack.data());
     }
 }
 

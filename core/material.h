@@ -1,13 +1,18 @@
 // core/material.h — 每像素的光学属性
 //
-// P1 阶段只负责**存储与编辑**这些属性；真正读取它们的是 P2 的光追通道。
-// 之所以现在就把数据模型定下来，是因为把"光"和"颜色"分开是画板的核心需求，
-// 事后往文档格式里塞通道代价很大。
+// ## 完全解耦：像素有两组**互相独立**的颜色
 //
-// 关键设计：自发光（emission）与遮挡（albedo 的 alpha）是**两个独立的量**。
-// 原实现里 alpha 同时兼任两者，导致表达不了这两种像素：
-//   - 不透明但发光：自发光墙面 / 屏幕
-//   - 半透明但不发光：彩色玻璃（只挡一部分光，自己不亮）
+//   1. albedo（存在 Canvas 里）：RGB = 显示成什么颜色、以及透光时把光过滤成什么颜色；
+//      A = 遮挡程度。
+//   2. 自发光（本结构里的 emR/emG/emB）：这个像素**自己发出**什么颜色的光。
+//
+// 两者完全独立，所以可以表达：
+//   * 暗色表面发绿光（albedo 很暗 + 自发光绿）
+//   * 红表面发蓝光（albedo 红 + 自发光蓝）
+//   * 同一个 albedo 配任意自发光色
+//
+// 早期实现把自发光写成 albedo.rgb * 一个标量亮度，那是**耦合**的：
+// 自发光颜色被 albedo 绑死，也无法表达"发光的颜色与表面颜色不同"。
 #pragma once
 
 #include <cstdint>
@@ -15,8 +20,9 @@
 namespace pb {
 
 struct Material {
-    // 自发光强度 0..255。0 = 完全不发光。
-    uint8_t emission = 0;
+    // 自发光颜色 RGB，各 0..255。0,0,0 = 不自发光。
+    // 与 albedo 无关：它只决定"自己发出什么颜色的光"。
+    uint8_t emR = 0, emG = 0, emB = 0;
 
     // 折射率，编码为 (ior - 1.0) * 100，于是 0..255 对应 ior 1.00 .. 3.55。
     // 0 表示不折射（空气或普通表面）。
@@ -31,8 +37,29 @@ struct Material {
 
     bool reflective() const { return (flags & kReflective) != 0; }
     bool solid() const { return (flags & kSolid) != 0; }
-    void setReflective(bool on) { flags = on ? (uint8_t)(flags | kReflective) : (uint8_t)(flags & ~kReflective); }
-    void setSolid(bool on) { flags = on ? (uint8_t)(flags | kSolid) : (uint8_t)(flags & ~kSolid); }
+    void setReflective(bool on) {
+        flags = on ? (uint8_t)(flags | kReflective) : (uint8_t)(flags & ~kReflective);
+    }
+    void setSolid(bool on) {
+        flags = on ? (uint8_t)(flags | kSolid) : (uint8_t)(flags & ~kSolid);
+    }
+
+    bool emissive() const { return emR || emG || emB; }
+
+    // 自发光的"亮度"（取三通道最大值），仅用于界面显示
+    uint8_t emissionLevel() const {
+        const uint8_t m = emR > emG ? emR : emG;
+        return m > emB ? m : emB;
+    }
+
+    // 直接用 albedo 的颜色作为自发光颜色（"让这个颜色发光"的一键操作）
+    void setEmissionFrom(uint8_t r, uint8_t g, uint8_t b) {
+        emR = r;
+        emG = g;
+        emB = b;
+    }
+
+    void clearEmission() { emR = emG = emB = 0; }
 
     float iorValue() const { return 1.0f + ior / 100.0f; }
     void setIorValue(float v) {
@@ -43,7 +70,8 @@ struct Material {
 };
 
 inline bool operator==(const Material& a, const Material& b) {
-    return a.emission == b.emission && a.ior == b.ior && a.flags == b.flags;
+    return a.emR == b.emR && a.emG == b.emG && a.emB == b.emB && a.ior == b.ior &&
+           a.flags == b.flags;
 }
 inline bool operator!=(const Material& a, const Material& b) { return !(a == b); }
 

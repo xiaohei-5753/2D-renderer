@@ -321,16 +321,18 @@ void testHistoryPatchSize() {
     c.setPixel(100, 100, kWhite, Material{});
     CHECK(h.endStroke(c, "单像素"));
 
-    // 1x1 补丁 = 4 字节颜色 + 4 字节材质 = 8 字节。
-    // 如果实现退化成整图快照，这里会是 256*256*8 = 512 KB。
-    CHECK(h.bytes() == 8);
+    // 1x1 补丁 = 一个像素的颜色 + 材质。
+    // 用 sizeof 而不是写死数字：Material 从 4 字节长到 6 字节（自发光变成独立 RGB）
+    // 时这个断言就失效过，写死数字的测试反而会误导。
+    const size_t perPixel = sizeof(RGBA8) + sizeof(Material);
+    CHECK(h.bytes() == perPixel);
 
     // 一小段线也只应是那个外接矩形
     h.beginStroke(c);
     c.drawLine(10, 10, 20, 10, kWhite, Material{});
     CHECK(h.endStroke(c, "短线"));
     const size_t b = h.bytes();
-    CHECK(b == 8 + 11 * 8);
+    CHECK(b == perPixel * (1 + 11));
 }
 
 void testHistoryStack() {
@@ -674,7 +676,8 @@ void testMaterial() {
     section("材质通道");
 
     Material m;
-    CHECK(m.emission == 0);
+    CHECK(m.emissionLevel() == 0);
+    CHECK(!m.emissive());
     CHECK(m.ior == 0);
     CHECK(!m.reflective());
     CHECK(!m.solid());
@@ -697,23 +700,26 @@ void testMaterial() {
     CHECK(!m.reflective());
     CHECK(m.solid());      // 清一个标志不该影响另一个
 
-    // 材质参与撤销重做的比对：
-    // 笔画内容是"画上自发光像素"，所以撤销应当回到画之前（全空），重做才恢复发光像素。
+    // 材质参与撤销重做的比对。
+    // 自发光故意设成 (10,200,30)，与 albedo（白色）**完全不同** ——
+    // 用来证明"表面颜色"与"发光颜色"是两个独立的量。
     Canvas c = makeCanvas(8, 8);
     History h;
     h.beginStroke(c);
     Material glow;
-    glow.emission = 200;
+    glow.setEmissionFrom(10, 200, 30);
     c.setPixel(1, 1, kWhite, glow);
     CHECK(h.endStroke(c, "自发光"));
-    CHECK(c.materialAt(1, 1).emission == 200);
+    CHECK(c.materialAt(1, 1).emG == 200);
+    CHECK(c.materialAt(1, 1).emR == 10);
+    CHECK(c.image().at(1, 1) == kWhite);   // albedo 不受自发光影响
 
     CHECK(h.undo(c));
-    CHECK(c.materialAt(1, 1).emission == 0);    // 回到笔画前：空气
+    CHECK(c.materialAt(1, 1).emissionLevel() == 0);   // 回到笔画前：空气
     CHECK(c.image().at(1, 1).a == 0);
 
     CHECK(h.redo(c));
-    CHECK(c.materialAt(1, 1).emission == 200);  // 重做后恢复
+    CHECK(c.materialAt(1, 1).emG == 200);  // 重做后恢复
     CHECK(c.image().at(1, 1) == kWhite);
 }
 

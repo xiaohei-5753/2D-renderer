@@ -21,6 +21,9 @@ void uploadSubImage(GLuint tex, const RGBA8* pixels, int w, int h, const Rect& d
 // 用于逐像素打包出来的副通道（例如材质），避免为了上传一小块而准备整张图。
 void uploadSubImagePacked(GLuint tex, int x0, int y0, int bw, int bh, const RGBA8* tight);
 
+// 同上，但数据是 4 个 float/像素（材质通道用，见 gfx/material_pack.h）
+void uploadSubImagePackedF(GLuint tex, int x0, int y0, int bw, int bh, const float* tight);
+
 // 把纹理内容读回 CPU（离线渲染出图用）
 bool readbackTexture(GLuint tex, int w, int h, RGBA8* out);
 

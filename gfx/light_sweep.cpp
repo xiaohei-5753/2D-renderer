@@ -98,7 +98,16 @@ void main(){
   float cov=((fl&2)!=0)?1.0:c.a;
   vec3 e=c.rgb*mt.r*u_emit;
   if(cov>=1.0){
-    vec3 r=mix(c.rgb,vec3(1.0),clamp(mt.r,0.0,1.0)*0.85);
+    // 实心像素：以自身 albedo 为底色。
+    //
+    // 自发光必须在**自身颜色**上增亮，**不能**把颜色推向白。
+    // 原来的写法 mix(c.rgb, 1.0, mt.r*0.85) 会让亮度越大颜色越白——
+    // 用户选的红 + 高亮度会变成白色，等于"颜色"被"亮度"吃掉了。
+    // 颜色（albedo）与亮度（自发光）必须是两个独立的量。
+    vec3 s=texelFetch(u_scan,p,0).rgb;
+    vec3 r=c.rgb*(1.0+mt.r*u_emit*1.7)+c.rgb*s*1.2;
+    float pk=max(max(r.r,r.g),r.b);
+    if(pk>1.0)r/=pk;
     imageStore(u_out,p,vec4(r,1.0));return;
   }
   vec3 s=texelFetch(u_scan,p,0).rgb;

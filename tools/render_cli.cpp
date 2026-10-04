@@ -174,11 +174,39 @@ void sceneChecker(Canvas& c) {
     c.markAllDirty();
 }
 
+// 专门用来验证"颜色与亮度是两个独立的量"：
+// 同一个色相在三档亮度下，**色相必须保持不变**，只有明暗变化。
+// 如果亮度把颜色推向白（旧实现的错误行为），右列会变成白色 —— 这个场景一眼就能看出来。
+void sceneHue(Canvas& c) {
+    c.clear(RGBA8{0, 0, 0, 0});
+    const int W = c.width(), H = c.height();
+    const RGBA8 hues[3] = {rgb(220, 40, 40), rgb(40, 200, 60), rgb(50, 90, 230)};
+    const uint8_t ems[3] = {0, 120, 255};
+
+    const int barW = W / 5;
+    const int barH = H / 5;
+    for (int r = 0; r < 3; r++) {
+        for (int k = 0; k < 3; k++) {
+            const int x0 = W / 12 + k * (barW + W / 24);
+            const int y0 = H / 8 + r * (barH + H / 12);
+            c.fillRect(x0, y0, x0 + barW, y0 + barH, hues[r], emissive(ems[k]));
+        }
+    }
+    // 亮度对照的标签块：无彩色，用来检查自发光强度本身
+    for (int k = 0; k < 3; k++) {
+        const int x0 = W / 12 + k * (barW + W / 24);
+        c.fillRect(x0, H - H / 5, x0 + barW, H - H / 6, rgb(255, 255, 255),
+                   emissive(ems[k]));
+    }
+    c.markAllDirty();
+}
+
 bool buildScene(const std::string& name, Canvas& c) {
     if (name == "empty") { c.clear(RGBA8{0, 0, 0, 0}); return true; }
     if (name == "neon") { sceneNeon(c); return true; }
     if (name == "cornell") { sceneCornell(c); return true; }
     if (name == "checker") { sceneChecker(c); return true; }
+    if (name == "hue") { sceneHue(c); return true; }
     fprintf(stderr, "[cli] 未知场景: %s\n", name.c_str());
     return false;
 }

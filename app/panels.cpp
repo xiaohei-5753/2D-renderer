@@ -649,11 +649,12 @@ void applyMaterialPreset(App& a, int i) {
 
 void drawMaterialSection(App& a) {
     Material& m = a.opts.material;
+    RGBA8& col = a.opts.color;
 
     // ------------------------------------------------------------------
-    // 1. 材质预设
+    // 1. 材质预设（注意：预设会同时改写颜色以外的全部轴）
     // ------------------------------------------------------------------
-    ImGui::TextDisabled("预设（一键套用一组参数）");
+    ImGui::TextDisabled("预设（一键套用一组参数，会覆盖下面的各项）");
     const float pw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) *
                      0.5f;
     for (int i = 0; i < kMaterialPresetCount; i++) {
@@ -663,40 +664,101 @@ void drawMaterialSection(App& a) {
         if ((i & 1) == 0 && i + 1 < kMaterialPresetCount) ImGui::SameLine();
     }
 
-    // ------------------------------------------------------------------
-    // 2. 逐项参数
-    // ------------------------------------------------------------------
+    // ==================================================================
+    // 轴 1：颜色（albedo）
+    // ==================================================================
+    // 颜色决定两件事：像素显示成什么颜色、以及半透明时滤过什么颜色的光。
+    // 它**不**决定亮度——亮度是下面独立的第二条轴。
     ImGui::Spacing();
-    ImGui::SeparatorText("参数");
+    ImGui::SeparatorText("颜色（albedo）");
+    float rgb[3] = {col.r / 255.0f, col.g / 255.0f, col.b / 255.0f};
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::ColorEdit3("##albedo", rgb,
+                          ImGuiColorEditFlags_DisplayHex | ImGuiColorEditFlags_InputRGB |
+                              ImGuiColorEditFlags_PickerHueBar)) {
+        col.r = (uint8_t)std::lround(rgb[0] * 255.0f);
+        col.g = (uint8_t)std::lround(rgb[1] * 255.0f);
+        col.b = (uint8_t)std::lround(rgb[2] * 255.0f);
+        pushRecentColor(a, col);
+    }
+    ImGui::TextWrapped("决定像素显示成什么颜色，以及半透明时把透过的光染成什么颜色。");
 
-    int alpha = a.opts.color.a;
+    // ==================================================================
+    // 轴 2：亮度（自发光）
+    // ==================================================================
+    // 与颜色**完全独立**：同一个颜色可以配任意亮度。
+    // 下面那条渐变就是"同一个颜色在 6 档亮度下的实际效果"，用的是和着色器一致的公式。
+    ImGui::Spacing();
+    ImGui::SeparatorText("亮度（自发光）");
+    int em = m.emission;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderInt("##emission", &em, 0, 255, "自发光 %d", ImGuiSliderFlags_AlwaysClamp)) {
+        m.emission = (uint8_t)em;
+    }
+
+    // 亮度渐变条：逐档用与 blend 通道相同的公式算颜色，
+    // 让"亮度只改变明暗、不改变色相"这件事直接看得见。
+    {
+        const int kSteps = 6;
+        const float h = a.ui(20.0f);
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float w = (avail - a.ui(2.0f) * (kSteps - 1)) / kSteps;
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        for (int i = 0; i < kSteps; i++) {
+            const float e = (float)i / (float)(kSteps - 1);
+            // 与 light_sweep blend 的实心分支同式：albedo*(1+e*1.7)，峰值归一
+            float r = col.r / 255.0f * (1.0f + e * 1.7f);
+            float g = col.g / 255.0f * (1.0f + e * 1.7f);
+            float b = col.b / 255.0f * (1.0f + e * 1.7f);
+            const float pk = std::max(std::max(r, g), b);
+            if (pk > 1.0f) { r /= pk; g /= pk; b /= pk; }
+            const ImVec2 q0(p0.x + (w + a.ui(2.0f)) * i, p0.y);
+            const ImVec2 q1(q0.x + w, q0.y + h);
+            dl->AddRectFilled(q0, q1,
+                              IM_COL32((int)std::lround(r * 255), (int)std::lround(g * 255),
+                                       (int)std::lround(b * 255), 255));
+            // 当前档位加个白框
+            if (std::abs(e * 255.0f - (float)m.emission) <= 25.0f)
+                dl->AddRect(q0, q1, IM_COL32(255, 255, 255, 255), 0.0f, 0, 2.0f);
+            else
+                dl->AddRect(q0, q1, IM_COL32(120, 124, 134, 255));
+        }
+        ImGui::Dummy(ImVec2(avail, h));
+    }
+    ImGui::TextWrapped("与颜色独立：同一个颜色可以配任意亮度。"
+                       "亮度提高时颜色会变亮而**不会变成白色**。");
+
+    // ==================================================================
+    // 轴 3：遮挡（alpha）
+    // ==================================================================
+    ImGui::Spacing();
+    ImGui::SeparatorText("遮挡（alpha）");
+    int alpha = col.a;
     ImGui::SetNextItemWidth(-1);
     if (ImGui::SliderInt("##matAlpha", &alpha, 0, 255, "遮挡 alpha %d",
                          ImGuiSliderFlags_AlwaysClamp)) {
-        a.opts.color.a = (uint8_t)alpha;
+        col.a = (uint8_t)alpha;
     }
-    ImGui::TextDisabled("0 = 空气，255 = 完全挡光");
+    ImGui::TextWrapped("0 = 空气（光直接穿过），255 = 完全挡光。"
+                       "中间值是半透明介质：既挡一部分光，又把透过的光按上面的颜色染色。");
 
-    int em = m.emission;
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::SliderInt("##matEm", &em, 0, 255, "自发光 %d", ImGuiSliderFlags_AlwaysClamp)) {
-        m.emission = (uint8_t)em;
-    }
-    ImGui::TextDisabled("与遮挡**独立**：不透明也能发光（自发光屏）");
-
+    // ==================================================================
+    // 几何：反射 / 折射（只在路径追踪模式下生效）
+    // ==================================================================
+    ImGui::Spacing();
+    ImGui::SeparatorText("几何");
     float ior = m.iorValue();
     ImGui::SetNextItemWidth(-1);
     if (ImGui::SliderFloat("##matIor", &ior, 1.0f, 3.55f, "折射率 %.2f")) {
         m.setIorValue(ior);
     }
-
     bool refl = m.reflective();
-    if (ImGui::Checkbox("反射", &refl)) m.setReflective(refl);
+    if (ImGui::Checkbox("镜面反射", &refl)) m.setReflective(refl);
     ImGui::SameLine();
     bool solid = m.solid();
     if (ImGui::Checkbox("强制实心", &solid)) m.setSolid(solid);
 
-    // 如实标注哪些参数在哪个模式下生效——否则用户调了折射率却看不到变化，会以为坏了
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.35f, 1.0f));
     ImGui::TextWrapped("遮挡与自发光：两种模式都生效。"
@@ -704,47 +766,54 @@ void drawMaterialSection(App& a) {
                        "（扫描 GI 是直线扫描，物理上做不了弯曲光路）。");
     ImGui::PopStyleColor();
 
-    // ------------------------------------------------------------------
-    // 3. 当前材质预览
-    // ------------------------------------------------------------------
+    // ==================================================================
+    // 预览：左右并排显示"颜色"和"该颜色在当前位置的最终外观"
+    // ==================================================================
     ImGui::Spacing();
     ImGui::SeparatorText("预览");
     {
-        // 预览块：底色是 albedo，自发光让它变亮趋白，遮挡越低棋盘露得越多
-        const float h = a.ui(28.0f);
+        const float h = a.ui(30.0f);
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float w = (avail - a.ui(4.0f)) * 0.5f;
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
-        const float w = ImGui::GetContentRegionAvail().x;
-        ImGui::InvisibleButton("##matpreview", ImVec2(w, h));
+        ImGui::InvisibleButton("##matpreview", ImVec2(avail, h));
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 p1(p0.x + w, p0.y + h);
 
-        // 棋盘底，用来直观看出遮挡程度
-        const float cell = a.ui(7.0f);
-        for (float y = 0; y < h; y += cell) {
-            for (float x = 0; x < w; x += cell) {
-                const bool odd = ((int)(x / cell) + (int)(y / cell)) & 1;
-                dl->AddRectFilled(
-                    ImVec2(p0.x + x, p0.y + y),
-                    ImVec2(std::min(p0.x + x + cell, p1.x), std::min(p0.y + y + cell, p1.y)),
-                    odd ? IM_COL32(58, 58, 62, 255) : IM_COL32(86, 86, 92, 255));
-            }
-        }
-        const float cov = (m.solid() ? 255.0f : (float)a.opts.color.a) / 255.0f;
-        const int er = (int)std::lround(a.opts.color.r * (1.0f - m.emission / 255.0f * 0.85f) +
-                                        255.0f * (m.emission / 255.0f * 0.85f));
-        const int eg = (int)std::lround(a.opts.color.g * (1.0f - m.emission / 255.0f * 0.85f) +
-                                        255.0f * (m.emission / 255.0f * 0.85f));
-        const int eb = (int)std::lround(a.opts.color.b * (1.0f - m.emission / 255.0f * 0.85f) +
-                                        255.0f * (m.emission / 255.0f * 0.85f));
-        dl->AddRectFilled(p0, p1, IM_COL32(std::clamp(er, 0, 255), std::clamp(eg, 0, 255),
-                                           std::clamp(eb, 0, 255),
-                                           (int)std::lround(cov * 255.0f)));
-        dl->AddRect(p0, p1, IM_COL32(120, 124, 134, 255));
+        auto checker = [&](ImVec2 q0, ImVec2 q1) {
+            const float cell = a.ui(7.0f);
+            for (float y = q0.y; y < q1.y; y += cell)
+                for (float x = q0.x; x < q1.x; x += cell) {
+                    const bool odd = ((int)((x - q0.x) / cell) + (int)((y - q0.y) / cell)) & 1;
+                    dl->AddRectFilled(ImVec2(x, y),
+                                      ImVec2(std::min(x + cell, q1.x), std::min(y + cell, q1.y)),
+                                      odd ? IM_COL32(58, 58, 62, 255) : IM_COL32(86, 86, 92, 255));
+                }
+        };
+
+        // 左：纯颜色（带棋盘，直观看出遮挡程度）
+        const ImVec2 l0(p0.x, p0.y), l1(p0.x + w, p0.y + h);
+        checker(l0, l1);
+        const float cov = (m.solid() ? 255.0f : (float)col.a) / 255.0f;
+        dl->AddRectFilled(l0, l1, IM_COL32(col.r, col.g, col.b, (int)std::lround(cov * 255.0f)));
+        dl->AddRect(l0, l1, IM_COL32(120, 124, 134, 255));
+
+        // 右：加上亮度之后的外观（与着色器同式）
+        const float e = m.emission / 255.0f;
+        float r = col.r / 255.0f * (1.0f + e * 1.7f);
+        float g = col.g / 255.0f * (1.0f + e * 1.7f);
+        float b = col.b / 255.0f * (1.0f + e * 1.7f);
+        const float pk = std::max(std::max(r, g), b);
+        if (pk > 1.0f) { r /= pk; g /= pk; b /= pk; }
+        const ImVec2 r0(p0.x + w + a.ui(4.0f), p0.y), r1(r0.x + w, p0.y + h);
+        dl->AddRectFilled(r0, r1,
+                          IM_COL32((int)std::lround(r * 255), (int)std::lround(g * 255),
+                                   (int)std::lround(b * 255), 255));
+        dl->AddRect(r0, r1, IM_COL32(120, 124, 134, 255));
     }
-    ImGui::TextDisabled("预览块：棋盘透出的多少 = 遮挡程度，越白 = 自发光越强");
+    ImGui::TextDisabled("左 = 颜色（棋盘透出多少 = 遮挡程度）　右 = 加上亮度后的外观");
 
     // ------------------------------------------------------------------
-    // 4. 从画布吸取材质
+    // 从画布吸取
     // ------------------------------------------------------------------
     ImGui::Spacing();
     if (ImGui::Button("吸取光标下的颜色与材质", ImVec2(-1.0f, 0.0f))) {

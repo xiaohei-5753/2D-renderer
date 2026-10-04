@@ -35,6 +35,9 @@ void actSetTool(App& a, ToolId t);
 void actSetPaletteColor(App& a, int index);
 void actResetCamera(App& a);
 
+// 把颜色记入"最近使用"（去重，最新在前）。所有改色的入口都应调用它。
+void pushRecentColor(App& a, RGBA8 c);
+
 // 请求打开"新建画布"对话框（快捷键与菜单共用同一个入口）
 void requestNewCanvasDialog();
 

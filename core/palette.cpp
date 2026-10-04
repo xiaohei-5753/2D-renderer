@@ -147,6 +147,15 @@ void Palette::setColorAt(int i, RGBA8 c) {
     colors_[(size_t)i] = c;
 }
 
+bool Palette::removeColor(int i) {
+    // 不允许删空：画板总得有一个当前色
+    if (colors_.size() <= 1) return false;
+    if (i < 0 || i >= (int)colors_.size()) return false;
+    colors_.erase(colors_.begin() + i);
+    if (current_ >= (int)colors_.size()) current_ = (int)colors_.size() - 1;
+    return true;
+}
+
 bool Palette::contains(RGBA8 c) const {
     for (const auto& e : colors_)
         if (e == c) return true;

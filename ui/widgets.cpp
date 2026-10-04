@@ -62,7 +62,9 @@ bool colorSwatch(const char* id, ImU32 col, ImVec2 size, bool selected,
         dl->AddRect(ImVec2(p0.x - 2, p0.y - 2), ImVec2(p1.x + 2, p1.y + 2),
                     IM_COL32(255, 255, 255, 255), 0.0f, 0, 2.0f);
     } else {
-        ImU32 border = hovered ? IM_COL32(200, 210, 230, 255) : IM_COL32(0, 0, 0, 170);
+        // 未选中用**中灰**描边（不是近黑）：很多调色板（NES、Game Boy）里有纯黑与深色，
+        // 深色描边会跟深色块本身糊在一起，看不出色块的边界在哪。
+        const ImU32 border = hovered ? IM_COL32(235, 240, 250, 255) : IM_COL32(120, 124, 134, 255);
         dl->AddRect(p0, p1, border);
     }
 

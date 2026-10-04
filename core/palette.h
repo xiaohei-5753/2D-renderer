@@ -44,6 +44,8 @@ public:
     // 追加一个自定义颜色并选中它，返回其下标
     int addColor(RGBA8 c);
     void setColorAt(int i, RGBA8 c);
+    // 删除一个颜色（至少保留 1 个）。真的删掉了才返回 true。
+    bool removeColor(int i);
 
     // 当前色板里是否已经存在这个颜色
     bool contains(RGBA8 c) const;

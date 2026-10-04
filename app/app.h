@@ -78,6 +78,12 @@ struct App {
     int saveCounter = 0;
     double fps = 0.0;
 
+    // --- 最近使用的颜色 ---
+    // 调色板本身只存"某一套色板"，最近使用是跨色板的编辑历史，所以放在 App 里。
+    static constexpr int kRecentMax = 18;
+    RGBA8 recent[kRecentMax]{};
+    int recentCount = 0;
+
     // --- 自动化 / 演示模式 ---
     bool demo = false;
     bool requestQuit = false;

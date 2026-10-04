@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
     bool demo = false;
     bool forceVisible = false, forceHidden = false;
     int framesToRun = 0;
+    int paletteIndex = -1;
     std::string outFile;
 
     for (int i = 1; i < argc; i++) {
@@ -146,6 +147,8 @@ int main(int argc, char** argv) {
             framesToRun = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
             outFile = argv[++i];
+        } else if (std::strcmp(argv[i], "--palette") == 0 && i + 1 < argc) {
+            paletteIndex = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--visible") == 0) {
             forceVisible = true;
         } else if (std::strcmp(argv[i], "--hidden") == 0) {
@@ -174,6 +177,12 @@ int main(int argc, char** argv) {
     a.history.reset();
     a.opts.color = a.palette.current();
     a.demo = demo;
+
+    // 自动化/回归用：直接切到某一套色板（例如 NES 55 色，验证色块网格的自动换行）
+    if (paletteIndex >= 0) {
+        a.palette.loadPreset(paletteIndex);
+        app::actSetPaletteColor(a, 0);
+    }
 
     gfx::ContextDesc desc;
     desc.width = 1600;

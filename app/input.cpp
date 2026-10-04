@@ -32,6 +32,7 @@ void beginStrokeAt(App& a, int cx, int cy) {
         if (pickPixel(a.canvas, cx, cy, c, m)) {
             a.opts.color = c;
             a.opts.material = m;
+            pushRecentColor(a, c);
             a.lastAction = "取色";
         }
         return;
@@ -154,7 +155,7 @@ void cyclePalette(App& a, int delta) {
     const int n = builtinPaletteCount();
     if (n <= 0) return;
     a.palette.loadPreset(((a.palette.presetIndex() + delta) % n + n) % n);
-    a.opts.color = a.palette.current();
+    actSetPaletteColor(a, 0);
     a.lastAction = std::string("色板 ") + a.palette.presetName();
 }
 

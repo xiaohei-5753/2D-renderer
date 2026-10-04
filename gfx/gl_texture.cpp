@@ -1,0 +1,82 @@
+// gfx/gl_texture.cpp
+#include "gl_texture.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <vector>
+
+namespace pb::gfx {
+
+GLuint createTexture(GLenum internalFormat, int w, int h, GLenum format, GLenum type) {
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, w, h, 0, format, type, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
+GLuint createTextureWithStorage(GLenum internalFormat, int w, int h, int levels) {
+    if (levels < 1) levels = 1;
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexStorage2D(GL_TEXTURE_2D, levels, internalFormat, w, h);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
+void uploadSubImage(GLuint tex, const RGBA8* pixels, int w, int h, const Rect& dirtyIn) {
+    if (!pixels || !tex) return;
+
+    Rect r = dirtyIn;
+    r.clipTo(w, h);
+    if (r.empty()) return;
+
+    const int bw = r.width();
+    const int bh = r.height();
+
+    // 打包成紧凑的临时缓冲：只有脏矩形区域，避免整张重新上传
+    static std::vector<uint8_t> buf;
+    buf.resize((size_t)bw * (size_t)bh * 4);
+    for (int y = 0; y < bh; y++) {
+        const RGBA8* src = pixels + (size_t)(r.y0 + y) * (size_t)w + (size_t)r.x0;
+        uint8_t* dst = buf.data() + (size_t)y * (size_t)bw * 4;
+        for (int x = 0; x < bw; x++) {
+            dst[x * 4 + 0] = src[x].r;
+            dst[x * 4 + 1] = src[x].g;
+            dst[x * 4 + 2] = src[x].b;
+            dst[x * 4 + 3] = src[x].a;
+        }
+    }
+
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, r.x0, r.y0, bw, bh, GL_RGBA, GL_UNSIGNED_BYTE,
+                    buf.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+bool readbackTexture(GLuint tex, int w, int h, RGBA8* out) {
+    if (!tex || w <= 0 || h <= 0 || !out) return false;
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, out);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    const GLenum e = glGetError();
+    if (e != GL_NO_ERROR) {
+        fprintf(stderr, "[gl] readbackTexture failed: 0x%04X\n", e);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace pb::gfx

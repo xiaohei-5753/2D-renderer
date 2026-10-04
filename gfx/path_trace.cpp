@@ -80,13 +80,25 @@ void main(){
   // 收集到的入射辐照度再乘自己的 albedo（见循环之后的处理）。
   float cov0=coverageOf(px);
   bool primarySolid=(cov0>0.5);
+  int fl0=int(texelFetch(u_mat,px,0).b*255.0+0.5);
+  bool primaryMirror=primarySolid&&((fl0&1)!=0);
   vec2 pos,dir;
   if(primarySolid){
     vec2 n0=normalOf(px);
     pos=vec2(px)+n0*1.1;
-    float t=asin(clamp(2.0*rnd(seed)-1.0,-1.0,1.0));
-    float ct=cos(t),st=sin(t);
-    dir=vec2(n0.x*ct-n0.y*st,n0.x*st+n0.y*ct);
+    if(primaryMirror){
+      // 镜面像素：沿法线**锐利地**看出去，方向完全不抖动。
+      //
+      // 为什么必须这样：镜面属性如果只影响"别的射线弹到它"的时候，那么镜面像素自己
+      // 看起来会和漫反射像素一模一样（当初就是这么写的，所以反射完全看不出来）。
+      // 让初级射线沿法线单向看出去、并保持全强度（不乘 albedo），
+      // 镜面像素才会明确显示它正对的场景 —— 这才是用户期待的"镜子"。
+      dir=n0;
+    }else{
+      float t=asin(clamp(2.0*rnd(seed)-1.0,-1.0,1.0));
+      float ct=cos(t),st=sin(t);
+      dir=vec2(n0.x*ct-n0.y*st,n0.x*st+n0.y*ct);
+    }
   }else{
     pos=vec2(px)+vec2(rnd(seed),rnd(seed));   // 亚像素抖动
     float ang=rnd(seed)*6.2831853;
@@ -99,26 +111,52 @@ void main(){
   for(int b=0;b<u_bounces;b++){
     bool hit=false;ivec2 hp=ivec2(0);
 
-    // ---- 体积步进：沿途累积自发光、穿过半透明介质 ----
+    // ---- DDA 网格遍历：沿途累积自发光、穿过半透明介质 ----
+    //
+    // 这里必须用 DDA（逐格跨越边界），**不能**用 pos += dir 那种固定步长前进。
+    // 固定步长 1 格时，方向接近对角线的射线会从 (x,y) 直接跳到 (x+1,y+1)，
+    // 把 (x+1,y) 与 (x,y+1) 两个格子整个跳过 —— 表现为：
+    //   * 细的发光线条经常被整条漏掉 -> 光"很粗糙"、缺斤少两
+    //   * 每条射线只采到一半信息 -> 方差大 -> 收敛极慢
+    //   * 不同方向漏的格子不同 -> 残留方向性结构
+    // DDA 保证射线经过的每个格子恰好被采样一次，且 dt 就是射线在该格内的长度，
+    // 于是体积自发光的积分权重不再需要拍一个magic系数。
+    vec2 cellF=floor(pos);
+    ivec2 cell=ivec2(cellF);
+    ivec2 stp=ivec2(dir.x>=0.0?1:-1,dir.y>=0.0?1:-1);
+    vec2 tDelta=vec2(1.0/max(abs(dir.x),1e-8),1.0/max(abs(dir.y),1e-8));
+    vec2 tMax;
+    tMax.x=(dir.x>=0.0?(cellF.x+1.0-pos.x):(pos.x-cellF.x))*tDelta.x;
+    tMax.y=(dir.y>=0.0?(cellF.y+1.0-pos.y):(pos.y-cellF.y))*tDelta.y;
+    float tPrev=0.0;
+    bool escaped=false;
+
     for(int s=0;s<u_steps;s++){
-      ivec2 ip=ivec2(floor(pos));
-      if(ip.x<0||ip.y<0||ip.x>=u_cs.x||ip.y>=u_cs.y)break;
-      vec4 a=texelFetch(u_alb,ip,0);
-      vec4 m=texelFetch(u_mat,ip,0);
+      if(cell.x<0||cell.y<0||cell.x>=u_cs.x||cell.y>=u_cs.y){escaped=true;break;}
+      float tNext=min(tMax.x,tMax.y);
+      float dt=max(tNext-tPrev,1e-4);
+      tPrev=tNext;
+
+      vec4 a=texelFetch(u_alb,cell,0);
+      vec4 m=texelFetch(u_mat,cell,0);
       int fl=int(m.b*255.0+0.5);
       float cov=((fl&2)!=0)?1.0:a.a;
 
-      // 自发光沿程累积（体积发光）：霓虹管的"管身"和光晕都靠这一项
-      rad+=tp*a.rgb*(m.r*u_emit)*0.7;
+      // 体积自发光：按射线在该格内的长度加权（这就是正确的体积积分）
+      rad+=tp*a.rgb*(m.r*u_emit)*dt;
 
-      if(cov>0.5){hit=true;hp=ip;break;}
+      if(cov>0.5){hit=true;hp=cell;break;}
       // 半透明介质：衰减 + 按 albedo 染色（彩色玻璃）
       tp*=mix(vec3(1.0),a.rgb,cov)*(1.0-cov);
-      if(max(max(tp.r,tp.g),tp.b)<0.004)break;   // 能量耗尽，提前退出
-      pos+=dir;
+      if(max(max(tp.r,tp.g),tp.b)<0.004)break;
+
+      if(tMax.x<tMax.y){tMax.x+=tDelta.x;cell.x+=stp.x;}
+      else{tMax.y+=tDelta.y;cell.y+=stp.y;}
     }
-    if(!hit||max(max(tp.r,tp.g),tp.b)<0.004){
-      rad+=tp*u_ambient;    // 逃出画布 -> 环境光
+    // 逃出画布、能量耗尽、或步数用尽：都按"看到了环境"处理。
+    // 步数用尽也算逃逸，否则远处会因为截断而出现黑斑。
+    if(!hit||escaped||max(max(tp.r,tp.g),tp.b)<0.004){
+      rad+=tp*u_ambient;
       break;
     }
 
@@ -168,7 +206,14 @@ void main(){
   if(primarySolid){
     vec4 ap=texelFetch(u_alb,px,0);
     vec4 mp=texelFetch(u_mat,px,0);
-    rad=ap.rgb*(mp.r*u_emit)+ap.rgb*(u_base+rad);
+    vec3 selfEm=ap.rgb*(mp.r*u_emit);
+    if(primaryMirror){
+      // 镜面保持全强度：乘 albedo 会让它和普通表面难以区分（当初就是这个原因
+      // 让"反射看不见"）。这样镜面明显更亮、且显示的是正对的场景。
+      rad=selfEm+rad;
+    }else{
+      rad=selfEm+ap.rgb*(u_base+rad);
+    }
   }
 
   // ---- 时间累积：滑动平均。第 n+1 个样本的权重是 1/(n+1) ----
@@ -329,7 +374,7 @@ void PathTrace::render() {
         needsClear_ = false;
     }
 
-    // --- 1. 追踪 + 累积 ---
+    // --- 1. 追踪 + 累积（每帧可跑多次，用相互独立的种子） ---
     glUseProgram(traceProg_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, albedoTex_);
@@ -343,10 +388,17 @@ void PathTrace::render() {
     glUniform1i(uTrace_.steps, std::max(1, st_.maxSteps));
     glUniform1i(uTrace_.bounces, std::max(1, st_.maxBounces));
     glUniform1f(uTrace_.base, st_.albedoBase);
-    glUniform1ui(uTrace_.frame, (GLuint)sampleIndex_);
     glBindImageTexture(0, accumTex_, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
-    glDispatchCompute((GLuint)((w_ + 7) / 8), (GLuint)((h_ + 7) / 8), 1);
-    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+    // 每帧跑 spp 次，每次用不同的样本序号（= 不同的随机种子）。
+    // 噪声按 1/sqrt(N) 下降，而单帧成本只有 2-3 ms，余量很大，用采样换画质是划算的。
+    const int spp = std::clamp(st_.samplesPerFrame, 1, 32);
+    for (int i = 0; i < spp && sampleIndex_ < kConvergedSamples; i++) {
+        glUniform1ui(uTrace_.frame, (GLuint)sampleIndex_);
+        glDispatchCompute((GLuint)((w_ + 7) / 8), (GLuint)((h_ + 7) / 8), 1);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        sampleIndex_++;
+    }
 
     // --- 2. 解析到显示纹理 ---
     glUseProgram(resolveProg_);
@@ -361,7 +413,6 @@ void PathTrace::render() {
     glMemoryBarrier(GL_ALL_BARRIER_BITS);
 
     glUseProgram(0);
-    sampleIndex_++;
 }
 
 }  // namespace pb::gfx

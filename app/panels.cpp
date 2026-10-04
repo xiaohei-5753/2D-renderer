@@ -855,6 +855,15 @@ void drawLightingSection(App& a) {
         }
         ImGui::TextDisabled("弹射 = 反射 / 折射 / 漫反射的次数");
 
+        int spp = s.samplesPerFrame;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderInt("##spp", &spp, 1, 16, "每帧采样 %d 条/像素",
+                             ImGuiSliderFlags_AlwaysClamp)) {
+            s.samplesPerFrame = spp;
+            actLightSettingsChanged(a);
+        }
+        ImGui::TextDisabled("噪声按 1/sqrt(N) 下降；单帧成本有大量余量可用");
+
         ImGui::SetNextItemWidth(-1);
         if (ImGui::SliderFloat("##exposure", &s.exposure, 0.2f, 5.0f, "曝光 %.2f")) {
             actLightSettingsChanged(a);

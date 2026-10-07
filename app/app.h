@@ -14,6 +14,7 @@
 #include "core/types.h"
 #include "gfx/gl_common.h"
 #include "gfx/gl_context.h"
+#include "gfx/dz_trace.h"
 #include "gfx/light_sweep.h"
 #include "gfx/path_trace.h"
 #include "gfx/viewport.h"
@@ -21,7 +22,7 @@
 namespace pb::app {
 
 // 照明模式：实时扫描 GI / 渐进式逐像素光追（后者在 P2 实现）
-enum class LightMode { Sweep, PathTrace };
+enum class LightMode { Sweep, PathTrace, Trace25D };
 
 const char* lightModeName(LightMode m);
 
@@ -60,6 +61,7 @@ struct App {
     gfx::GLContext* ctx = nullptr;
     gfx::LightSweep* sweep = nullptr;
     gfx::PathTrace* pt = nullptr;
+    gfx::DzTrace* dz = nullptr;          // 2.5D 光线追踪（柱顶曲面 + 上半球辐照度）
     gfx::Viewport* vp = nullptr;
 
     // --- 图层面板 ---
@@ -85,6 +87,11 @@ struct App {
     LightMode lightMode = LightMode::Sweep;
     bool lightDirty = true;
     float lightMs = 0.0f;
+    // --- 2.5D 光追参数 ---
+    float dz25Radius = 24.0f;      // 方向集合半径：越大光晕越铺开、越慢
+    float dz25Sun = 0.35f;         // 天光（太阳）强度
+    float dz25EmitScale = 1.0f;    // 自发光倍率
+    bool dz25Dirty = true;
 
     // --- 视图选项 ---
     bool showPixelGrid = false;

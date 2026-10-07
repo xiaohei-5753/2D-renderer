@@ -27,6 +27,7 @@
 #include "app/app.h"
 #include "app/input.h"
 #include "app/panels.h"
+#include "app/voxel_build.h"
 #include "core/composite.h"
 #include "gfx/layer_composite.h"
 #include "core/console.h"
@@ -241,6 +242,8 @@ int main(int argc, char** argv) {
     int framesToRun = 0;
     int paletteIndex = -1;
     app::LightMode startMode = app::LightMode::Sweep;
+    float startDzRadius = 24.0f;   // --dz-radius：2.5D 方向半径
+    float startDzSun = 0.35f;      // --dz-sun：2.5D 天光
     std::string outFile;
     std::string forceOpen, forceClosed;
     std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
@@ -268,8 +271,13 @@ int main(int argc, char** argv) {
             paletteIndex = std::atoi(args[(size_t)++i].c_str());
         } else if (arg == "--mode" && i + 1 < argCount) {
             const std::string& m = args[(size_t)++i];
-            startMode = (m == "pathtrace" || m == "pt") ? app::LightMode::PathTrace
-                                                        : app::LightMode::Sweep;
+            if (m == "pathtrace" || m == "pt") startMode = app::LightMode::PathTrace;
+            else if (m == "25d" || m == "dz") startMode = app::LightMode::Trace25D;
+            else startMode = app::LightMode::Sweep;
+        } else if (arg == "--dz-radius" && i + 1 < argCount) {
+            startDzRadius = (float)std::atof(args[(size_t)++i].c_str());
+        } else if (arg == "--dz-sun" && i + 1 < argCount) {
+            startDzSun = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--visible") {
             forceVisible = true;
         } else if (arg == "--hidden") {
@@ -308,6 +316,8 @@ int main(int argc, char** argv) {
     a.opts.color = a.palette.current();
     a.demo = demo;
     a.lightMode = startMode;
+    a.dz25Radius = startDzRadius;
+    a.dz25Sun = startDzSun;
 
     // 自动化/回归用：直接切到某一套色板（例如 NES 55 色，验证色块网格的自动换行）
     if (paletteIndex >= 0) {
@@ -366,6 +376,17 @@ int main(int argc, char** argv) {
     pt.settings().ambient[1] = 0.12f;
     pt.settings().ambient[2] = 0.14f;
     a.pt = &pt;
+
+    // 2.5D 光追：把图层当体素空间，算柱顶曲面的上半球辐照度。
+    // 尺寸是 画布 × 层数；层数变了要重新 init（由主循环里的 dz25Dirty 触发）。
+    gfx::DzTrace dz25;
+    if (!dz25.init(cw, ch, std::max(1, a.doc.layerCount()))) {
+        fprintf(stderr, "2.5D 光追初始化失败\n");
+        return 1;
+    }
+    a.dz = &dz25;
+    int dz25Layers = a.doc.layerCount();
+    VoxelGrid voxGrid;              // 2.5D 模式下的体素空间（每帧按文档重建）
 
     gfx::Viewport vp;
     if (!vp.init()) {
@@ -479,12 +500,44 @@ int main(int argc, char** argv) {
         // 详见 app/lighting.cpp。
         app::syncLightDirty(a);
         if (a.lightOn && a.canvasVisible) {
-            // 画布一变，路径追踪的旧累积样本就和新几何对不上了（会拖影），必须重置累积
-            if (app::anyLayerDirty(a)) pt.resetAccumulation();
-            lightTimer.begin();
-            const bool didWork = app::runLighting(a);
-            lightTimer.end();
-            if (!didWork) a.lightMs = 0.0f;   // 本帧没有光照要做，别显示上一帧的数字
+            if (a.lightMode == app::LightMode::Trace25D) {
+                // ---- 2.5D 光追：图层 = z 层，直接按规格算柱顶曲面的上半球辐照度 ----
+                //
+                // 与另外两个模式不同，它不是"逐层照亮再合成"，而是一次 3D 反向投射。
+                // 所以不经过 app::runLighting。
+                const int L = a.doc.layerCount();
+                if (L != dz25Layers || !dz25.valid()) {
+                    dz25.init(cw, ch, std::max(1, L));
+                    dz25Layers = std::max(1, L);
+                    a.dz25Dirty = true;
+                }
+                if (a.dz25Dirty || app::anyLayerDirty(a)) {
+                    lightTimer.begin();
+                    app::buildVoxelGrid(a.doc, voxGrid);
+                    dz25.uploadVolume(voxGrid);
+                    gfx::DzTraceParams dp;
+                    dp.radius = std::max(4, (int)std::lround(a.dz25Radius));
+                    dp.emitScale = a.dz25EmitScale;
+                    const float s = a.dz25Sun;
+                    dp.sunCol[0] = 1.00f * s + 0.15f * s;
+                    dp.sunCol[1] = 0.97f * s + 0.15f * s;
+                    dp.sunCol[2] = 0.90f * s + 0.15f * s;
+                    dp.wallCol[0] = dp.wallCol[1] = dp.wallCol[2] = 0.0f;
+                    dp.sunDir[0] = 0.7f;
+                    dp.sunDir[1] = 0.7f;
+                    dp.sunSoft = 0.15f;
+                    dz25.render(dp);
+                    lightTimer.end();
+                    a.dz25Dirty = false;
+                }
+            } else {
+                // 画布一变，路径追踪的旧累积样本就和新几何对不上了（会拖影），必须重置累积
+                if (app::anyLayerDirty(a)) pt.resetAccumulation();
+                lightTimer.begin();
+                const bool didWork = app::runLighting(a);
+                lightTimer.end();
+                if (!didWork) a.lightMs = 0.0f;   // 本帧没有光照要做，别显示上一帧的数字
+            }
         }
         // 计时器结果要下一帧才可用（不阻塞管线）
         {
@@ -522,7 +575,8 @@ int main(int argc, char** argv) {
                 glMemoryBarrier(GL_ALL_BARRIER_BITS);
                 shown = albedoFlat;
             } else {
-                shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
+                if (a.lightMode == app::LightMode::Trace25D) shown = dz25.resultTexture();
+                else shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
             }
             vp.draw(shown);
         }
@@ -565,6 +619,7 @@ int main(int argc, char** argv) {
     vp.shutdown();
     sweep.shutdown();
     pt.shutdown();
+    dz25.shutdown();
     lightTimer.shutdown();
     uiCtx.shutdown();
     ctx.destroy();

@@ -254,6 +254,7 @@ const char* lightModeName(LightMode m) {
     switch (m) {
         case LightMode::Sweep: return "扫描 GI";
         case LightMode::PathTrace: return "路径追踪";
+        case LightMode::Trace25D: return "2.5D 光追";
         default: return "?";
     }
 }
@@ -474,8 +475,15 @@ void drawMainMenuBar(App& a) {
             a.lightDirty = true;
         }
         if (ImGui::MenuItem("路径追踪（渐进）", nullptr,
-                            a.lightMode == LightMode::PathTrace, false)) {
-            // P2 实现；这里先禁用，避免选了却没有效果
+                            a.lightMode == LightMode::PathTrace)) {
+            a.lightMode = LightMode::PathTrace;
+            a.lightDirty = true;
+        }
+        if (ImGui::MenuItem("2.5D 光追（柱顶曲面）", nullptr,
+                            a.lightMode == LightMode::Trace25D)) {
+            a.lightMode = LightMode::Trace25D;
+            a.lightDirty = true;
+            a.dz25Dirty = true;
         }
         ImGui::EndMenu();
     }
@@ -1025,13 +1033,20 @@ void drawLightingSection(App& a) {
     const float mw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) *
                      0.5f;
     const bool isSweep = (a.lightMode == LightMode::Sweep);
+    const bool isPt = (a.lightMode == LightMode::PathTrace);
+    const bool is25D = (a.lightMode == LightMode::Trace25D);
     if (ui::toolButton("modeSweep", "扫描 GI", isSweep, "每帧沿 N 个方向扫描，极快，无反射",
                        ImVec2(mw, a.ui(26.0f))))
         actSetLightMode(a, LightMode::Sweep);
     ImGui::SameLine();
-    if (ui::toolButton("modePt", "路径追踪", !isSweep,
+    if (ui::toolButton("modePt", "路径追踪", isPt,
                        "每条射线可反射/漫反射/折射，逐步累积收敛", ImVec2(mw, a.ui(26.0f))))
         actSetLightMode(a, LightMode::PathTrace);
+    if (ui::toolButton("mode25d", "2.5D 光追", is25D,
+                       "把图层当体素空间：只算柱顶曲面的上半球辐照度。"
+                       "上层的光会照亮下层，并投出光晕",
+                       ImVec2(-1.0f, a.ui(26.0f))))
+        actSetLightMode(a, LightMode::Trace25D);
 
     ImGui::Spacing();
     ImGui::Checkbox("开启光照", &a.lightOn);
@@ -1051,7 +1066,7 @@ void drawLightingSection(App& a) {
             amb[0] = a.sweep->settings().ambient[0];
             amb[1] = a.sweep->settings().ambient[1];
             amb[2] = a.sweep->settings().ambient[2];
-        } else if (!isSweep && a.pt) {
+        } else if (isPt && a.pt) {
             amb[0] = a.pt->settings().ambient[0];
             amb[1] = a.pt->settings().ambient[1];
             amb[2] = a.pt->settings().ambient[2];
@@ -1060,7 +1075,7 @@ void drawLightingSection(App& a) {
         if (ImGui::ColorEdit3("##ambient", amb, ImGuiColorEditFlags_InputRGB)) {
             if (isSweep && a.sweep) {
                 for (int i = 0; i < 3; i++) a.sweep->settings().ambient[i] = amb[i];
-            } else if (!isSweep && a.pt) {
+            } else if (isPt && a.pt) {
                 for (int i = 0; i < 3; i++) a.pt->settings().ambient[i] = amb[i];
             }
             actLightSettingsChanged(a);
@@ -1094,6 +1109,28 @@ void drawLightingSection(App& a) {
         if (ui::labeledSliderFloat("##cp", &s.propagate, 0.5f, 2.0f, "沿程增益")) {
             actLightSettingsChanged(a);
         }
+    } else if (is25D) {
+        // ---- 2.5D 光追的专属参数 ----
+        ImGui::SeparatorText("2.5D 光追");
+        float r = a.dz25Radius;
+        if (ui::labeledSliderFloat("dz25r", &r, 4.0f, 96.0f, "方向半径", "%.0f")) {
+            a.dz25Radius = r;
+            a.dz25Dirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("方向集合半径：越大光晕铺得越开，也越慢");
+        float sun = a.dz25Sun;
+        if (ui::labeledSliderFloat("dz25sun", &sun, 0.0f, 1.0f, "天光强度")) {
+            a.dz25Sun = sun;
+            a.dz25Dirty = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("上半球里非太阳方向的背景光");
+        float es = a.dz25EmitScale;
+        if (ui::labeledSliderFloat("dz25em", &es, 0.0f, 4.0f, "自发光倍率")) {
+            a.dz25EmitScale = es;
+            a.dz25Dirty = true;
+        }
+        ImGui::TextDisabled("图层 = z 层，上层的光会照亮下层柱顶");
     } else if (a.pt) {
         ImGui::SeparatorText("路径追踪");
         gfx::PathTraceSettings& s = a.pt->settings();

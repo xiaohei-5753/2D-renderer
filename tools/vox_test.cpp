@@ -139,7 +139,9 @@ int main(int argc, char** argv) {
 
     std::vector<RGBA8> px;
     const int frames = 256;
-    for (int f = 0; f < frames; f++) r->render(px);
+    double firstMs = 0.0;
+    for (int f = 0; f < frames; f++) { r->render(px); if (f == 0) firstMs = r->lastMs(); }
+    printf("  单帧（第一帧）%.1f ms\n", firstMs);
     if (compare) {
         // 用**反向光追（光源采样）**当参照物：两种算法都应收敛到同一张图
         std::vector<RGBA8> ref;
@@ -147,12 +149,14 @@ int main(int argc, char** argv) {
         rs.lightSamples = 16;
         r->setSettings(rs);
         for (int f = 0; f < 512; f++) r->render(ref);
-        double sum = 0, mx = 0; int nd = 0;
+        double sum = 0, mx = 0; int nd = 0; size_t mi = 0;
         for (size_t i = 0; i < ref.size(); i++) {
             const int a0 = ref[i].r, a1 = px[i].r;
             const double d = std::abs(a0 - a1);
-            sum += d; if (d > mx) mx = d; if (d > 2) nd++;
+            sum += d; if (d > mx) { mx = d; mi = i; } if (d > 2) nd++;
         }
+        printf("  最大差在 (%zu,%zu)：本算法 R=%d  参照物 R=%d\n", mi % (size_t)W, mi / (size_t)W,
+               px[mi].r, ref[mi].r);
         printf("  vs 反向光追：平均差 %.2f  最大差 %.0f  明显不同 %d/%zu\\n",
                sum / (double)ref.size(), mx, nd, ref.size());
         Image ri(W, H);

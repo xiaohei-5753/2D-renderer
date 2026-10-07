@@ -278,7 +278,11 @@ public:
                             if (pw <= 0.0f) continue;
                             const float pdf = pw / totalPower_;
                             float tr = 1.0f;
-                            if (set_.shadows && traceShadow(p, d, tr, limit, r - 1.0f)) continue;
+                            // 碰到发光体素就当到达光源（否则射线会先撞进光源
+                            // 自己的体积，把大块光源判成"被遮挡" -> 参照物偏暗）
+                            if (set_.shadows &&
+                                traceShadow(p, d, tr, limit, 1e30f, /*stopAtEmissive=*/true))
+                                continue;
                             const float w = cosT / r2 / pdf * set_.emissiveIntensity * tr;
                             acc[0] += q.er * w;
                             acc[1] += q.eg * w;
@@ -624,8 +628,14 @@ private:
     }
 
     // 阴影射线（Amanatides-Woo 3D DDA）
+    //
+    // stopAtEmissive：碰到发光体素就当"到达光源"（不算被遮挡）。
+    // 光源采样必须打开它：光源常是一整块体素，射线在到达被采样体素的中心
+    // 之前就会先进光源自己的体积。我原来用 maxT=r-1 糊过去，那**只对小光源
+    // （细线）成立**；大块光源下射线提前撞进块里 -> 判成遮挡 -> 参照物偏暗
+    // （实测 6×6×6 光源时偏差到 18 倍）。
     bool traceShadow(const float p[3], const float d[3], float& tr, int limit,
-                     float maxT = 1e30f) const {        tr = 1.0f;
+                     float maxT = 1e30f, bool stopAtEmissive = false) const {        tr = 1.0f;
         int x = (int)std::floor(p[0]);
         int y = (int)std::floor(p[1]);
         int z = (int)std::floor(p[2]);
@@ -650,7 +660,12 @@ private:
             else { tHit = tMaxZ; z += sz; tMaxZ += tDz; }
             if (tHit > maxT) return false;
             if (!vol_.inBounds(x, y, z)) return false;
-            const float A = VoxelVolume::a01(vol_.color[vol_.idx(x, y, z)]);
+            const size_t ci = vol_.idx(x, y, z);
+            if (stopAtEmissive) {
+                const RGBA8 e = vol_.emission[ci];
+                if (e.r || e.g || e.b) return false;      // 到达光源
+            }
+            const float A = VoxelVolume::a01(vol_.color[ci]);
             if (A >= 1.0f) return true;
             if (A > 0.0f) {
                 tr *= (1.0f - A);

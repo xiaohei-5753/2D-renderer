@@ -1147,10 +1147,34 @@ void drawLightingSection(App& a) {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("每个图层在 z 方向占几格。太小的话上层光源对下层是掠射、照不亮");
-        ImGui::SeparatorText("自发光当光源");
-        if (ImGui::Checkbox("开启自发光照明", &a.vzEmitLights)) a.vzDirty = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("把 E>0 的体素当面光源采样（光源表 + 功率 CDF）");
+        ImGui::SeparatorText("全局光照");
+        {
+            const char* items[] = {"关闭", "光源采样（有噪声，需累积）", "体素锥追踪 VCT（无噪声）"};
+            int m = a.vzGiMode;
+            if (ImGui::Combo("算法", &m, items, 3)) {
+                a.vzGiMode = m;
+                a.vzDirty = true;
+            }
+        }
+        if (a.vzGiMode == 2) {
+            int nc = a.vzCones;
+            if (ui::labeledSliderInt("vzNc", &nc, 4, 64, "锥数量")) {
+                a.vzCones = nc;
+                a.vzDirty = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("上半球打几个锥。越多越细，单帧越慢");
+            float gi = a.vzGiIntensity;
+            if (ui::labeledSliderFloat("vzGi", &gi, 0.0f, 8.0f, "GI 强度")) {
+                a.vzGiIntensity = gi;
+                a.vzDirty = true;
+            }
+            float cd = a.vzConeDist;
+            if (ui::labeledSliderFloat("vzCd", &cd, 8.0f, 320.0f, "锥最远距离", "%.0f")) {
+                a.vzConeDist = cd;
+                a.vzDirty = true;
+            }
+        }
         float ei = a.vzEmitIntensity;
         if (ui::labeledSliderFloat("vzEi", &ei, 0.0f, 8.0f, "自发光强度")) {
             a.vzEmitIntensity = ei;

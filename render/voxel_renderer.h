@@ -34,10 +34,19 @@ struct RenderSettings {
     // --- 开关 ---
     bool shadows = true;
 
-    // --- 自发光体素当光源（重点）---
-    bool emissiveLights = true;   // 把 E>0 的体素当面光源采样
+    // --- 全局光照的求法 ---
+    enum class Gi { None, LightSampling, ConeTrace };
+    Gi gi = Gi::ConeTrace;        // 默认走体素锥追踪
+
+    // 光源采样（Gi::LightSampling 用）
     float emissiveIntensity = 1.0f;
     int lightSamples = 4;         // 每像素每帧抽多少个光源
+
+    // 体素锥追踪（Gi::ConeTrace 用）
+    int cones = 9;                // 半球上打几个锥
+    float coneMaxDist = 96.0f;    // 锥的最远距离
+    float giIntensity = 1.0f;     // GI 整体强度
+    int giBounces = 0;            // 0 = 只收自发光（单次）；>=1 追加反照率弹射
 
     // --- 渐进累积 ---
     bool progressive = true;      // 帧间累积平均（噪点随时间收敛）

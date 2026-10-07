@@ -94,7 +94,11 @@ struct App {
     float vzEmitScale = 1.0f;
     bool vzShadows = true;
     int vzLayerStride = 4;         // 每个图层在 z 方向占几格（层间留空 -> 光才照得下来）
-    bool vzEmitLights = true;      // 自发光体素当光源
+    int vzGiMode = 2;              // 0=关 1=光源采样 2=体素锥追踪(VCT)
+    int vzCones = 9;               // VCT：半球上打几个锥
+    float vzGiIntensity = 1.0f;    // VCT：GI 强度
+    float vzConeDist = 96.0f;      // VCT：锥最远距离
+    bool vzEmitLights = true;      // （旧）自发光体素当光源
     float vzEmitIntensity = 1.0f;
     int vzLightSamples = 8;        // 每像素每帧抽几个光源
     int vzMaxFrames = 128;         // 累积多少帧

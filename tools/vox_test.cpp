@@ -67,18 +67,16 @@ int main(int argc, char** argv) {
     rs.sunDir[2] = std::sin(elr);
     rs.sunIntensity = sun;
     rs.skyColor[0] = rs.skyColor[1] = rs.skyColor[2] = sky;
-    rs.emissiveLights = true;
-    rs.emissiveIntensity = 1.0f;
-    rs.lightSamples = 8;
-    rs.progressive = true;
-    rs.maxAccumFrames = 64;
+    rs.gi = render::RenderSettings::Gi::ConeTrace;
+    rs.cones = 9;
+    rs.coneMaxDist = 96.0f;
+    rs.giIntensity = 1.0f;
     r->setSettings(rs);
 
-    // 渐进累积：跑若干帧，看噪点收敛
     std::vector<RGBA8> px;
-    const int frames = 32;
+    const int frames = 4;
     for (int f = 0; f < frames; f++) r->render(px);
-    printf("  累积 %d 帧\n", r->accumFrames());
+    printf("  锥追踪（确定性）：跑了 %d 帧\n", r->accumFrames());
 
     Image img(W, H);
     for (int i = 0; i < W * H; i++) img.data()[i] = px[(size_t)i];

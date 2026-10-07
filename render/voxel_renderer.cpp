@@ -1,31 +1,24 @@
 // render/voxel_renderer.cpp — +z 面的 3D 体素光线追踪
 //
-// ## 主射线
+// 主射线（所有模式共用）
+//   正交俯视：像素 (x,y) 沿 (0,0,-1) 射下，打到每列最高的实体体素，
+//   取它的 **+z 面**（法线 n = (0,0,1)），命中点 p = (x+.5, y+.5, h+1)。
 //
-//   正交俯视：像素 (x,y) 从 (x+.5, y+.5, +∞) 沿 (0,0,-1) 射下，打到最高的实体
-//   体素，取它的 **+z 面**（法线 n = (0,0,1)）。命中点 p = (x+.5, y+.5, h+1)。
+// 全局光照有两种求法，可用设置切换、直接 A/B：
 //
-// ## 着色：重点在**自发光体素互相照亮**
+//   Gi::ConeTrace（默认，VCT）
+//     把体素化成 3D 辐照度网格（rgb = 自发光 E，a = 不透明度 A），
+//     建 3D **mip 金字塔**，然后从 p 沿上半球打 N 个**锥**：
+//         acc += T · sample.rgb · sample.a
+//         T   *= (1 - sample.a)
+//     锥越远越粗，正好采样对应层级的 mip（footprint ≈ t·tanα）。
+//     好处：**无噪声**、天然多尺度、远处自动用粗层 —— 不用再堆样本。
 //
-//   每个发光体素都当成一个面光源（面积 = 一格，辐射 E）。对 p 的辐照度：
+//   Gi::LightSampling（上一版，留作对照）
+//     把每个 E>0 的体素当面光源，按功率建 CDF 做蒙特卡洛 + 渐进累积。
+//     方差大，要累积很多帧。
 //
-//       I(p) = Σ_q  E(q)·cosθ_q / r_q² · vis(p,q)
-//
-//   直接求和是 O(像素 × 光源)，所以走标准的**光源采样**：
-//   按功率建 CDF，每帧每像素随机抽 K 个光源，用蒙特卡洛估计量
-//
-//       I ≈ (1/K) Σ_k  E(q_k)·cosθ/r² · vis / pdf(q_k)
-//
-//   配合**渐进累积**：帧间平均，噪点随时间收敛。
-//
-//   太阳 + 天空保留成一个解析项（不做重点）。
-//
-// ## 3D 光追的加速手段（都已就位或可加）
-//
-//   * 阴影射线 = Amanatides-Woo 3D 体素 DDA
-//   * 空跳：粗占据网格（brick map），空格一次跨过
-//   * 光源表按功率排序 + CDF 二分，O(log N) 抽样
-//   * 可继续加：光源 BVH、SVO、阴影贴图
+// 太阳那一条阴影用 Amanatides-Woo 3D 体素 DDA。
 #include "render/voxel_renderer.h"
 
 #include <algorithm>
@@ -41,7 +34,7 @@ namespace {
 
 inline float u8f(uint8_t v) { return (float)v / 255.0f; }
 
-// xorshift：线程内确定性随机（同一帧同一像素结果稳定，便于比对）
+// xorshift：线程内确定性随机
 struct Rng {
     uint32_t s;
     explicit Rng(uint32_t seed) : s(seed ? seed : 0x9E3779B9u) {}
@@ -54,9 +47,20 @@ struct Rng {
     float f01() { return (float)(next() >> 8) * (1.0f / 16777216.0f); }
 };
 
-// 粗占据网格：xy 每 8 格一块，z 每层一块（BZ 必须 = 1，
-// 否则相邻层的实体会把射线所在层的块也标成非空，空跳就失效）
-constexpr int BXY = 8;
+// 一层 mip：4 float / 体素（rgb + a）
+struct MipLevel {
+    int X = 0, Y = 0, Z = 0;
+    std::vector<float> v;
+    void init(int x, int y, int z) {
+        X = std::max(1, x);
+        Y = std::max(1, y);
+        Z = std::max(1, z);
+        v.assign((size_t)X * (size_t)Y * (size_t)Z * 4u, 0.0f);
+    }
+    size_t idx(int x, int y, int z) const {
+        return (((size_t)z * (size_t)Y + (size_t)y) * (size_t)X + (size_t)x) * 4u;
+    }
+};
 
 }  // namespace
 
@@ -66,24 +70,13 @@ public:
         vol_ = v;
         const int X = v.X, Y = v.Y, Z = v.Z;
 
-        // 列高缓存：主射线是垂直的
+        // 列高缓存（主射线是垂直的）
         top_.assign((size_t)X * (size_t)Y, -1);
         for (int y = 0; y < Y; y++)
             for (int x = 0; x < X; x++)
                 top_[(size_t)y * (size_t)X + (size_t)x] = v.columnTop(x, y);
 
-        // 粗占据（空跳用）
-        bx_ = (X + BXY - 1) / BXY;
-        by_ = (Y + BXY - 1) / BXY;
-        occ_.assign((size_t)bx_ * (size_t)by_ * (size_t)Z, 0);
-        for (int z = 0; z < Z; z++)
-            for (int y = 0; y < Y; y++)
-                for (int x = 0; x < X; x++)
-                    if (v.solid(x, y, z))
-                        occ_[((size_t)z * (size_t)by_ + (size_t)(y / BXY)) * (size_t)bx_ +
-                             (size_t)(x / BXY)] = 1;
-
-        // ---- 光源表：E>0 的体素，按功率建 CDF ----
+        // ---- 光源表（Gi::LightSampling 用）----
         lights_.clear();
         cdf_.clear();
         totalPower_ = 0.0f;
@@ -97,33 +90,37 @@ public:
                     totalPower_ += p;
                     cdf_.push_back(totalPower_);
                 }
-        if (getenv("PB_VOXDBG"))
-            fprintf(stderr, "[vox] 体素 %dx%dx%d  实体光源 %zu  总功率 %.1f\\n", X, Y, Z,
-                    lights_.size(), totalPower_);
+
+        buildMips();
         resetAccumulation();
+        if (getenv("PB_VOXDBG"))
+            fprintf(stderr, "[vox] 体素 %dx%dx%d  光源 %zu  总功率 %.1f  mip 层数 %zu\n", X, Y, Z,
+                    lights_.size(), totalPower_, mips_.size());
         return true;
     }
 
     void setSettings(const RenderSettings& s) override {
-        const bool lightChanged = (s.emissiveLights != set_.emissiveLights) ||
-                                  (s.lightSamples != set_.lightSamples) ||
-                                  (s.emissiveIntensity != set_.emissiveIntensity);
-        const bool sunChanged = std::memcmp(s.sunDir, set_.sunDir, sizeof(s.sunDir)) != 0 ||
-                                s.sunIntensity != set_.sunIntensity ||
-                                s.shadows != set_.shadows ||
-                                std::memcmp(s.skyColor, set_.skyColor, sizeof(s.skyColor)) != 0;
+        const bool diff = s.gi != set_.gi || s.lightSamples != set_.lightSamples ||
+                          s.emissiveIntensity != set_.emissiveIntensity ||
+                          s.cones != set_.cones || s.coneMaxDist != set_.coneMaxDist ||
+                          s.giIntensity != set_.giIntensity ||
+                          std::memcmp(s.sunDir, set_.sunDir, sizeof(s.sunDir)) != 0 ||
+                          s.sunIntensity != set_.sunIntensity || s.shadows != set_.shadows ||
+                          std::memcmp(s.skyColor, set_.skyColor, sizeof(s.skyColor)) != 0;
         set_ = s;
-        if (lightChanged || sunChanged) resetAccumulation();
+        if (diff) resetAccumulation();
+        // emitScale 会进 mip 第 0 层，变了要重建
+        if (s.emitScale != emitScaleUsed_) buildMips();
     }
 
     void resetAccumulation() override {
         accum_.clear();
         frames_ = 0;
     }
-
     int accumFrames() const override { return frames_; }
-
     bool converged() const override {
+        // 锥追踪是确定性的：一帧就是最终结果
+        if (set_.gi == RenderSettings::Gi::ConeTrace) return frames_ >= 1;
         return !set_.progressive || frames_ >= set_.maxAccumFrames;
     }
 
@@ -138,14 +135,12 @@ public:
             accum_.assign(n * 3u, 0.0f);
             frames_ = 0;
         }
-        if (set_.progressive && frames_ >= set_.maxAccumFrames) {
-            // 已收敛：直接用现有累积出图，不再采样
+        if (converged()) {
             toImage(out);
             lastMs_ = 0.0;
             return;
         }
 
-        // 主光方向
         float L[3] = {set_.sunDir[0], set_.sunDir[1], set_.sunDir[2]};
         const float ln = std::sqrt(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
         if (ln > 1e-6f) { L[0] /= ln; L[1] /= ln; L[2] /= ln; }
@@ -153,8 +148,31 @@ public:
         const int limit = (X + Y + vol_.Z) * 2 + 8;
 
         const int K = std::max(1, set_.lightSamples);
-        const bool useEm = set_.emissiveLights && !lights_.empty() && totalPower_ > 0.0f;
+        const bool useEm = set_.gi == RenderSettings::Gi::LightSampling &&
+                           !lights_.empty() && totalPower_ > 0.0f;
+        const bool useVct = set_.gi == RenderSettings::Gi::ConeTrace;
         const uint32_t frameSeed = (uint32_t)(frames_ * 2654435761u + 12345u);
+
+        // 锥方向：上半球斐波那契（cosθ = 1-(i+.5)/N ∈ (0,1]）
+        std::vector<float> coneDir;
+        float coneTan = 0.0f;
+        if (useVct) {
+            const int N = std::max(1, set_.cones);
+            coneDir.reserve((size_t)N * 3u);
+            const float ga = 2.39996323f;
+            for (int i = 0; i < N; i++) {
+                const float cz = 1.0f - ((float)i + 0.5f) / (float)N;
+                const float sz = std::sqrt(std::max(0.0f, 1.0f - cz * cz));
+                const float phi = (float)i * ga;
+                coneDir.push_back(sz * std::cos(phi));
+                coneDir.push_back(sz * std::sin(phi));
+                coneDir.push_back(cz);
+            }
+            // N 个锥大致铺满半球：每个占 2π/N 立体角
+            const float omega = 2.0f * 3.14159265f / (float)N;
+            const float cosA = std::max(-1.0f, 1.0f - omega / (2.0f * 3.14159265f));
+            coneTan = std::tan(std::acos(std::min(1.0f, cosA)));
+        }
 
         auto rows = [&](int y0, int y1) {
             for (int y = y0; y < y1; y++) {
@@ -167,7 +185,7 @@ public:
                     const float A = VoxelVolume::a01(C);
                     const float p[3] = {(float)x + 0.5f, (float)y + 0.5f, (float)(h + 1)};
 
-                    // ---- 太阳 + 天空（解析项）----
+                    // 太阳 + 天空（解析项）
                     float vis = 1.0f;
                     if (set_.shadows && ndl > 0.0f) {
                         float tr = 1.0f;
@@ -182,7 +200,21 @@ public:
                         lit[c] = sc * set_.sunIntensity * ndl * vis + kc;
                     }
 
-                    // ---- 自发光体素当光源：蒙特卡洛 ----
+                    // ---- 体素锥追踪 ----
+                    if (useVct && !mips_.empty()) {
+                        float acc[3] = {0, 0, 0};
+                        const int N = (int)(coneDir.size() / 3u);
+                        for (int i = 0; i < N; i++) {
+                            const float d[3] = {coneDir[(size_t)i * 3u],
+                                                coneDir[(size_t)i * 3u + 1],
+                                                coneDir[(size_t)i * 3u + 2]};
+                            traceCone(p, d, coneTan, acc);
+                        }
+                        const float inv = (N > 0) ? set_.giIntensity / (float)N : 0.0f;
+                        for (int c = 0; c < 3; c++) lit[c] += acc[c] * inv;
+                    }
+
+                    // ---- 光源采样（对照）----
                     if (useEm) {
                         Rng rng(frameSeed ^ ((uint32_t)y * 73856093u) ^
                                 ((uint32_t)x * 19349663u));
@@ -190,7 +222,6 @@ public:
                         int good = 0;
                         for (int k = 0; k < K; k++) {
                             const float u = rng.f01() * totalPower_;
-                            // CDF 二分
                             const size_t li =
                                 (size_t)(std::lower_bound(cdf_.begin(), cdf_.end(), u) -
                                          cdf_.begin());
@@ -202,20 +233,13 @@ public:
                             if (r2 < 1e-6f) continue;
                             const float r = std::sqrt(r2);
                             d[0] /= r; d[1] /= r; d[2] /= r;
-                            const float cosT = d[2];            // n = (0,0,1)
-                            if (cosT <= 0.0f) continue;         // 只取上半球
-                            // pdf = 该光源功率 / 总功率
-                            const float pw =
-                                q.er + q.eg + q.eb;
+                            const float cosT = d[2];
+                            if (cosT <= 0.0f) continue;
+                            const float pw = q.er + q.eg + q.eb;
                             if (pw <= 0.0f) continue;
                             const float pdf = pw / totalPower_;
                             float tr = 1.0f;
-                            // 只走到光源**之前**。光源是一整格方块，
-                            // 沿任意方向的近面最近也在 r-0.87（半对角线），
-                            // 所以留 1.0 的余量，否则射线会撞进光源自己的体积、
-                            // 把每个光源都判成被遮挡 —— 自发光就一点都照不出去。
-                            if (set_.shadows && traceShadow(p, d, tr, limit, r - 1.0f))
-                                continue;
+                            if (set_.shadows && traceShadow(p, d, tr, limit, r - 1.0f)) continue;
                             const float w = cosT / r2 / pdf * set_.emissiveIntensity * tr;
                             acc[0] += q.er * w;
                             acc[1] += q.eg * w;
@@ -223,12 +247,11 @@ public:
                             good++;
                         }
                         if (good > 0) {
-                            const float inv = 1.0f / (float)K;   // 注意：按 K 平均（未命中的算 0）
+                            const float inv = 1.0f / (float)K;
                             for (int c = 0; c < 3; c++) lit[c] += acc[c] * inv;
                         }
                     }
 
-                    // ---- 合成：E + C·A·(光照) ----
                     const size_t ai = ((size_t)y * (size_t)X + (size_t)x) * 3u;
                     for (int c = 0; c < 3; c++) {
                         const float Cs = u8f(c == 0 ? C.r : (c == 1 ? C.g : C.b));
@@ -255,13 +278,6 @@ public:
         }
 
         frames_++;
-        if (getenv("PB_VOXDBG") && frames_ == 1) {
-            float mx = 0.0f;
-            for (float v : accum_) mx = std::max(mx, v);
-            fprintf(stderr, "[vox] 第1帧累积最大值 %.4f  K=%d  useEm=%d\\n", mx,
-                    std::max(1, set_.lightSamples),
-                    (set_.emissiveLights && !lights_.empty()) ? 1 : 0);
-        }
         toImage(out);
         lastMs_ = std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - t0)
@@ -276,11 +292,114 @@ private:
         float er, eg, eb;
     };
 
-    // 阴影射线：从 p 沿 d 走。被挡住返回 true；tr 是透射率（半透明衰减）。
-    //
-    // maxT：只走到这个距离为止。做面光源采样时**必须**传 r-ε ——
-    // 否则射线会先撞进光源自己的体素（A=255），把每一个光源都判成"被遮挡"，
-    // 自发光就一点都照不出去。
+    // ---- 体素化 + mip 金字塔 ----
+    void buildMips() {
+        mips_.clear();
+        const int X = vol_.X, Y = vol_.Y, Z = vol_.Z;
+        if (X <= 0 || Y <= 0 || Z <= 0) return;
+        emitScaleUsed_ = set_.emitScale;
+
+        MipLevel l0;
+        l0.init(X, Y, Z);
+        for (int z = 0; z < Z; z++)
+            for (int y = 0; y < Y; y++)
+                for (int x = 0; x < X; x++) {
+                    const size_t si = vol_.idx(x, y, z);
+                    const RGBA8 c = vol_.color[si];
+                    const RGBA8 e = vol_.emission[si];
+                    const float A = VoxelVolume::a01(c);
+                    float* d = &l0.v[l0.idx(x, y, z)];
+                    // rgb = 自发光（辐射），a = 不透明度
+                    d[0] = u8f(e.r) * emitScaleUsed_;
+                    d[1] = u8f(e.g) * emitScaleUsed_;
+                    d[2] = u8f(e.b) * emitScaleUsed_;
+                    d[3] = A;
+                }
+        mips_.push_back(std::move(l0));
+
+        // 2×2×2 盒式下采样，直到 1×1×1
+        while (mips_.back().X > 1 || mips_.back().Y > 1 || mips_.back().Z > 1) {
+            const MipLevel& s = mips_.back();
+            MipLevel d;
+            d.init((s.X + 1) / 2, (s.Y + 1) / 2, (s.Z + 1) / 2);
+            for (int z = 0; z < d.Z; z++)
+                for (int y = 0; y < d.Y; y++)
+                    for (int x = 0; x < d.X; x++) {
+                        // 下采样必须是**按不透明度加权**的平均辐射：
+                        // 直接盒式平均会把自发光和空气一起平均，粗层里辐射被稀释，
+                        // 于是远处几乎收不到光（实测光晕衰减快得离谱）。
+                        // 标准 VCT 的存法：rgb = Σ(rgb·a)/Σa（辐射不被空格稀释），
+                        // a = 平均不透明度（负责表示覆盖率/遮挡）。
+                        float sumA = 0.0f, sumRgb[3] = {0, 0, 0};
+                        int cnt = 0;
+                        for (int dz = 0; dz < 2; dz++)
+                            for (int dy = 0; dy < 2; dy++)
+                                for (int dx = 0; dx < 2; dx++) {
+                                    const int sx = x * 2 + dx, sy = y * 2 + dy,
+                                              sz = z * 2 + dz;
+                                    if (sx >= s.X || sy >= s.Y || sz >= s.Z) continue;
+                                    const float* pp = &s.v[s.idx(sx, sy, sz)];
+                                    sumA += pp[3];
+                                    for (int c = 0; c < 3; c++) sumRgb[c] += pp[c] * pp[3];
+                                    cnt++;
+                                }
+                        if (cnt <= 0) cnt = 1;
+                        float* dp = &d.v[d.idx(x, y, z)];
+                        for (int c = 0; c < 3; c++)
+                            dp[c] = (sumA > 1e-6f) ? (sumRgb[c] / sumA) : 0.0f;
+                        dp[3] = sumA / (float)cnt;
+                    }
+            mips_.push_back(std::move(d));
+        }
+    }
+
+    // 在某一层做三线性采样
+    void sampleMip(int level, float x, float y, float z, float out[4]) const {
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        if (level < 0 || level >= (int)mips_.size()) return;
+        const MipLevel& m = mips_[(size_t)level];
+        const float inv = 1.0f / (float)(1 << level);   // 该层体素尺寸 = 2^level
+        const float fx = x * inv - 0.5f, fy = y * inv - 0.5f, fz = z * inv - 0.5f;
+        const int x0 = (int)std::floor(fx), y0 = (int)std::floor(fy), z0 = (int)std::floor(fz);
+        const float tx = fx - (float)x0, ty = fy - (float)y0, tz = fz - (float)z0;
+        for (int dz = 0; dz < 2; dz++)
+            for (int dy = 0; dy < 2; dy++)
+                for (int dx = 0; dx < 2; dx++) {
+                    const int sx = x0 + dx, sy = y0 + dy, sz = z0 + dz;
+                    if (sx < 0 || sy < 0 || sz < 0 || sx >= m.X || sy >= m.Y || sz >= m.Z)
+                        continue;
+                    const float wgt = (dx ? tx : 1.0f - tx) * (dy ? ty : 1.0f - ty) *
+                                      (dz ? tz : 1.0f - tz);
+                    const float* pp = &m.v[m.idx(sx, sy, sz)];
+                    for (int c = 0; c < 4; c++) out[c] += pp[c] * wgt;
+                }
+    }
+
+    // 沿 d 打一个半角 tanA 的锥，累积到 acc
+    void traceCone(const float p[3], const float d[3], float tanA, float acc[3]) const {
+        if (mips_.empty()) return;
+        const int maxLevel = (int)mips_.size() - 1;
+        const float maxDist = std::max(1.0f, set_.coneMaxDist);
+        const float mt = std::max(tanA, 1e-3f);
+
+        float T = 1.0f;
+        float t = 0.75f;                       // 跳过自己那一格
+        int guard = 512;
+        while (t < maxDist && T > 1e-3f && guard-- > 0) {
+            const float r = std::max(0.5f, t * mt);   // 锥在距离 t 处的半径
+            int level = 0;
+            while (level < maxLevel && (float)(1 << (level + 1)) <= r * 2.0f) level++;
+            float s[4];
+            sampleMip(level, p[0] + d[0] * t, p[1] + d[1] * t, p[2] + d[2] * t, s);
+            acc[0] += T * s[0] * s[3];
+            acc[1] += T * s[1] * s[3];
+            acc[2] += T * s[2] * s[3];
+            T *= (1.0f - s[3]);
+            t += std::max(0.75f, r * 0.5f);
+        }
+    }
+
+    // 阴影射线（Amanatides-Woo 3D DDA）
     bool traceShadow(const float p[3], const float d[3], float& tr, int limit,
                      float maxT = 1e30f) const {
         tr = 1.0f;
@@ -301,14 +420,12 @@ private:
         float tMaxY = tMax(p[1], y, sy, d[1]);
         float tMaxZ = tMax(p[2], z, sz, d[2]);
         const float tDx = tDelta(d[0]), tDy = tDelta(d[1]), tDz = tDelta(d[2]);
-
         for (int it = 0; it < limit; it++) {
             float tHit;
             if (tMaxX < tMaxY && tMaxX < tMaxZ) { tHit = tMaxX; x += sx; tMaxX += tDx; }
             else if (tMaxY < tMaxZ) { tHit = tMaxY; y += sy; tMaxY += tDy; }
             else { tHit = tMaxZ; z += sz; tMaxZ += tDz; }
-
-            if (tHit > maxT) return false;      // 到光源之前没被挡
+            if (tHit > maxT) return false;
             if (!vol_.inBounds(x, y, z)) return false;
             const float A = VoxelVolume::a01(vol_.color[vol_.idx(x, y, z)]);
             if (A >= 1.0f) return true;
@@ -337,13 +454,13 @@ private:
 
     VoxelVolume vol_;
     RenderSettings set_;
-    std::vector<int> top_;               // 每列的柱高
-    std::vector<uint8_t> occ_;           // 粗占据：空跳用（已建，阴影射线里可加）
-    int bx_ = 0, by_ = 0;
-    std::vector<Light> lights_;          // 发光体素
-    std::vector<float> cdf_;             // 功率累积分布
+    std::vector<int> top_;
+    std::vector<Light> lights_;
+    std::vector<float> cdf_;
     float totalPower_ = 0.0f;
-    std::vector<float> accum_;           // 渐进累积（X*Y*3）
+    std::vector<MipLevel> mips_;      // 体素锥追踪的金字塔
+    float emitScaleUsed_ = -1.0f;
+    std::vector<float> accum_;
     int frames_ = 0;
     double lastMs_ = 0.0;
 };

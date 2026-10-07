@@ -127,13 +127,11 @@ void Layer::drawLine(int x0, int y0, int x1, int y1, RGBA8 c, Material m) {
             err -= dx;
         }
     }
-    revision++;
 }
 
 void Layer::drawEllipse(int x0, int y0, int x1, int y1, bool filled, RGBA8 c, Material m) {
     if (filled) ellipseFilled(*this, x0, y0, x1, y1, c, m);
     else ellipseOutline(*this, x0, y0, x1, y1, c, m);
-    revision++;
 }
 
 int Layer::floodFill(int x, int y, RGBA8 c, Material m) {
@@ -165,7 +163,6 @@ int Layer::floodFill(int x, int y, RGBA8 c, Material m) {
         stack.push_back(CoordI{p.x, p.y + 1});
         stack.push_back(CoordI{p.x, p.y - 1});
     }
-    revision++;
     return count;
 }
 

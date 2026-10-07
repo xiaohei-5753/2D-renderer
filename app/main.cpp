@@ -244,6 +244,7 @@ int main(int argc, char** argv) {
     std::string outFile;
     std::string forceOpen, forceClosed;
     std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
+    int strokeAtFrame = -1;     // --stroke-at N：在第 N 帧往画布上画一笔（验证绘制->光照）
     int clickFrame = 10;   // 等布局稳定（右侧栏宽度会自适应，前几帧的矩形还在变）
 
     const int argCount = (int)args.size();
@@ -273,6 +274,8 @@ int main(int argc, char** argv) {
             forceVisible = true;
         } else if (arg == "--hidden") {
             forceHidden = true;
+        } else if (arg == "--stroke-at" && i + 1 < argCount) {
+            strokeAtFrame = std::atoi(args[(size_t)++i].c_str());
         } else if (arg == "--click-section" && i + 1 < argCount) {
             clickSection = args[(size_t)++i];
         } else if (arg == "--open" && i + 1 < argCount) {
@@ -438,6 +441,15 @@ int main(int argc, char** argv) {
             if (frameIndex == clickFrame + 2) ImGui::GetIO().AddMouseButtonEvent(0, false);
         }
 
+        // 自动化验证：在主循环里真的画一笔（走和鼠标一样的路径）
+        if (strokeAtFrame >= 0 && frameIndex == strokeAtFrame) {
+            a.opts.color = RGBA8{255, 80, 40, 255};
+            a.opts.brushSize = 5;
+            a.opts.material.setEmissionFrom(255, 120, 60);
+            app::simulateStroke(a, cw / 4, ch / 3, cw * 3 / 4, ch * 2 / 3);
+            printf("[sim] 已在第 %d 帧画了一笔\n", frameIndex);
+        }
+
         app::beginPanelHeaderCapture();
         app::drawUi(a);
 
@@ -503,8 +515,10 @@ int main(int argc, char** argv) {
                 GLuint layers = ptMode ? ptx->albedoTexture() : ls->canvasTexture();
                 GLuint opacity = ptMode ? ptx->opacityTexture() : ls->opacityTexture();
                 const int n = ptMode ? ptx->layerCount() : ls->layerCount();
-                // 关灯时用"覆盖率"语义：albedo 的 alpha 就是"这个像素有多不透明"
-                albedoComp.composite(layers, opacity, n, cw, ch, albedoFlat, false);
+                // 原始 albedo：alpha 是"有多不透明"，空气(0)要变成 mask=1（以完整
+                // 颜色显示），半透明像素也以**完整颜色**显示、只用 alpha 决定透出
+                // 下面多少。所以两个开关是 (false, true) —— 详见 layer_composite.h。
+                albedoComp.composite(layers, opacity, n, cw, ch, albedoFlat, true);
                 glMemoryBarrier(GL_ALL_BARRIER_BITS);
                 shown = albedoFlat;
             } else {

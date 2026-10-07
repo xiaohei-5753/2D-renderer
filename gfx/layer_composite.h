@@ -33,38 +33,37 @@ public:
     //   layersTex : GL_TEXTURE_2D_ARRAY，每层是已经算好的颜色
     //   opacityTex: GL_TEXTURE_2D_ARRAY (R32F)，每层一个不透明度 0..1
     //
-    // ⚠️ 这里有一个非常容易搞错、而且一搞错就"泛光整片消失"的语义区别 ——
-    // 它花了我很久才理清，所以写清楚：
+    // ## 两个正交的开关（这里我连着栽了两次，所以写成正向公式并说明）
     //
-    //   alphaIsCoverage = true  —— alpha 就是**覆盖率**，直接决定这一层盖住下面多少。
-    //       未受光的原始 albedo 走这条（那里的 alpha 就是"这个像素有多不透明"）。
+    // 合成一层需要两个**独立**的量：
+    //   1. 参与度 part —— 这一层在这里有没有内容（0 就直接看下面那层）
+    //   2. alpha      —— 半透明像素要透出下面多少（只在画原始像素时用到）
     //
-    //   alphaIsCoverage = false —— alpha 是**可见度**（1-覆盖率），要取反才是覆盖率。
-    //       逐层照亮的**受光结果**走这条。
+    // `alphaIsVisibility` 说明数组里的 alpha 是哪种：
+    //   true  —— **可见度** = 1-覆盖率。逐层照亮的**受光结果**用它：
+    //            空气 1（它的光晕必须留下）、半透明 1-cov、实心 0（盖住下面）。
+    //   false —— **覆盖率**。**未受光的原始 albedo** 用它：
+    //            空气 0、不透明 255。
     //
-    // 为什么受光结果要用"可见度"这种别扭的表示？因为它的 alpha 必须回答一个
-    // 与 albedo 不同的问题：
+    // 关键：这两种数值**本身就都是参与度**，所以代码里 part = alpha，不做取反。
+    // 我两次都是在这里多取了一次反，导致"空气被跳过、泛光消失"和
+    // "整张图被自己的 alpha 乘暗"。别再取反。
     //
-    //   albedo 的 alpha 回答"这个像素有多不透明" —— 空气是 0，就是空的，露出下层。
-    //   受光结果的 alpha 回答"这一层的颜色要盖住下面多少" —— 空气的覆盖率是 0，
-    //       但它带着这一层贡献的**光晕**，必须把颜色画上去。
-    //
-    // 如果受光结果也按 albedo 的语义解释，空气就会被当成"什么都没画"而整片丢掉，
-    // 于是泛光全部消失、画面只剩几条线（实测：平均亮度 73 -> 0.47）。
-    // 所以受光结果的 alpha 存 1-cov，合成时取反回 cov —— 空气的覆盖率因此是 1，
-    // 它的光晕就被完整保留。
-    //
-    // 详见 layer_composite.cpp 顶部的推导。
+    // `albedoAsOpaque` 决定要不要用 alpha 与背景混合：
+    //   true  —— 要。原始 albedo 走这条：**画上去什么颜色就显示什么颜色**，
+    //            alpha 只决定透出下面多少（两件事数值相同但作用不同）。
+    //   false —— 不要。受光结果走这条：颜色已经把材质与光照算进去了，
+    //            再乘一次 alpha 就是二次衰减。
     //
     // backdrop 是所有层都没盖住时显示的底色，可为 nullptr（= 黑）。
     void composite(GLuint layersTex, GLuint opacityTex, int layerCount, int w, int h,
-                   GLuint outTex, bool alphaIsCoverage,
+                   GLuint outTex, bool albedoAsOpaque = false,
                    const float backdrop[3] = nullptr);
 
 private:
     GLuint prog_ = 0;
     struct {
-        GLint tex = -1, opacity = -1, cs = -1, n = -1, alphaIsCov = -1, backdrop = -1;
+        GLint tex = -1, opacity = -1, cs = -1, n = -1, opaque = -1, backdrop = -1;
     } u_;
 };
 

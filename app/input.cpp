@@ -255,6 +255,22 @@ void handleShortcuts(App& a) {
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) a.requestQuit = true;
 }
 
+void simulateStroke(App& a, int x0, int y0, int x1, int y1) {
+    beginStrokeAt(a, x0, y0);
+    if (!a.stroking) {
+        printf("[sim] 没进入描边状态（图层被锁定/隐藏？）\n");
+        return;
+    }
+    // 分几步拖过去，模拟真实拖动（形状工具靠这一步预览）
+    const int steps = 8;
+    for (int i = 1; i <= steps; i++) {
+        const int x = x0 + (x1 - x0) * i / steps;
+        const int y = y0 + (y1 - y0) * i / steps;
+        a.session.update(a.doc.active(), a.opts, x, y);
+    }
+    endStroke(a);
+}
+
 void handleNavigation(App& a) {
     ImGuiIO& io = ImGui::GetIO();
     if (io.WantTextInput) {

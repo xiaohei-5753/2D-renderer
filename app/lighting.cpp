@@ -94,6 +94,11 @@ void syncLightDirty(App& a) {
 
     for (int i = 0; i < nGpu; i++) {
         const LayerSignature now = sigOf(a.doc.layer(i));
+        if (getenv("PB_LIGHT_TRACE"))
+            fprintf(stderr, "[light] L%d rev %u->%u vis %d->%d op %d->%d\\n", i,
+                    g_last[(size_t)i].revision, now.revision,
+                    (int)g_last[(size_t)i].visible, (int)now.visible,
+                    (int)g_last[(size_t)i].opacity, (int)now.opacity);
         if (!sameSig(now, g_last[(size_t)i])) {
             a.lightDirtyLayers[(size_t)i] = 1;
             g_last[(size_t)i] = now;

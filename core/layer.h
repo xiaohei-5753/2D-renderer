@@ -69,14 +69,23 @@ struct Layer {
     bool locked = false;
 
     // 内容版本号：每次内容被改动都自增。图层面板靠它判断缩略图要不要重传 GPU，
-    // 这样就不必每帧把整层重算一遍（512x512 每帧重传是纯浪费）。
+    // 逐层光照靠它判断"这一层要不要重新照亮"。
+    //
+    // ⚠️ 它必须由**所有**改动路径维护，否则会出一个很隐蔽的 bug：漏掉一条路径，
+    // 那一类笔画就永远不会被认作"变了"。我就在这里栽过 —— 一开始只在
+    // clear/fill/fillRect/drawLine 这些"整块"操作里自增，忘了 setPixelRaw /
+    // markDirty，而铅笔笔画走的正是 `stampBrush -> setPixelRaw + markDirty`，
+    // 于是 revision 恒定不变、光照永远不重算，表现就是**画完之后画布全黑**
+    // （笔迹在文档里，撤销栈也有记录，只是从没被送去光照）。
+    //
+    // 所以现在统一在 markDirty / markPixelDirty / markAllDirty 里自增：
+    // 任何"标脏"的语义就是"内容变了"，版本号跟它走最不容易漏。
     uint32_t revision = 1;
 
     void resize(int w, int h, RGBA8 clearColor = RGBA8{0, 0, 0, 0}) {
         albedo.resize(w, h);
         albedo.fill(clearColor);
         material.assign((size_t)std::max(0, w) * (size_t)std::max(0, h), Material{});
-        revision++;
         markAllDirty();
     }
 
@@ -100,9 +109,22 @@ struct Layer {
     }
 
     // --- 脏矩形 ---
-    void markDirty(const Rect& r) { dirty_.add(r); }
-    void markPixelDirty(int x, int y) { dirty_.add(x, y); }
-    void markAllDirty() { dirty_.add(0, 0, albedo.width() - 1, albedo.height() - 1); }
+    //
+    // 标记脏 = 内容变了，所以这里同时自增 revision（见上面关于 revision 的说明）。
+    // 这是"版本号"的唯一维护点，所有绘制原语都经由它，不会漏。
+    void markDirty(const Rect& r) {
+        if (r.empty()) return;
+        dirty_.add(r);
+        revision++;
+    }
+    void markPixelDirty(int x, int y) {
+        dirty_.add(x, y);
+        revision++;
+    }
+    void markAllDirty() {
+        dirty_.add(0, 0, albedo.width() - 1, albedo.height() - 1);
+        revision++;
+    }
     const Rect& dirty() const { return dirty_; }
     bool hasDirty() const { return !dirty_.empty(); }
     Rect takeDirty() {
@@ -129,7 +151,6 @@ struct Layer {
     void clear(RGBA8 c = RGBA8{0, 0, 0, 0}, Material m = Material{}) {
         albedo.fill(c);
         for (auto& e : material) e = m;
-        revision++;
         markAllDirty();
     }
 
@@ -145,7 +166,6 @@ struct Layer {
         if (x1 < x0 || y1 < y0) return;
         for (int y = y0; y <= y1; y++)
             for (int x = x0; x <= x1; x++) setPixelRaw(x, y, c, m);
-        revision++;
         markDirty(Rect{x0, y0, x1, y1});
     }
 
@@ -165,7 +185,6 @@ struct Layer {
             setPixelRaw(x0, y, c, m);
             setPixelRaw(x1, y, c, m);
         }
-        revision++;
         markDirty(Rect{x0, y0, x1, y1});
     }
 
@@ -306,7 +325,6 @@ public:
         }
         // 合并后整层都可能变（源层的不透明度被折进去了），且尺寸不变，
         // 所以直接标整层脏就够了——这里没有"只影响局部"的快捷路径。
-        dst.revision++;
         dst.markAllDirty();
         layers_.erase(layers_.begin() + i);
         active_ = std::clamp(i - 1, 0, layerCount() - 1);

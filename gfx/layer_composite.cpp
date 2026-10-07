@@ -2,32 +2,40 @@
 //
 // 一个 compute pass，从最底层往上叠。
 //
-// ## 关键：合成要按"可见度"而不是"覆盖率"来叠
+// ## 只有两件事要做
 //
-// 这是我这次踩得最久的一个坑，值得写清楚：
+//   对每一层：  acc = mix(acc, layer.rgb, layerOpacity)
 //
-// "先逐层照亮，再合成"意味着每一层的受光结果里**空气像素也是有内容的** ——
-// 那正是这一层贡献的光晕（辉光/泛光）。但空气像素的覆盖率 alpha = 0。
-// 如果合成直接拿 alpha 当透明度，空气就会被当成"什么都没画"而**整片丢掉**，
-// 于是所有光晕消失、画面只剩几条线（实测：平均亮度从 73.8 掉到 0.73）。
+// 就这么简单 —— 但我的第一版把它写复杂了，然后连着栽了三次，所以这里解释清楚
+// **为什么**它可以这么简单。
 //
-// 所以每一层的受光结果里，alpha 存的数虽然也是"覆盖率"，语义却与 albedo 的 alpha 不同：
-//   空气   覆盖率 0   -> 颜色（这一层贡献的**光晕**）必须照单全收
-//   半透明 覆盖率 cov -> 颜色按 source-over 叠上去
-//   实心   覆盖率 1   -> 这一层在这里不透明，把下面的挡住
+// 合成一层看似需要两个量：
+//   1. 这一层在这里有没有内容（没有就看下面那层）
+//   2. 半透明像素要透出下面多少
 //
-// 也就是说：它回答的是"这一层的颜色要盖住下面多少"，而不是"这个像素有多不透明"。
-// 空气像素的 alpha 是 0，却仍然要把颜色画上去 —— 这正是泛光的来源。
-// （我一开始按 albedo 的语义去写，结果整片光晕被丢掉：平均亮度 73 -> 0.47。）
+// ### 「受光结果」这两个量都不需要
 //
-// 该层在这个像素的有效覆盖率 = 覆盖率 * 图层不透明度：
-//     sa = coverage * layerOpacity
-// 这样"图层不透明度"与"像素自己的遮挡 alpha"就自然相乘了 —— 不需要额外的约定。
+// 逐层照亮之后，每一层的结果已经是**这一层最终的画面**：
+//   * 空气像素带着这一层贡献的**光晕**（纯黑的层也要显示它的黑）
+//   * 半透明像素的透光与自发光已经在光照那一步算完了
+//   * 实心像素就是要盖住下面
+// 也就是说它已经"所见即所得"了，合成唯一要做的就是按**图层不透明度**叠上去。
+// 再拿它的 alpha 混一次，就是把光照结果又衰减一遍（实测：一条 alpha=110 的霓虹线
+// 显示成一半亮度；纯黑的光晕层干脆整片消失）。
 //
-// ## 另一个分支：原始 albedo（关灯看原图）
+// 我先前把 alpha 存成"可见度 1-cov"并试图让它同时承担"参与度"，这是错的：
+// 一个纯黑图层（cov=0，可见度 1）与一个实心图层（cov=1，可见度 0）**都应当
+// 100% 显示自己的颜色**。两者的区别不在"显示多少"，而在**下面那层收到多少光** ——
+// 而那是 core/composite.h 的 occlAbove 通道负责的事，与这里无关。
 //
-// 那条路径送进来的是**未受光的 albedo**，它的 alpha 就是覆盖率（不是可见度），
-// 而且空气像素确实是"空的"。所以用 alphaIsVisibility=false 走另一套算法。
+// ### 「原始 albedo」（关灯看原图）需要的是另一套
+//
+// 它没有经过光照，alpha 是"这个像素有多不透明"：
+//   * 空气(alpha=0) 是空的，露出下面那层（不是"以完整颜色显示"）
+//   * 半透明像素要**以完整颜色显示**（画上去什么颜色就是什么颜色），
+//     只透出下面一部分 —— 而不是把自己的颜色乘暗
+// 所以对原始 albedo：acc = mix(c.rgb, acc, c.a * layerOpacity)，
+// 且只在 alpha > 0 时才参与（alpha=0 表示这一层这里没内容）。
 #include "layer_composite.h"
 
 #include <cstdio>
@@ -39,11 +47,11 @@ namespace pb::gfx {
 
 static const char* kCompositeComp = R"(#version 430 core
 layout(local_size_x=8,local_size_y=8)in;
-uniform sampler2DArray u_tex;      // 每层：已经算好的颜色
+uniform sampler2DArray u_tex;      // 每层的颜色（受光结果或原始 albedo）
 uniform sampler2DArray u_opacity;  // 每层：一个 float 的图层不透明度
 uniform ivec2 u_cs;
 uniform int u_n;                   // 参与合成的层数
-uniform int u_alphaIsCov;         // 1 = tex.a 是覆盖率；0 = tex.a 是可见度 (1-覆盖率)
+uniform int u_albedoAsOpaque;      // 1 = 原始 albedo（alpha 是"有多不透明"）
 uniform vec3 u_backdrop;           // 所有层都没盖住时显示什么
 layout(rgba8,binding=0)writeonly uniform image2D u_out;
 void main(){
@@ -54,10 +62,19 @@ void main(){
   for(int i=0;i<u_n;i++){
     vec4 c=texelFetch(u_tex,ivec3(p,i),0);
     float op=texelFetch(u_opacity,ivec3(p,i),0).r;
-    float cov=(u_alphaIsCov!=0)?c.a:(1.0-c.a);   // 这一层在这个像素的覆盖率
-    float sa=clamp(cov*op,0.0,1.0);
-    if(sa<=0.0)continue;                     // 这层这个像素是空的，看下面那层
-    acc=mix(acc,c.rgb,sa);
+    if(op<=0.0)continue;
+    if(u_albedoAsOpaque!=0){
+      // 原始 albedo：**以完整颜色显示**（画上去什么颜色就是什么颜色），
+      // alpha 只削弱下面那层，而不是把自己的颜色往黑色上混。
+      // 写成 mix(c.rgb,acc,c.a*op) 是错的（那是"半透明就画得暗"）；
+      // 正确形式是 c.rgb + (acc-c.rgb)*(1-a*op)：
+      //   a=0 -> 颜色原样、下面全透出（空气也是这一支）
+      //   a=1 -> 完全覆盖下面
+      acc=c.rgb+(acc-c.rgb)*(1.0-c.a*op);
+    }else{
+      // 受光结果：所见即所得，只按图层不透明度叠上去
+      acc=mix(acc,c.rgb,op);
+    }
   }
   imageStore(u_out,p,vec4(acc,1.0));
 })";
@@ -75,7 +92,8 @@ bool LayerComposite::init() {
     u_.opacity = glGetUniformLocation(prog_, "u_opacity");
     u_.cs = glGetUniformLocation(prog_, "u_cs");
     u_.n = glGetUniformLocation(prog_, "u_n");
-    u_.alphaIsCov = glGetUniformLocation(prog_, "u_alphaIsCov");
+
+    u_.opaque = glGetUniformLocation(prog_, "u_albedoAsOpaque");
     u_.backdrop = glGetUniformLocation(prog_, "u_backdrop");
     return !checkGLError("layers/composite/init");
 }
@@ -86,7 +104,7 @@ void LayerComposite::shutdown() {
 }
 
 void LayerComposite::composite(GLuint layersTex, GLuint opacityTex, int layerCount, int w,
-                               int h, GLuint outTex, bool alphaIsCoverage,
+                               int h, GLuint outTex, bool albedoAsOpaque,
                                const float backdrop[3]) {
     if (!valid() || !layersTex || !outTex || w <= 0 || h <= 0) return;
     layerCount = layerCount < 0 ? 0 : layerCount;
@@ -100,7 +118,7 @@ void LayerComposite::composite(GLuint layersTex, GLuint opacityTex, int layerCou
     glUniform1i(u_.opacity, 1);
     glUniform2i(u_.cs, w, h);
     glUniform1i(u_.n, layerCount);
-    glUniform1i(u_.alphaIsCov, alphaIsCoverage ? 1 : 0);
+    glUniform1i(u_.opaque, albedoAsOpaque ? 1 : 0);
     if (backdrop) {
         glUniform3fv(u_.backdrop, 1, backdrop);
     } else {

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -100,20 +101,79 @@ int main(int argc, char** argv) {
     GLenum e = glGetError();
     if (e) printf("  GL error 0x%04X\n", e);
 
+    // litArray 是数组纹理：直接量它的 layer 0
+    {
+        std::vector<RGBA8> lp((size_t)W * H);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, sweep.litTexture());
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, GL_UNSIGNED_BYTE, lp.data());
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+        const RGBA8 c = lp[(size_t)45 * W + 80];
+        printf("  lit层0 @(80,45) = (%d,%d,%d,a=%d)\\n", c.r, c.g, c.b, c.a);
+    }
     dumpTex("scan", sweep.scanTexture(), W, H);
     dumpTex("result", sweep.resultTexture(), W, H);
 
+    // canvas 数组纹理的 layer 0：用 glGetTexImage(GL_TEXTURE_2D_ARRAY) 直接量，
+    // 不经过任何采样/合成，排除采样端的可能
+    {
+        std::vector<RGBA8> px((size_t)W * H);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, sweep.canvasTexture());
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+        const GLenum err = glGetError();
+        int nonZero = 0, maxA = 0;
+        for (const RGBA8& c : px) {
+            if (c.r || c.g || c.b || c.a) nonZero++;
+            if (c.a > maxA) maxA = c.a;
+        }
+        // 取一个非空像素报出来
+        printf("  canvas层0      非空像素 %d  最大 alpha %d  (GL err 0x%04X)\n", nonZero,
+               maxA, err);
+        for (int i = 0; i < (int)px.size(); i++) {
+            if (px[(size_t)i].a > 0) {
+                printf("  canvas层0 首个非空像素 #%d = (%d,%d,%d,a=%d)\n", i, px[(size_t)i].r,
+                       px[(size_t)i].g, px[(size_t)i].b, px[(size_t)i].a);
+                break;
+            }
+        }
+    }
+
+    // 不透明度数组纹理（R32F，每层一个值）只能逐层回读，用 glGetTexImage 直接量
+    {
+        std::vector<float> op((size_t)W * H, 0.0f);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, sweep.opacityTexture());
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RED, GL_FLOAT, op.data());
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+        const GLenum err = glGetError();
+        double sum = 0, mx = 0;
+        for (float v : op) { sum += v; if (v > mx) mx = v; }
+        printf("  不透明度层0    平均 %7.4f  最大 %6.3f  (GL err 0x%04X)\n",
+               (double)(sum / (double)op.size()), mx, err);
+    }
+
     // 逐层结果（数组纹理）要一层一层读：glGetTexImage 不能整体读数组纹理的某一层，
-    // 所以用 LayerComposite 把它当作"只有一层、且不透明"来合成为一张 2D 图。
-    // 这同时也是在验证 LayerComposite 本身。
+    // 所以用 LayerComposite 把它当作"只有一层"来合成为一张 2D 图。
+    // 这同时也是在验证 LayerComposite 与数组纹理上传本身。
     {
         gfx::LayerComposite comp;
         if (comp.init()) {
             GLuint flat = gfx::createTexture(GL_RGBA8, W, H, GL_RGBA, GL_UNSIGNED_BYTE);
+
+            // 未受光的 albedo：alpha 是"有多不透明" -> (alphaIsCoverage=false,
+            // albedoAsOpaque=true)：颜色原样显示，alpha 只决定透出下面多少
+            comp.composite(sweep.canvasTexture(), sweep.opacityTexture(), 1, W, H, flat,
+                           true);
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            dumpTex("albedo", flat, W, H);
+            // 受光结果：走 alphaIsCoverage=false（受光结果的 alpha 是可见度）
             comp.composite(sweep.litTexture(), sweep.opacityTexture(), 1, W, H, flat,
                            false);
             glMemoryBarrier(GL_ALL_BARRIER_BITS);
             dumpTex("lit0", flat, W, H);
+
             glDeleteTextures(1, &flat);
             comp.shutdown();
         }

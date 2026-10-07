@@ -1,7 +1,14 @@
-// core/canvas.h — 画板文档
+// core/canvas.h — 压平用的合成表面
 //
-// 持有像素数据（albedo）与每像素的光学属性（material），以及"自上次同步以来
-// 哪些像素变了"的脏矩形。
+// 改造前这个类同时扮演两个角色："可绘制的表面"和"送去光照的那张图"。
+// 有了图层之后两个角色分开了：
+//   * **可绘制的表面**是 core/layer.h 里的 Layer（工具、History 只碰它）
+//   * **送去光照的图**是所有图层压平的结果，就是这里的 Canvas
+//
+// 于是 Canvas 现在只做三件事：持有一份 albedo + material、
+// 在合成（core/composite.h）与上传之间当缓冲、用脏矩形告诉 GPU 只传哪一块。
+// 它仍然保留了完整的绘制原语 —— 工具之外的代码（测试、离线渲染工具）用得着，
+// 而且与 Layer 的语义完全一致，读代码时不需要在两种约定之间切换。
 //
 // albedo 的 alpha 语义（这也是光照模型的枢纽）：
 //   a == 0     空气，光直接穿过
@@ -40,6 +47,8 @@ public:
     const Image& image() const { return img_; }
 
     // --- material ---
+    std::vector<Material>& materials() { return mat_; }
+    const std::vector<Material>& materials() const { return mat_; }
     Material* materialData() { return mat_.data(); }
     const Material* materialData() const { return mat_.data(); }
     Material& materialAt(int x, int y) { return mat_[(size_t)y * (size_t)img_.width() + (size_t)x]; }

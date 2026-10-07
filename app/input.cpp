@@ -29,7 +29,9 @@ void beginStrokeAt(App& a, int cx, int cy) {
     if (a.opts.tool == ToolId::Picker) {
         RGBA8 c;
         Material m;
-        if (pickPixel(a.canvas, cx, cy, c, m)) {
+        // 取色读的是**当前图层**：取色器给的是"我要继续画的那个值"，
+        // 而压平结果里混着下面几层，取到的颜色画出来会不一样。
+        if (pickPixel(a.doc.active(), cx, cy, c, m)) {
             a.opts.color = c;
             a.opts.material = m;
             pushRecentColor(a, c);
@@ -37,15 +39,23 @@ void beginStrokeAt(App& a, int cx, int cy) {
         }
         return;
     }
-    a.history.beginStroke(a.canvas);
-    a.session.begin(a.canvas, a.opts, cx, cy);
+    // 隐藏或锁定的图层不接受笔触：往看不见的层上画是纯粹的挫败来源
+    if (!a.doc.activeWritable()) {
+        a.lastAction = a.doc.active().locked ? "图层已锁定" : "图层已隐藏";
+        return;
+    }
+    a.history.beginStroke(a.doc);
+    a.session.begin(a.doc.active(), a.opts, cx, cy);
     a.stroking = true;
 }
 
 void endStroke(App& a) {
     if (!a.stroking) return;
     a.session.end();
-    if (a.history.endStroke(a.canvas, toolName(a.opts.tool))) a.lightDirty = true;
+    if (a.history.commit(a.doc, toolName(a.opts.tool))) {
+        a.lightDirty = true;
+        a.layerPanelDirty = true;
+    }
     a.stroking = false;
 }
 
@@ -112,7 +122,7 @@ void onCursorPos(GLFWwindow* w, double x, double y) {
     if (a.stroking) {
         int cx = 0, cy = 0;
         cursorToCanvas(a, x, y, cx, cy);
-        a.session.update(a.canvas, a.opts, cx, cy);
+        a.session.update(a.doc.active(), a.opts, cx, cy);
     }
 }
 
@@ -176,6 +186,9 @@ void handleShortcuts(App& a) {
         if (ImGui::IsKeyPressed(ImGuiKey_S)) { actSavePng(a, shift); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_N)) { requestNewCanvasDialog(); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_0)) { actResetCamera(a); return; }
+        // Ctrl+J = 新建图层（Photoshop 的惯例），Ctrl+Shift+E = 向下合并
+        if (ImGui::IsKeyPressed(ImGuiKey_J)) { actAddLayer(a); return; }
+        if (shift && ImGui::IsKeyPressed(ImGuiKey_E)) { actMergeDown(a); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_Equal)) { actZoomAtCursor(a, 1.0 / 1.25); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_Minus)) { actZoomAtCursor(a, 1.25); return; }
         return;

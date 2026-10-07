@@ -99,4 +99,32 @@ void statusDot(ImU32 col, const char* label) {
     (void)dl;
 }
 
+// ---------------------------------------------------------------------------
+// 带独立标签的滑块
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 这类滑块有一个反复踩到的坑，值得单独写成一个部件：
+//
+// ImGui 的 SliderInt/SliderFloat 把 format 里的标签画在**滑块正中间**。它不会
+// 换行、也不会省略，宽度不够时是**直接裁掉**的。右侧面板在 DPI 缩放之后本来就不宽
+// （默认 322 逻辑像素），于是"图层不透明度 255"这种中文标签会被切掉半截 ——
+// 看起来像渲染坏了，其实是布局问题。
+//
+// 解决办法很简单：标签自己占一行，滑块不显示标签。代价是多占一行高度，
+// 但在这种参数面板里可读性远比紧凑重要。
+
+bool labeledSliderInt(const char* id, int* v, int lo, int hi, const char* label,
+                      const char* fmt, float fullWidth) {
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(fullWidth);
+    return ImGui::SliderInt(id, v, lo, hi, fmt, ImGuiSliderFlags_AlwaysClamp);
+}
+
+bool labeledSliderFloat(const char* id, float* v, float lo, float hi, const char* label,
+                        const char* fmt, float fullWidth) {
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(fullWidth);
+    return ImGui::SliderFloat(id, v, lo, hi, fmt, ImGuiSliderFlags_AlwaysClamp);
+}
+
 }  // namespace pb::ui

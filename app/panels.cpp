@@ -48,6 +48,37 @@ bool g_openAbout = false;
 bool g_openShortcuts = false;
 int g_newW = 320, g_newH = 180;
 
+// 自动化截图用：强制展开 / 折叠右侧栏的分区。
+//
+// 为什么需要它：ImGui 的折叠状态存在 .ini 里，功能一多右侧栏就长到要滚动，
+// 于是"我改了图层面板"这件事在截图里根本看不到（被挤到屏幕外面了）。
+// 有了这个开关，`--frames N --out x.png --open 图层` 就能把要验证的那一块
+// 稳定地放到画面里，而不是靠人去滚。
+// 留空 = 用 .ini 里的用户状态（正常交互时的行为）。
+std::string g_forceOpen;
+std::string g_forceClosed;
+
+bool sectionOpen(const char* name, bool defaultOpen) {
+    const std::string n = name;
+    if (!g_forceOpen.empty() && g_forceOpen.find(n) != std::string::npos) return true;
+    if (!g_forceClosed.empty() && g_forceClosed.find(n) != std::string::npos) return false;
+    return defaultOpen;
+}
+
+void sectionHeader(const char* name, bool defaultOpen) {
+    ImGui::SetNextItemOpen(sectionOpen(name, defaultOpen), ImGuiCond_Always);
+}
+
+}  // namespace
+
+// 见上面 g_forceOpen 的说明
+void setUiSections(const std::string& forceOpen, const std::string& forceClosed) {
+    g_forceOpen = forceOpen;
+    g_forceClosed = forceClosed;
+}
+
+namespace {
+
 const ImGuiWindowFlags kWorkspaceFlags =
     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
@@ -69,7 +100,7 @@ void drawCanvasOverlay(App& a) {
     // 像素网格：放大到一定程度才画，否则线比像素还密，只会糊成一片
     if (a.showPixelGrid && ppc >= 5.0) {
         const ImU32 gridCol = IM_COL32(255, 255, 255, 34);
-        const int cw = a.canvas.width(), chh = a.canvas.height();
+        const int cw = a.doc.width(), chh = a.doc.height();
 
         // 只画落在可见范围内的线
         double uMin = 0.0, vMin = 0.0, uMax = 1.0, vMax = 1.0;
@@ -179,25 +210,33 @@ void pushRecentColor(App& a, RGBA8 c) {
 }
 
 void actUndo(App& a) {
-    if (a.history.undo(a.canvas)) {
+    if (a.history.undo(a.doc)) {
         a.lightDirty = true;
+        a.layerPanelDirty = true;
+        if (a.pt) a.pt->resetAccumulation();
         a.lastAction = "撤销";
     }
 }
 
 void actRedo(App& a) {
-    if (a.history.redo(a.canvas)) {
+    if (a.history.redo(a.doc)) {
         a.lightDirty = true;
+        a.layerPanelDirty = true;
+        if (a.pt) a.pt->resetAccumulation();
         a.lastAction = "重做";
     }
 }
 
 void actClearCanvas(App& a) {
-    a.history.beginStroke(a.canvas);
-    a.canvas.clear(RGBA8{0, 0, 0, 0}, Material{});
-    a.history.endStroke(a.canvas, "清空");
+    // 清的是**当前图层**，不是整份文档 —— 与"工具只作用于当前图层"保持一致。
+    // 但它是一次整层改动，所以走 beginAll：逐层取差在这里没有意义。
+    a.history.beginAll(a.doc);
+    a.doc.active().clear(RGBA8{0, 0, 0, 0}, Material{});
+    a.history.commit(a.doc, "清空图层");
     a.lightDirty = true;
-    a.lastAction = "清空画布";
+    a.layerPanelDirty = true;
+    if (a.pt) a.pt->resetAccumulation();
+    a.lastAction = "清空当前图层";
 }
 
 void actResetCamera(App& a) {
@@ -206,13 +245,16 @@ void actResetCamera(App& a) {
 
 void actNewCanvas(App& a, int w, int h) {
     if (w < 1 || h < 1) return;
-    a.canvas.resize(w, h);
-    a.canvas.clear(RGBA8{0, 0, 0, 0}, Material{});
+    // Document::resize 会丢弃所有图层并重置为单个空层
+    a.doc.resize(w, h);
+    a.composite.resize(w, h);
+    a.composite.clear(RGBA8{0, 0, 0, 0}, Material{});
     a.history.reset();
     // LightSweep 的纹理和 SSBO 是按初始尺寸一次性分配的，改尺寸必须重新 init
     if (a.sweep) a.sweep->init(w, h);
     if (a.vp) a.vp->setCanvasSize(w, h);
     a.lightDirty = true;
+    a.layerPanelDirty = true;
     a.lastAction = "新建画布";
     a.cameraInitialized = false;   // 新画布重新做一次整数倍适配
     printf("[画布] 新建 %dx%d\n", w, h);
@@ -229,17 +271,18 @@ void actSavePng(App& a, bool lit) {
 #endif
 
     if (!lit) {
-        if (writePNG(path, a.canvas.image())) {
+        // 导出的是**压平后的结果**：图层是编辑期的概念，导出的应该就是用户看到的那张图
+        if (writePNG(path, a.composite.image())) {
             a.lastAction = std::string("已保存 ") + path;
-            printf("[保存] %s（原始画布）\n", path);
+            printf("[保存] %s（压平后的画布）\n", path);
         }
         return;
     }
 
     if (!a.sweep) return;
-    Image litImg(a.canvas.width(), a.canvas.height());
-    if (!gfx::readbackTexture(a.sweep->resultTexture(), a.canvas.width(),
-                              a.canvas.height(), litImg.data())) {
+    Image litImg(a.composite.width(), a.composite.height());
+    if (!gfx::readbackTexture(a.sweep->resultTexture(), a.composite.width(),
+                              a.composite.height(), litImg.data())) {
         a.lastAction = "受光图回读失败";
         return;
     }
@@ -378,23 +421,17 @@ void drawToolbarPanel(App& a) {
     ImGui::Spacing();
     ImGui::SeparatorText("工具选项");
 
-    ImGui::SetNextItemWidth(-1);
-    ImGui::SliderInt("##brush", &a.opts.brushSize, 1, 64, "笔刷 %d px",
-                     ImGuiSliderFlags_AlwaysClamp);
+    ui::labeledSliderInt("##brush", &a.opts.brushSize, 1, 64, "笔刷大小", "%d px");
 
     ImGui::Checkbox("圆形笔刷", &a.opts.brushRound);
     ImGui::SameLine();
     ImGui::Checkbox("填充图形", &a.opts.shapeFilled);
 
     if (a.opts.tool == ToolId::Dither) {
-        ImGui::SetNextItemWidth(-1);
-        ImGui::SliderInt("##dither", &a.opts.ditherLevel, 0, 100, "抖动密度 %d%%",
-                         ImGuiSliderFlags_AlwaysClamp);
+        ui::labeledSliderInt("##dither", &a.opts.ditherLevel, 0, 100, "抖动密度", "%d%%");
     }
     if (a.opts.tool == ToolId::Lighten || a.opts.tool == ToolId::Darken) {
-        ImGui::SetNextItemWidth(-1);
-        ImGui::SliderInt("##shade", &a.opts.shadeAmount, 1, 255, "强度 %d",
-                         ImGuiSliderFlags_AlwaysClamp);
+        ui::labeledSliderInt("##shade", &a.opts.shadeAmount, 1, 255, "强度");
     }
 
     ImGui::Spacing();
@@ -445,11 +482,16 @@ void drawCanvasPanel(App& a) {
     if (a.vp) {
         a.vp->setViewRect((double)a.canvasX, (double)a.canvasY, (double)a.canvasW,
                           (double)a.canvasH);
-        // 鼠标位置换算成画布坐标，供状态栏与叠加层使用
+        // 鼠标位置换算成画布坐标，供状态栏与叠加层使用。
+        //
+        // 读的是**当前图层**而不是压平结果：状态栏的价值在于"告诉我马上要画上去/取到的
+        // 是什么值"，而压平结果里混着下面几层，反而不是工具会读到的那个像素。
         a.vp->screenToCanvas(a.mx, a.my, a.cursorX, a.cursorY);
-        if (!a.canvas.empty()) {
-            a.cursorColor = a.canvas.image().at(a.cursorX, a.cursorY);
-            a.cursorMaterial = a.canvas.materialAt(a.cursorX, a.cursorY);
+        if (!a.doc.empty()) {
+            const int cx = std::clamp(a.cursorX, 0, a.doc.width() - 1);
+            const int cy = std::clamp(a.cursorY, 0, a.doc.height() - 1);
+            a.cursorColor = a.doc.active().albedo.at(cx, cy);
+            a.cursorMaterial = a.doc.active().materialAt(cx, cy);
         }
     }
 
@@ -463,17 +505,21 @@ void drawCanvasPanel(App& a) {
 void drawPropertiesPanel(App& a) {
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6, 3));
 
-    if (ImGui::CollapsingHeader("调色板", ImGuiTreeNodeFlags_DefaultOpen))
-        drawPaletteSection(a);
+    // SetNextItemOpen 必须紧贴在对应的 CollapsingHeader 之前，所以四个分区各自
+    // 调一次 sectionHeader（不能抽成循环：中间还有 Spacing）。
+    // 默认展开状态：材质分区参数最多、最长，默认折起来 ——
+    // 否则右侧栏一开就要滚动才能看到「图层」，而图层是这一版的主角。
+    sectionHeader("调色板", true);
+    if (ImGui::CollapsingHeader("调色板")) drawPaletteSection(a);
     ImGui::Spacing();
-    if (ImGui::CollapsingHeader("材质", ImGuiTreeNodeFlags_DefaultOpen))
-        drawMaterialSection(a);
+    sectionHeader("材质", false);
+    if (ImGui::CollapsingHeader("材质")) drawMaterialSection(a);
     ImGui::Spacing();
-    if (ImGui::CollapsingHeader("光照", ImGuiTreeNodeFlags_DefaultOpen))
-        drawLightingSection(a);
+    sectionHeader("光照", true);
+    if (ImGui::CollapsingHeader("光照")) drawLightingSection(a);
     ImGui::Spacing();
-    if (ImGui::CollapsingHeader("图层"))
-        ImGui::TextDisabled("图层面板将在 P4 实现");
+    sectionHeader("图层", true);
+    if (ImGui::CollapsingHeader("图层")) drawLayerSection(a);
 
     ImGui::PopStyleVar();
 }
@@ -702,7 +748,7 @@ void drawMaterialSection(App& a) {
     // 便捷：整条亮度缩放（仍然作用在那个 RGB 上，不引入新的耦合）
     int level = m.emissionLevel();
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::SliderInt("##emlevel", &level, 0, 255, "亮度 %d", ImGuiSliderFlags_AlwaysClamp)) {
+    if (ui::labeledSliderInt("##emlevel", &level, 0, 255, "亮度（等比缩放自发光 RGB）")) {
         if (m.emissionLevel() > 0) {
             const float k = (float)level / (float)m.emissionLevel();
             const int r = (int)std::lround(m.emR * k);
@@ -758,9 +804,8 @@ void drawMaterialSection(App& a) {
     ImGui::Spacing();
     ImGui::SeparatorText("遮挡（alpha）");
     int alpha = col.a;
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::SliderInt("##matAlpha", &alpha, 0, 255, "遮挡 alpha %d",
-                         ImGuiSliderFlags_AlwaysClamp)) {
+    if (ui::labeledSliderInt("##matAlpha", &alpha, 0, 255,
+                             "遮挡 alpha（0 = 空气，255 = 完全挡光）")) {
         col.a = (uint8_t)alpha;
     }
     ImGui::TextWrapped("0 = 空气（光直接穿过），255 = 完全挡光。"
@@ -773,7 +818,7 @@ void drawMaterialSection(App& a) {
     ImGui::SeparatorText("几何");
     float ior = m.iorValue();
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::SliderFloat("##matIor", &ior, 1.0f, 3.55f, "折射率 %.2f")) {
+    if (ui::labeledSliderFloat("##matIor", &ior, 1.0f, 3.55f, "折射率（1.00 = 不折射）")) {
         m.setIorValue(ior);
     }
     bool solid = m.solid();
@@ -897,7 +942,7 @@ void drawLightingSection(App& a) {
         float em = isSweep && a.sweep ? a.sweep->settings().emitScale
                                       : (a.pt ? a.pt->settings().emitScale : 1.0f);
         ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderFloat("##emit", &em, 0.0f, 4.0f, "自发光倍率 %.2f")) {
+        if (ui::labeledSliderFloat("##emit", &em, 0.0f, 4.0f, "自发光倍率")) {
             if (isSweep && a.sweep) a.sweep->settings().emitScale = em;
             else if (a.pt) a.pt->settings().emitScale = em;
             actLightSettingsChanged(a);
@@ -911,16 +956,14 @@ void drawLightingSection(App& a) {
         ImGui::SeparatorText("扫描 GI");
         gfx::LightSettings& s = a.sweep->settings();
         int r = s.rayRadius;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderInt("##radius", &r, 4, 512, "方向表半径 %d",
-                             ImGuiSliderFlags_AlwaysClamp)) {
+        if (ui::labeledSliderInt("##radius", &r, 4, 512, "方向表半径")) {
             s.rayRadius = r;
             actLightSettingsChanged(a);
         }
         ImGui::TextDisabled("当前 %d 个方向（半径越大越平滑、越慢）",
                             a.sweep->directionCount());
         ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderFloat("##cp", &s.propagate, 0.5f, 2.0f, "沿程增益 %.2f")) {
+        if (ui::labeledSliderFloat("##cp", &s.propagate, 0.5f, 2.0f, "沿程增益")) {
             actLightSettingsChanged(a);
         }
     } else if (a.pt) {
@@ -928,32 +971,26 @@ void drawLightingSection(App& a) {
         gfx::PathTraceSettings& s = a.pt->settings();
 
         int steps = s.maxSteps;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderInt("##steps", &steps, 16, 512, "最大步长 %d",
-                             ImGuiSliderFlags_AlwaysClamp)) {
+        if (ui::labeledSliderInt("##steps", &steps, 16, 512, "最大步长")) {
             s.maxSteps = steps;
             actLightSettingsChanged(a);
         }
         int bounces = s.maxBounces;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderInt("##bounces", &bounces, 1, 8, "最大弹射 %d",
-                             ImGuiSliderFlags_AlwaysClamp)) {
+        if (ui::labeledSliderInt("##bounces", &bounces, 1, 8,
+                                 "最大弹射（反射/折射/漫反射的总次数）")) {
             s.maxBounces = bounces;
             actLightSettingsChanged(a);
         }
-        ImGui::TextDisabled("弹射 = 反射 / 折射 / 漫反射的次数");
 
         int spp = s.samplesPerFrame;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderInt("##spp", &spp, 1, 16, "每帧采样 %d 条/像素",
-                             ImGuiSliderFlags_AlwaysClamp)) {
+        if (ui::labeledSliderInt("##spp", &spp, 1, 16, "每帧采样（条/像素）")) {
             s.samplesPerFrame = spp;
             actLightSettingsChanged(a);
         }
         ImGui::TextDisabled("噪声按 1/sqrt(N) 下降；单帧成本有大量余量可用");
 
         ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderFloat("##exposure", &s.exposure, 0.2f, 5.0f, "曝光 %.2f")) {
+        if (ui::labeledSliderFloat("##exposure", &s.exposure, 0.2f, 5.0f, "曝光")) {
             actLightSettingsChanged(a);
         }
         if (ImGui::Checkbox("色调映射（Reinhard）", &s.tonemap)) actLightSettingsChanged(a);
@@ -1001,7 +1038,10 @@ void drawStatusBar(App& a) {
 
     ImGui::SameLine(0, 12);
     ImGui::Text("| %s | %s | %dx%d", toolName(a.opts.tool), a.palette.presetName(),
-                a.canvas.width(), a.canvas.height());
+                a.doc.width(), a.doc.height());
+
+    ImGui::SameLine(0, 12);
+    ImGui::Text("| %s", a.doc.active().name.c_str());
 
     ImGui::SameLine(0, 12);
     ImGui::Text("| 缩放 %.0f%%", a.vp ? 100.0 / std::max(0.01, a.vp->camera().zoom) : 100.0);

@@ -27,6 +27,7 @@
 #include "app/app.h"
 #include "app/input.h"
 #include "app/panels.h"
+#include "core/composite.h"
 #include "core/console.h"
 #include "core/image.h"
 #include "gfx/gl_context.h"
@@ -44,11 +45,110 @@ using namespace pb;
 
 namespace {
 
+// 把命令行参数重新按 UTF-8 取一遍。
+//
+// ⚠️ 为什么不能直接用 main 的 argv：在中文 Windows 上，CRT 是按 **ANSI 代码页**
+// （CP936/GBK）解码命令行参数的，而本程序全程按 UTF-8 处理文本。于是
+// `--open 图层` 拿到的是一串 GBK 字节，和源码里的 UTF-8 字面量比较永远不相等 ——
+// 表现就是"这个选项完全没反应"，而且不会有任何报错。我自己就踩了这个坑。
+//
+// 所以这里绕开 CRT，直接用 GetCommandLineW 拿原始的 UTF-16 命令行，按 Windows
+// 自己的分词规则拆开（双引号成组、反斜杠转义），再转成 UTF-8。
+// 顺带把 `--out 中文名.png` 这类路径也修好了。
+//
+// 注：不用 CommandLineToArgvW 是因为它声明在 <shellapi.h>，而该头文件在
+// WIN32_LEAN_AND_MEAN 下不完整（而且还要多链接一个 shell32）。自己拆更省事。
+bool isWindowsSpace(wchar_t c) { return c == L' ' || c == L'\t'; }
+
+std::vector<std::string> utf8Args() {
+    std::vector<std::string> out;
+#ifdef _WIN32
+    const wchar_t* cmd = GetCommandLineW();
+    if (!cmd) return out;
+
+    auto append = [&out](const std::wstring& w) {
+        if (w.empty()) {
+            out.emplace_back();
+            return;
+        }
+        const int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr,
+                                            0, nullptr, nullptr);
+        std::string s;
+        if (len > 0) {
+            s.resize((size_t)len);
+            WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), len,
+                                nullptr, nullptr);
+        }
+        out.push_back(std::move(s));
+    };
+
+    size_t i = 0;
+    while (cmd[i] != L'\0') {
+        while (cmd[i] != L'\0' && isWindowsSpace(cmd[i])) i++;
+        if (cmd[i] == L'\0') break;
+
+        std::wstring arg;
+        bool inQuotes = false;
+        while (cmd[i] != L'\0') {
+            if (!inQuotes && isWindowsSpace(cmd[i])) break;
+            if (cmd[i] == L'\\') {
+                // 反斜杠要数一串：只有紧跟在双引号前的才转义
+                size_t slashes = 0;
+                while (cmd[i] == L'\\') { slashes++; i++; }
+                if (cmd[i] == L'"') {
+                    arg.append(slashes / 2, L'\\');
+                    if (slashes % 2 == 1) {
+                        arg.push_back(L'"');   // 转义掉的引号，算普通字符
+                        i++;
+                    } else {
+                        inQuotes = !inQuotes;  // 偶数个反斜杠：这个引号是分隔符
+                        i++;
+                    }
+                } else {
+                    arg.append(slashes, L'\\');
+                }
+                continue;
+            }
+            if (cmd[i] == L'"') {
+                inQuotes = !inQuotes;
+                i++;
+                continue;
+            }
+            arg.push_back(cmd[i]);
+            i++;
+        }
+        append(arg);
+    }
+#endif
+    return out;
+}
+
+// 把文档的脏区域压平进 composite（合成缓冲），并把这些区域的"脏"转记到 composite 上。
+//
+// 这是"编辑 -> 合成 -> 上传 GPU"这条链的中间那一步。放在 app 层而不是 core 层，
+// 是因为 core 层刻意不让 Layer 知道 Canvas 的存在：Layer 是绘制表面，
+// Canvas 只是压平结果的缓冲。
+void syncComposite(app::App& a) {
+    Document& d = a.doc;
+    if (d.empty()) return;
+    if (a.composite.width() != d.width() || a.composite.height() != d.height()) {
+        a.composite.resize(d.width(), d.height());
+        a.composite.clear(RGBA8{0, 0, 0, 0}, Material{});
+    }
+    const Rect dirty = d.takeDirtyUnion();
+    if (dirty.empty()) return;
+    flattenDocument(d, a.composite.image(), a.composite.materials(), dirty);
+    a.composite.markDirty(dirty);
+}
+
 // 演示/自动化模式：用工具管线画一张图，渲染若干帧后截图退出。
 // 同时充当这个项目的视觉回归工具——不需要人操作就能看出 UI 与渲染是否正常。
+//
+// 演示图刻意画在**两个图层**上，这样自动化截图就能同时验证：
+// 图层合成、逐层光照的层间影响、以及图层面板的缩略图。
 void buildDemoScene(app::App& a) {
-    const int W = a.canvas.width();
-    const int H = a.canvas.height();
+    const int W = a.doc.width();
+    const int H = a.doc.height();
 
     const ToolOptions saved = a.opts;
     ToolOptions o = a.opts;
@@ -61,11 +161,11 @@ void buildDemoScene(app::App& a) {
         o.brushSize = brush;
         o.shapeFilled = filled;
         o.material = mat;
-        a.history.beginStroke(a.canvas);
-        s.begin(a.canvas, o, x0, y0);
-        s.update(a.canvas, o, x1, y1);
+        a.history.beginStroke(a.doc);
+        s.begin(a.doc.active(), o, x0, y0);
+        s.update(a.doc.active(), o, x1, y1);
         s.end();
-        a.history.endStroke(a.canvas, toolName(t));
+        a.history.commit(a.doc, toolName(t));
     };
 
     // 自发光是**独立的 RGB**，与 albedo 无关。
@@ -84,11 +184,18 @@ void buildDemoScene(app::App& a) {
     const RGBA8 neonB{255, 130, 80, 110};
     const RGBA8 glassC{220, 190, 90, 160};
 
+    // --- 底层：两条霓虹灯管 + 中间一块实心墙 ---
     stroke(ToolId::Line, W / 8, H / 4, W - W / 8, H / 4, neonA, 3, false, glowOf(neonA, 175));
     stroke(ToolId::Line, W / 8, H - H / 4, W - W / 8, H - H / 4, neonB, 3, false,
            glowOf(neonB, 175));
     stroke(ToolId::Rect, W / 2 - 26, H / 2 - 20, W / 2 + 26, H / 2 + 20,
            RGBA8{44, 44, 54, 255}, 1, true, none);
+
+    // --- 上层：玻璃椭圆 + 一列抖动色块。它们会压住下面的灯管 ---
+    a.history.beginAll(a.doc);
+    a.doc.addLayer("前景");
+    a.history.commit(a.doc, "新建图层");
+
     stroke(ToolId::Ellipse, W / 8, H / 2 - 30, W / 4, H / 2 + 30, glassC, 1, false,
            glowOf(glassC, 150));
     for (int i = 0; i < 6; i++) {
@@ -97,14 +204,15 @@ void buildDemoScene(app::App& a) {
         o.brushSize = 12;
         o.ditherLevel = 100 - i * 16;
         o.material = glowOf(o.color, 120);
-        a.history.beginStroke(a.canvas);
-        s.begin(a.canvas, o, W - W / 6, H / 2 - 30 + i * 10);
+        a.history.beginStroke(a.doc);
+        s.begin(a.doc.active(), o, W - W / 6, H / 2 - 30 + i * 10);
         s.end();
-        a.history.endStroke(a.canvas, "抖动");
+        a.history.commit(a.doc, "抖动");
     }
 
     a.opts = saved;
     a.lightDirty = true;
+    a.layerPanelDirty = true;
 }
 
 // 把默认帧缓冲抓成 PNG（GL 原点在左下，写文件前要翻转）
@@ -137,6 +245,13 @@ int main(int argc, char** argv) {
     SetProcessDPIAware();
 #endif
 
+    // 用 UTF-8 的参数表（理由见上面 utf8Args 的注释）。
+    // 非 Windows 平台或取不到时回落到 CRT 给的 argv。
+    std::vector<std::string> args = utf8Args();
+    if (args.empty()) {
+        for (int i = 0; i < argc; i++) args.push_back(argv[i] ? argv[i] : "");
+    }
+
     int cw = 320, ch = 180;
     bool demo = false;
     bool forceVisible = false, forceHidden = false;
@@ -144,40 +259,48 @@ int main(int argc, char** argv) {
     int paletteIndex = -1;
     app::LightMode startMode = app::LightMode::Sweep;
     std::string outFile;
+    std::string forceOpen, forceClosed;
 
-    for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
+    const int argCount = (int)args.size();
+    for (int i = 1; i < argCount; i++) {
+        const std::string& arg = args[(size_t)i];
+        if (arg == "--size" && i + 1 < argCount) {
             int w = 0, h = 0;
-            if (std::sscanf(argv[i + 1], "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+            if (std::sscanf(args[(size_t)i + 1].c_str(), "%dx%d", &w, &h) == 2 && w > 0 &&
+                h > 0) {
                 cw = w;
                 ch = h;
             }
             i++;
-        } else if (std::strcmp(argv[i], "--demo") == 0) {
+        } else if (arg == "--demo") {
             demo = true;
-        } else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
-            framesToRun = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
-            outFile = argv[++i];
-        } else if (std::strcmp(argv[i], "--palette") == 0 && i + 1 < argc) {
-            paletteIndex = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
-            const char* m = argv[++i];
-            if (std::strcmp(m, "pathtrace") == 0 || std::strcmp(m, "pt") == 0)
-                startMode = app::LightMode::PathTrace;
-            else
-                startMode = app::LightMode::Sweep;
-        } else if (std::strcmp(argv[i], "--visible") == 0) {
+        } else if (arg == "--frames" && i + 1 < argCount) {
+            framesToRun = std::atoi(args[(size_t)++i].c_str());
+        } else if (arg == "--out" && i + 1 < argCount) {
+            outFile = args[(size_t)++i];
+        } else if (arg == "--palette" && i + 1 < argCount) {
+            paletteIndex = std::atoi(args[(size_t)++i].c_str());
+        } else if (arg == "--mode" && i + 1 < argCount) {
+            const std::string& m = args[(size_t)++i];
+            startMode = (m == "pathtrace" || m == "pt") ? app::LightMode::PathTrace
+                                                        : app::LightMode::Sweep;
+        } else if (arg == "--visible") {
             forceVisible = true;
-        } else if (std::strcmp(argv[i], "--hidden") == 0) {
+        } else if (arg == "--hidden") {
             forceHidden = true;
-        } else if (std::strcmp(argv[i], "--help") == 0) {
+        } else if (arg == "--open" && i + 1 < argCount) {
+            forceOpen = args[(size_t)++i];
+        } else if (arg == "--close" && i + 1 < argCount) {
+            forceClosed = args[(size_t)++i];
+        } else if (arg == "--help") {
             printf(
                 "用法: paintboard [选项]\n"
                 "  --size WxH         画布尺寸（默认 320x180）\n"
-                "  --demo             用工具管线画一张演示图\n"
+                "  --demo             用工具管线画一张演示图（含两个图层）\n"
                 "  --frames N         渲染 N 帧后截图退出（配合 --out）\n"
                 "  --out FILE.png     截图输出路径\n"
+                "  --open NAME        强制展开右侧栏分区（名字子串，如「图层」）\n"
+                "  --close NAME       强制折叠右侧栏分区\n"
                 "  --hidden/--visible 强制窗口是否可见\n"
                 "  无 --frames 时进入正常交互模式。\n");
             return 0;
@@ -190,8 +313,9 @@ int main(int argc, char** argv) {
     if (forceHidden) visible = false;
 
     app::App a;
-    a.canvas.resize(cw, ch);
-    a.canvas.clear(RGBA8{0, 0, 0, 0}, Material{});
+    a.doc.resize(cw, ch);
+    a.composite.resize(cw, ch);
+    a.composite.clear(RGBA8{0, 0, 0, 0}, Material{});
     a.history.reset();
     a.opts.color = a.palette.current();
     a.demo = demo;
@@ -228,6 +352,9 @@ int main(int argc, char** argv) {
     }
     // 字体没加载上就得在界面上报出来（双击启动看不到控制台）
     a.fontWarning = uiCtx.fontWarning();
+
+    // 自动化截图用：强制右侧栏分区的展开状态
+    app::setUiSections(forceOpen, forceClosed);
 
     gfx::LightSweep sweep;
     if (!sweep.init(cw, ch)) {
@@ -294,6 +421,9 @@ int main(int argc, char** argv) {
 
         // --- 4. 构建 UI（顺带确定画布矩形）---
         app::drawUi(a);
+        // 图层面板的缩略图：等 UI 跑完再重建，这样这一帧显示的就是最新内容，
+        // 而且不必让面板函数关心 GPU 资源
+        app::uploadLayerThumbnails(a);
 
         // 第一次拿到画布矩形后做一次整数倍缩放并居中（像素画必须整数倍，
         // 否则 NEAREST 采样会让像素列宽不均，表现为竖条纹）。之后不再干预用户。
@@ -302,13 +432,14 @@ int main(int argc, char** argv) {
             a.cameraInitialized = true;
         }
 
-        // --- 5. 上传画布（只传脏矩形）+ 光照 ---
-        const Rect dirty = a.canvas.takeDirty();
+        // --- 5. 合成（压平图层）+ 上传画布（只传脏矩形）+ 光照 ---
+        syncComposite(a);
+        const Rect dirty = a.composite.takeDirty();
         if (!dirty.empty()) {
             // 两个渲染器都保持同步：脏矩形通常很小，双份上传的代价可以忽略，
             // 换来的好处是切换模式时无需重新上传整张画布。
-            sweep.upload(a.canvas.image(), a.canvas.materialData(), dirty);
-            pt.upload(a.canvas.image(), a.canvas.materialData(), dirty);
+            sweep.upload(a.composite.image(), a.composite.materialData(), dirty);
+            pt.upload(a.composite.image(), a.composite.materialData(), dirty);
             a.lightDirty = true;
             // 画布一变，旧的累积样本就和新几何对不上了（会拖影），必须重置
             pt.resetAccumulation();

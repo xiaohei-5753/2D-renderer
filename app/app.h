@@ -5,12 +5,15 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "core/canvas.h"
 #include "core/history.h"
+#include "core/layer.h"
 #include "core/palette.h"
 #include "core/tool.h"
 #include "core/types.h"
+#include "gfx/gl_common.h"
 #include "gfx/gl_context.h"
 #include "gfx/light_sweep.h"
 #include "gfx/path_trace.h"
@@ -23,9 +26,24 @@ enum class LightMode { Sweep, PathTrace };
 
 const char* lightModeName(LightMode m);
 
+// 图层面板用的缩略图资源。
+//
+// 缩略图必须缓存：每帧把一整层重新转成 RGBA32 再传 GPU，在 512×512 × 十几层下
+// 是纯粹的浪费。靠 Layer::revision 判断"内容变没变"，变了才重建。
+struct LayerThumb {
+    GLuint tex = 0;
+    int w = 0, h = 0;
+    uint32_t revision = 0;
+};
+
 struct App {
     // --- 文档与编辑 ---
-    Canvas canvas;
+    //
+    // Document 是真正的文档（图层栈），tools / History 都作用在**当前图层**上。
+    // composite 是"所有图层压平后的结果"，唯一的作用是喂给光照与导出 ——
+    // 它由 core/composite.h 的 flattenDocument 写，永远不该被直接画。
+    Document doc;
+    Canvas composite;
     History history;
     Palette palette;
     ToolOptions opts;
@@ -36,6 +54,10 @@ struct App {
     gfx::LightSweep* sweep = nullptr;
     gfx::PathTrace* pt = nullptr;
     gfx::Viewport* vp = nullptr;
+
+    // --- 图层面板 ---
+    std::vector<LayerThumb> thumbs;
+    bool layerPanelDirty = true;   // 请求重建缩略图（图层数变了 / 图层被改过）
 
     // --- 面板布局（可拖拽调宽 / 折叠）---
     //

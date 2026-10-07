@@ -127,8 +127,10 @@ if ($Config -eq 'release') { $linkFlags += '-s' }
 # incremental compile helpers
 # ---------------------------------------------------------------------------
 # any header change invalidates every object; the tree is small so this is a
-# cheap and always-correct rule
-$headers = @(Get-ChildItem -Path (Join-Path $root 'core'), (Join-Path $root 'gfx') `
+# cheap and always-correct rule. app/ and ui/ must be included too: changing
+# app/app.h (the shared state struct) otherwise leaves every dependent .o stale.
+$headers = @(Get-ChildItem -Path (Join-Path $root 'core'), (Join-Path $root 'gfx'),
+                (Join-Path $root 'ui'), (Join-Path $root 'app') `
                 -Recurse -Include '*.h', '*.hpp' -ErrorAction SilentlyContinue)
 $newestHeader = [datetime]::MinValue
 foreach ($h in $headers) { if ($h.LastWriteTime -gt $newestHeader) { $newestHeader = $h.LastWriteTime } }

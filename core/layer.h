@@ -25,6 +25,15 @@
 // 如果效果不好，备选是模型 A：把层堆当成 W x H x N 的 3D 体素网格做真 3D 光追
 // （成本与现在同量级，因为 3D DDA 一条线最多穿 W+H+N 个体素），
 // 但光照会变成 3D 的，现有霓虹在平面内传播的观感会改变。
+//
+// ## 为什么 Layer 自己带绘制原语与脏矩形
+//
+// 改造前 `Canvas` 一个类同时扮演两个角色："可绘制的表面"和"送去光照的那张图"。
+// 有了图层之后这两个角色必须分开：
+//   * **可绘制的表面**是单个图层 —— 工具、洪水填充、History 全都只碰它
+//   * **送去光照的图**是所有图层压平的结果 —— 由 Canvas 扮演（见 composite.h）
+// 两边都保留同一套原语，是为了让工具代码不需要知道自己写的是图层还是别的什么；
+// 代价是一份有意的、受控的重复（两个类的语义不同，硬抽公共基类反而会绑死它们）。
 #pragma once
 
 #include <algorithm>
@@ -44,19 +53,31 @@ namespace pb {
 // 而不是靠混合模式堆叠。后续要加再在这里扩展 + 在 composite 里加分支。
 enum class BlendMode { Normal };
 
+// 一个可绘制的像素表面：albedo + 逐像素材质 + 脏矩形。
+//
+// alpha 语义与单层时代完全一致（这也是光照模型的枢纽）：
+//   a == 0     空气，光直接穿过
+//   0 < a < 1  半透明介质：让光穿过，同时按 emission 自发光（霓虹管、玻璃）
+//   a == 255   实心不透明：挡住光，画面直接显示自身颜色（墙、实体）
 struct Layer {
     std::string name;
-    Image albedo;                     // RGB = 颜色, A = 遮挡（与单层时语义一致）
+    Image albedo;                     // RGB = 颜色, A = 遮挡
     std::vector<Material> material;   // 逐像素光学属性
     bool visible = true;
     uint8_t opacity = 255;            // 整层不透明度
     BlendMode blend = BlendMode::Normal;
     bool locked = false;
 
+    // 内容版本号：每次内容被改动都自增。图层面板靠它判断缩略图要不要重传 GPU，
+    // 这样就不必每帧把整层重算一遍（512x512 每帧重传是纯浪费）。
+    uint32_t revision = 1;
+
     void resize(int w, int h, RGBA8 clearColor = RGBA8{0, 0, 0, 0}) {
         albedo.resize(w, h);
         albedo.fill(clearColor);
         material.assign((size_t)std::max(0, w) * (size_t)std::max(0, h), Material{});
+        revision++;
+        markAllDirty();
     }
 
     int width() const { return albedo.width(); }
@@ -64,12 +85,99 @@ struct Layer {
     bool empty() const { return albedo.empty(); }
     size_t pixelCount() const { return albedo.pixelCount(); }
 
+    // --- 像素访问 ---
+    Image& image() { return albedo; }
+    const Image& image() const { return albedo; }
+
+    Material* materialData() { return material.data(); }
+    const Material* materialData() const { return material.data(); }
+
     Material& materialAt(int x, int y) {
         return material[(size_t)y * (size_t)albedo.width() + (size_t)x];
     }
     const Material& materialAt(int x, int y) const {
         return material[(size_t)y * (size_t)albedo.width() + (size_t)x];
     }
+
+    // --- 脏矩形 ---
+    void markDirty(const Rect& r) { dirty_.add(r); }
+    void markPixelDirty(int x, int y) { dirty_.add(x, y); }
+    void markAllDirty() { dirty_.add(0, 0, albedo.width() - 1, albedo.height() - 1); }
+    const Rect& dirty() const { return dirty_; }
+    bool hasDirty() const { return !dirty_.empty(); }
+    Rect takeDirty() {
+        Rect r = dirty_;
+        dirty_.reset();
+        return r;
+    }
+    void clearDirty() { dirty_.reset(); }
+
+    // --- 绘制原语（与 Canvas 的那一套语义完全相同）---
+    bool setPixel(int x, int y, RGBA8 c, Material m = Material{}) {
+        if (x < 0 || y < 0 || x >= width() || y >= height()) return false;
+        setPixelRaw(x, y, c, m);
+        markPixelDirty(x, y);
+        return true;
+    }
+
+    void setPixelRaw(int x, int y, RGBA8 c, Material m = Material{}) {
+        const size_t i = (size_t)y * (size_t)albedo.width() + (size_t)x;
+        albedo.data()[i] = c;
+        material[i] = m;
+    }
+
+    void clear(RGBA8 c = RGBA8{0, 0, 0, 0}, Material m = Material{}) {
+        albedo.fill(c);
+        for (auto& e : material) e = m;
+        revision++;
+        markAllDirty();
+    }
+
+    void fill(RGBA8 c, Material m = Material{}) { clear(c, m); }
+
+    void fillRect(int x0, int y0, int x1, int y1, RGBA8 c, Material m = Material{}) {
+        if (x1 < x0) std::swap(x0, x1);
+        if (y1 < y0) std::swap(y0, y1);
+        x0 = std::max(0, x0);
+        y0 = std::max(0, y0);
+        x1 = std::min(width() - 1, x1);
+        y1 = std::min(height() - 1, y1);
+        if (x1 < x0 || y1 < y0) return;
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++) setPixelRaw(x, y, c, m);
+        revision++;
+        markDirty(Rect{x0, y0, x1, y1});
+    }
+
+    void rectOutline(int x0, int y0, int x1, int y1, RGBA8 c, Material m = Material{}) {
+        if (x1 < x0) std::swap(x0, x1);
+        if (y1 < y0) std::swap(y0, y1);
+        x0 = std::max(0, x0);
+        y0 = std::max(0, y0);
+        x1 = std::min(width() - 1, x1);
+        y1 = std::min(height() - 1, y1);
+        if (x1 < x0 || y1 < y0) return;
+        for (int x = x0; x <= x1; x++) {
+            setPixelRaw(x, y0, c, m);
+            setPixelRaw(x, y1, c, m);
+        }
+        for (int y = y0; y <= y1; y++) {
+            setPixelRaw(x0, y, c, m);
+            setPixelRaw(x1, y, c, m);
+        }
+        revision++;
+        markDirty(Rect{x0, y0, x1, y1});
+    }
+
+    // 端点规范化后画线：从左往右拖和从右往左拖必须得到同一条线
+    // （裸 Bresenham 在误差平局时固定偏向一侧，这是它的固有性质，见 canvas.cpp）
+    void drawLine(int x0, int y0, int x1, int y1, RGBA8 c, Material m = Material{});
+    void drawEllipse(int x0, int y0, int x1, int y1, bool filled, RGBA8 c,
+                     Material m = Material{});
+    int floodFill(int x, int y, RGBA8 c, Material m = Material{});
+
+private:
+    Rect dirty_;
 };
 
 // 文档 = 一组图层。索引 0 是**最底层**（与显示顺序一致：先画底，再往上叠）。
@@ -110,6 +218,17 @@ public:
     Layer& active() { return layer(active_); }
     const Layer& active() const { return layer(active_); }
 
+    // 当前层是否是"可写的"。锁定层与隐藏层不接受笔触：
+    // 往看不见的层上画是纯粹的挫败来源，所以宁可挡住。
+    bool activeWritable() const {
+        const Layer& L = active();
+        return L.visible && !L.locked;
+    }
+
+    // ------------------------------------------------------------------
+    // 结构改动：这些会改变"哪些图层参与合成"，所以调用方必须重算整张合成结果
+    // ------------------------------------------------------------------
+
     // 在当前层**之上**插入一个空层并选中它，返回新层索引
     int addLayer(const std::string& name = std::string()) {
         Layer l;
@@ -124,8 +243,9 @@ public:
     int duplicateLayer(int i) {
         if (layers_.empty()) return -1;
         i = std::clamp(i, 0, layerCount() - 1);
-        Layer copy = layers_[(size_t)i];
-        copy.name = layers_[(size_t)i].name + " 副本";
+        Layer copy = layers()[(size_t)i];
+        copy.name = layers()[(size_t)i].name + " 副本";
+        copy.markAllDirty();
         layers_.insert(layers_.begin() + i + 1, std::move(copy));
         active_ = i + 1;
         return active_;
@@ -145,7 +265,7 @@ public:
         from = std::clamp(from, 0, layerCount() - 1);
         to = std::clamp(to, 0, layerCount() - 1);
         if (from == to) return false;
-        Layer l = std::move(layers_[(size_t)from]);
+        Layer l = std::move(layers()[(size_t)from]);
         layers_.erase(layers_.begin() + from);
         layers_.insert(layers_.begin() + to, std::move(l));
         active_ = to;
@@ -155,16 +275,17 @@ public:
     // 把第 i 层合并到它下面一层（i 必须 >= 1）。合并后删除第 i 层。
     bool mergeDown(int i) {
         if (i < 1 || i >= layerCount()) return false;
-        Layer& src = layers_[(size_t)i];
-        Layer& dst = layers_[(size_t)i - 1];
+        Layer& src = layers()[(size_t)i];
+        Layer& dst = layers()[(size_t)i - 1];
+        const float srcOp = src.opacity / 255.0f;
         for (int y = 0; y < h_; y++) {
             for (int x = 0; x < w_; x++) {
                 const size_t k = (size_t)y * (size_t)w_ + (size_t)x;
                 const RGBA8 s = src.albedo.data()[k];
-                if (s.a == 0) continue;   // 源是全透明：保留底下那层（含其材质）
+                const float sa = s.a / 255.0f * srcOp;
+                if (sa <= 0.0f) continue;   // 源是全透明：保留底下那层（含其材质）
                 const RGBA8 d = dst.albedo.data()[k];
                 // 标准 source-over（非预乘）
-                const float sa = s.a / 255.0f;
                 const float da = d.a / 255.0f * (1.0f - sa);
                 const float oa = sa + da;
                 RGBA8 out;
@@ -183,9 +304,26 @@ public:
                 dst.material[k] = src.material[k];
             }
         }
+        // 合并后整层都可能变（源层的不透明度被折进去了），且尺寸不变，
+        // 所以直接标整层脏就够了——这里没有"只影响局部"的快捷路径。
+        dst.revision++;
+        dst.markAllDirty();
         layers_.erase(layers_.begin() + i);
         active_ = std::clamp(i - 1, 0, layerCount() - 1);
         return true;
+    }
+
+    // 把所有图层的脏矩形并起来并清空。
+    // 合成步骤用它决定"重算哪一块"，而不是每帧重算整张图。
+    Rect takeDirtyUnion() {
+        Rect u;
+        for (Layer& L : layers_) u.add(L.takeDirty());
+        return u;
+    }
+    bool hasAnyDirty() const {
+        for (const Layer& L : layers_)
+            if (L.hasDirty()) return true;
+        return false;
     }
 
 private:

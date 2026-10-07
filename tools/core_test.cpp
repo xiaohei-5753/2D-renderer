@@ -53,7 +53,7 @@ const RGBA8 kRed{255, 0, 0, 255};
 const RGBA8 kGreen{0, 255, 0, 255};
 const RGBA8 kAir{0, 0, 0, 0};
 
-int countSet(const Canvas& c) {
+int countSet(const Layer& c) {
     int n = 0;
     const Image& img = c.image();
     for (size_t i = 0; i < img.pixelCount(); i++)
@@ -61,26 +61,26 @@ int countSet(const Canvas& c) {
     return n;
 }
 
-int countSetInRow(const Canvas& c, int y) {
+int countSetInRow(const Layer& c, int y) {
     int n = 0;
     for (int x = 0; x < c.width(); x++)
         if (c.image().at(x, y).a > 0) n++;
     return n;
 }
 
-int countSetInCol(const Canvas& c, int x) {
+int countSetInCol(const Layer& c, int x) {
     int n = 0;
     for (int y = 0; y < c.height(); y++)
         if (c.image().at(x, y).a > 0) n++;
     return n;
 }
 
-bool samePixel(const Canvas& a, const Canvas& b, int x, int y) {
+bool samePixel(const Layer& a, const Layer& b, int x, int y) {
     return a.image().at(x, y) == b.image().at(x, y) &&
            a.materialAt(x, y) == b.materialAt(x, y);
 }
 
-bool sameCanvas(const Canvas& a, const Canvas& b) {
+bool sameCanvas(const Layer& a, const Layer& b) {
     if (a.width() != b.width() || a.height() != b.height()) return false;
     for (int y = 0; y < a.height(); y++)
         for (int x = 0; x < a.width(); x++)
@@ -88,8 +88,8 @@ bool sameCanvas(const Canvas& a, const Canvas& b) {
     return true;
 }
 
-Canvas makeCanvas(int w, int h) {
-    Canvas c(w, h);
+Layer makeCanvas(int w, int h) {
+    Layer c; c.resize(w, h);
     c.clear(kAir, Material{});
     return c;
 }
@@ -102,7 +102,7 @@ void testLines() {
     section("绘制原语 / 直线（对称 Bresenham 的方向约定）");
 
     {
-        Canvas c = makeCanvas(32, 32);
+        Layer c = makeCanvas(32, 32);
         c.drawLine(2, 5, 12, 5, kWhite);
         CHECK(countSet(c) == 11);            // 2..12 含端点共 11 个
         CHECK(countSetInRow(c, 5) == 11);
@@ -110,13 +110,13 @@ void testLines() {
         CHECK(countSetInCol(c, 12) == 1);
     }
     {
-        Canvas c = makeCanvas(32, 32);
+        Layer c = makeCanvas(32, 32);
         c.drawLine(7, 1, 7, 9, kWhite);
         CHECK(countSet(c) == 9);
         CHECK(countSetInCol(c, 7) == 9);
     }
     {
-        Canvas c = makeCanvas(32, 32);
+        Layer c = makeCanvas(32, 32);
         c.drawLine(0, 0, 10, 10, kWhite);
         CHECK(countSet(c) == 11);
         // 45 度线每个 x 恰好一个点
@@ -129,15 +129,15 @@ void testLines() {
         // 反向画同一条线必须得到同一组像素。
         // 这依赖 Canvas::drawLine 里的端点规范化：裸的 Bresenham 在误差平局时会偏向
         // 固定一侧，对调端点会画出线的另一侧。
-        Canvas a = makeCanvas(32, 32);
-        Canvas b = makeCanvas(32, 32);
+        Layer a = makeCanvas(32, 32);
+        Layer b = makeCanvas(32, 32);
         a.drawLine(3, 4, 25, 17, kWhite);
         b.drawLine(25, 17, 3, 4, kWhite);
         CHECK(sameCanvas(a, b));
     }
     {
         // 越界坐标不应该写出画布外，也不应该崩溃
-        Canvas c = makeCanvas(16, 16);
+        Layer c = makeCanvas(16, 16);
         c.drawLine(-20, -20, 40, 40, kWhite);
         CHECK(countSet(c) == 16);   // 对角线恰好穿过 16 行
     }
@@ -147,26 +147,26 @@ void testRect() {
     section("绘制原语 / 矩形");
 
     {
-        Canvas c = makeCanvas(16, 16);
+        Layer c = makeCanvas(16, 16);
         c.rectOutline(1, 1, 5, 5, kWhite);
         CHECK(countSet(c) == 16);   // 5x5 周长 = 5*4-4
     }
     {
-        Canvas c = makeCanvas(16, 16);
+        Layer c = makeCanvas(16, 16);
         c.fillRect(2, 2, 4, 4, kWhite);
         CHECK(countSet(c) == 9);    // 3x3
     }
     {
         // 坐标反着传也要正确（内部会 swap）
-        Canvas a = makeCanvas(16, 16);
-        Canvas b = makeCanvas(16, 16);
+        Layer a = makeCanvas(16, 16);
+        Layer b = makeCanvas(16, 16);
         a.fillRect(2, 2, 6, 8, kWhite);
         b.fillRect(6, 8, 2, 2, kWhite);
         CHECK(sameCanvas(a, b));
     }
     {
         // 超出边界的矩形要被裁掉而不是越界写
-        Canvas c = makeCanvas(16, 16);
+        Layer c = makeCanvas(16, 16);
         c.fillRect(-5, -5, 100, 100, kWhite);
         CHECK(countSet(c) == 16 * 16);
     }
@@ -177,7 +177,7 @@ void testEllipse() {
 
     {
         // 实心圆的面积应接近 pi*r^2
-        Canvas c = makeCanvas(32, 32);
+        Layer c = makeCanvas(32, 32);
         c.drawEllipse(0, 0, 20, 20, true, kWhite);
         const int n = countSet(c);
         // r = 10.5（半整数），面积约 346；给一个宽松但有效的窗口
@@ -191,7 +191,7 @@ void testEllipse() {
     }
     {
         // 空心圆：四重对称 + 全部落在包围盒内 + 四角不画
-        Canvas c = makeCanvas(32, 32);
+        Layer c = makeCanvas(32, 32);
         c.drawEllipse(0, 0, 20, 20, false, kWhite);
         CHECK(countSet(c) > 0);
 
@@ -214,7 +214,7 @@ void testEllipse() {
     }
     {
         // 极扁椭圆（高 1）：这是朴素中点算法会画不完整的情况，Zingl 的修正专门处理它
-        Canvas c = makeCanvas(32, 8);
+        Layer c = makeCanvas(32, 8);
         c.drawEllipse(1, 3, 29, 4, false, kWhite);
         CHECK(countSet(c) > 0);
         // 最左和最右必须被画到
@@ -231,7 +231,7 @@ void testEllipse() {
     }
     {
         // 单点退化
-        Canvas c = makeCanvas(8, 8);
+        Layer c = makeCanvas(8, 8);
         c.drawEllipse(4, 4, 4, 4, false, kWhite);
         CHECK(countSet(c) == 1);
     }
@@ -241,7 +241,7 @@ void testFloodFill() {
     section("绘制原语 / 洪水填充");
 
     {
-        Canvas c = makeCanvas(20, 20);
+        Layer c = makeCanvas(20, 20);
         c.rectOutline(2, 2, 12, 12, kWhite);
         const int filled = c.floodFill(7, 7, kRed);
         CHECK(filled == 81);   // 内部 9x9
@@ -253,13 +253,13 @@ void testFloodFill() {
     }
     {
         // 填充同色应该什么都不做（也避免死循环）
-        Canvas c = makeCanvas(8, 8);
+        Layer c = makeCanvas(8, 8);
         c.fill(kRed, Material{});
         CHECK(c.floodFill(4, 4, kRed) == 0);
     }
     {
         // 越界起点不应崩溃
-        Canvas c = makeCanvas(8, 8);
+        Layer c = makeCanvas(8, 8);
         CHECK(c.floodFill(-1, 4, kRed) == 0);
         CHECK(c.floodFill(100, 4, kRed) == 0);
     }
@@ -272,26 +272,27 @@ void testFloodFill() {
 void testHistoryBasics() {
     section("撤销重做 / 基本正确性");
 
-    Canvas c = makeCanvas(32, 32);
-    Canvas original = c;
+    Document doc(32, 32);
+    Layer& c = doc.active();
+    const Layer original = c;
 
     History h;
-    h.beginStroke(c);
+    h.beginStroke(doc);
     c.drawLine(1, 1, 20, 20, kWhite);
-    CHECK(h.endStroke(c, "直线"));
-    const Canvas afterStroke = c;
+    CHECK(h.commit(doc, "直线"));
+    const Layer afterStroke = c;
 
     CHECK(h.canUndo());
     CHECK(!h.canRedo());
     CHECK(h.undoSteps() == 1);
 
-    CHECK(h.undo(c));
-    CHECK(sameCanvas(c, original));      // 逐像素 + 材质完全还原
+    CHECK(h.undo(doc));
+    CHECK(sameCanvas(doc.active(), original));   // 逐像素 + 材质完全还原
     CHECK(h.canRedo());
     CHECK(h.redoSteps() == 1);
 
-    CHECK(h.redo(c));
-    CHECK(sameCanvas(c, afterStroke));
+    CHECK(h.redo(doc));
+    CHECK(sameCanvas(doc.active(), afterStroke));
     CHECK(h.undoSteps() == 1);
     CHECK(!h.canRedo());
 }
@@ -299,77 +300,100 @@ void testHistoryBasics() {
 void testHistoryNoChange() {
     section("撤销重做 / 无变化不污染栈");
 
-    Canvas c = makeCanvas(16, 16);
+    Document doc(16, 16);
+    Layer& c = doc.active();
     History h;
 
-    h.beginStroke(c);
-    CHECK(!h.endStroke(c, "空操作"));   // 没改任何像素
+    h.beginStroke(doc);
+    CHECK(!h.commit(doc, "空操作"));   // 没改任何像素
     CHECK(!h.canUndo());
     CHECK(h.undoSteps() == 0);
 
     // 写回原值也应该算作"无变化"
-    h.beginStroke(c);
+    h.beginStroke(doc);
     c.setPixel(3, 3, kAir, Material{});
-    CHECK(!h.endStroke(c, "写回原值"));
+    CHECK(!h.commit(doc, "写回原值"));
     CHECK(!h.canUndo());
 }
 
 void testHistoryPatchSize() {
-    section("撤销重做 / 只存变化矩形（内存）");
+    section("撤销重做 / 内存占用是有界的（补丁不是无限增长）");
 
-    Canvas c = makeCanvas(256, 256);
-    History h;
-    h.beginStroke(c);
-    c.setPixel(100, 100, kWhite, Material{});
-    CHECK(h.endStroke(c, "单像素"));
-
-    // 1x1 补丁 = 一个像素的颜色 + 材质。
-    // 用 sizeof 而不是写死数字：Material 从 4 字节长到 6 字节（自发光变成独立 RGB）
-    // 时这个断言就失效过，写死数字的测试反而会误导。
+    // ⚠️ 这里要说清楚现在的真实语义，别让断言误导后来的人。
+    //
+    // 老实现的补丁是"变化像素的外接矩形"，所以一笔单像素只占 1 个像素。
+    // 改成图层之后不行了：撤销与重做都要**完全对称**（重做必须能精确还原，
+    // 而不是在撤销的那一刻从画布现采状态 —— 那条路一旦有绕过 History 的改动就会采坏），
+    // 于是每个步骤要同时存"改前"和"改后"两份。
+    // 而要判断"到底哪些像素变了"，就得先把整层抓下来做差。
+    //
+    // 结论：现在每次提交存的是**两份整层快照**，与改动多少像素无关。
+    // 代价可以用一次算清（见下面的断言），上限仍然有界：
+    //   一份快照 = 像素数 × (sizeof(RGBA8) + sizeof(Material))
+    //   一步     = 2 份
+    //   画布 320×180、128 步 ≈ 2 × 57KB × 128 ≈ 14.6 MB
+    // 也就是说对像素画的常见尺寸完全够用，而且 History::maxBytes 会兜底裁剪。
+    //
+    // 如果哪天真的需要省内存，正确的方向是存"变化外接矩形内的两份"：
+    // 先用整层快照做差求出矩形，再把两份都快照裁剪到那个矩形。那需要让 Blob
+    // 自己知道怎么裁剪 —— 这次没有做，因为先要保证语义正确。
     const size_t perPixel = sizeof(RGBA8) + sizeof(Material);
-    CHECK(h.bytes() == perPixel);
+    const size_t bytesPerStep = 2 * (size_t)256 * 256 * perPixel;
 
-    // 一小段线也只应是那个外接矩形
-    h.beginStroke(c);
+    Document doc(256, 256);
+    Layer& c = doc.active();
+    History h;
+    h.beginStroke(doc);
+    c.setPixel(100, 100, kWhite, Material{});
+    CHECK(h.commit(doc, "单像素"));
+    CHECK(h.bytes() == bytesPerStep);
+
+    // 第二次提交的增量同样是固定的 2 份，与画的是 1 个像素还是 11 个像素无关
+    h.beginStroke(doc);
     c.drawLine(10, 10, 20, 10, kWhite, Material{});
-    CHECK(h.endStroke(c, "短线"));
-    const size_t b = h.bytes();
-    CHECK(b == perPixel * (1 + 11));
+    CHECK(h.commit(doc, "短线"));
+    CHECK(h.bytes() == 2 * bytesPerStep);
+
+    // 没改动的提交不占任何内存
+    h.beginStroke(doc);
+    CHECK(!h.commit(doc, "空操作"));
+    CHECK(h.bytes() == 2 * bytesPerStep);
 }
 
 void testHistoryStack() {
     section("撤销重做 / 多步与分支");
 
-    Canvas c = makeCanvas(32, 32);
-    Canvas original = c;
+    Document doc(32, 32);
+    Layer& c = doc.active();
+    const Layer original = c;
     History h;
 
     // 5 笔，每笔一个不同位置的像素
     for (int i = 0; i < 5; i++) {
-        h.beginStroke(c);
+        h.beginStroke(doc);
         c.setPixel(i, 0, kWhite, Material{});
-        CHECK(h.endStroke(c, "点"));
+        CHECK(h.commit(doc, "点"));
     }
     CHECK(h.undoSteps() == 5);
 
     // 全部撤销
-    for (int i = 0; i < 5; i++) CHECK(h.undo(c));
-    CHECK(sameCanvas(c, original));
+    for (int i = 0; i < 5; i++) CHECK(h.undo(doc));
+    CHECK(sameCanvas(doc.active(), original));
     CHECK(!h.canUndo());
     CHECK(h.redoSteps() == 5);
 
     // 全部重做
-    for (int i = 0; i < 5; i++) CHECK(h.redo(c));
+    for (int i = 0; i < 5; i++) CHECK(h.redo(doc));
     CHECK(!h.canRedo());
     for (int i = 0; i < 5; i++) CHECK(c.image().at(i, 0) == kWhite);
 
     // 撤销两步后做新操作 -> 重做链必须失效
-    CHECK(h.undo(c));
-    CHECK(h.undo(c));
+    CHECK(h.undo(doc));
+    CHECK(h.undo(doc));
     CHECK(h.redoSteps() == 2);
-    h.beginStroke(c);
+    h.beginStroke(doc);
     c.setPixel(20, 20, kGreen, Material{});
-    CHECK(h.endStroke(c, "新分支"));
+    CHECK(h.commit(doc, "新分支"));
     CHECK(!h.canRedo());
     CHECK(h.redoSteps() == 0);
     // 新分支保留，旧的前 3 步仍在撤销栈里
@@ -379,19 +403,20 @@ void testHistoryStack() {
 void testHistoryMaxSteps() {
     section("撤销重做 / 步数上限裁剪");
 
-    Canvas c = makeCanvas(16, 16);
+    Document doc(16, 16);
+    Layer& c = doc.active();
     History h;
     h.maxSteps = 8;
 
     for (int i = 0; i < 20; i++) {
-        h.beginStroke(c);
+        h.beginStroke(doc);
         c.setPixel(i % 16, i / 16, kWhite, Material{});
-        h.endStroke(c, "点");
+        h.commit(doc, "点");
     }
     CHECK(h.undoSteps() == 8);
     // 还能正常撤销 8 次
     int undone = 0;
-    while (h.undo(c)) undone++;
+    while (h.undo(doc)) undone++;
     CHECK(undone == 8);
 }
 
@@ -402,7 +427,7 @@ void testHistoryMaxSteps() {
 void testToolPencil() {
     section("工具 / 铅笔连续性（快速拖动不留断点）");
 
-    Canvas c = makeCanvas(32, 32);
+    Layer c = makeCanvas(32, 32);
     ToolOptions o;
     o.tool = ToolId::Pencil;
     o.color = kWhite;
@@ -426,7 +451,7 @@ void testToolBrushShape() {
     section("工具 / 笔刷大小与形状");
 
     {
-        Canvas c = makeCanvas(32, 32);
+        Layer c = makeCanvas(32, 32);
         ToolOptions o;
         o.tool = ToolId::Pencil;
         o.color = kWhite;
@@ -436,7 +461,7 @@ void testToolBrushShape() {
         CHECK(countSet(c) == 25);   // 5x5 方
     }
     {
-        Canvas c = makeCanvas(32, 32);
+        Layer c = makeCanvas(32, 32);
         ToolOptions o;
         o.tool = ToolId::Pencil;
         o.color = kWhite;
@@ -450,7 +475,7 @@ void testToolBrushShape() {
     }
     {
         // 笔刷在画布边缘要被裁掉而不是越界
-        Canvas c = makeCanvas(16, 16);
+        Layer c = makeCanvas(16, 16);
         ToolOptions o;
         o.tool = ToolId::Pencil;
         o.color = kWhite;
@@ -463,7 +488,7 @@ void testToolBrushShape() {
 void testToolShapePreview() {
     section("工具 / 形状预览回滚（不该留下上一次的预览）");
 
-    Canvas c = makeCanvas(32, 32);
+    Layer c = makeCanvas(32, 32);
     ToolOptions o;
     o.tool = ToolId::Rect;
     o.color = kWhite;
@@ -487,7 +512,7 @@ void testToolShapePreview() {
 void testToolEraserAndPicker() {
     section("工具 / 橡皮与取色");
 
-    Canvas c = makeCanvas(16, 16);
+    Layer c = makeCanvas(16, 16);
     c.fillRect(0, 0, 7, 7, kRed, Material{});
     CHECK(countSet(c) == 64);
 
@@ -536,7 +561,7 @@ void testToolDither() {
     CHECK(stable);
 
     // 通过工具走一遍
-    Canvas c = makeCanvas(16, 16);
+    Layer c = makeCanvas(16, 16);
     ToolOptions o;
     o.tool = ToolId::Dither;
     o.color = kWhite;
@@ -549,7 +574,7 @@ void testToolDither() {
 void testToolShade() {
     section("工具 / 加光减光只作用于已有的像素");
 
-    Canvas c = makeCanvas(8, 8);
+    Layer c = makeCanvas(8, 8);
     c.setPixel(2, 2, RGBA8{100, 100, 100, 255}, Material{});
 
     ToolOptions o;
@@ -573,7 +598,7 @@ void testToolShade() {
 void testToolFillViaSession() {
     section("工具 / 油漆桶（经会话）");
 
-    Canvas c = makeCanvas(20, 20);
+    Layer c = makeCanvas(20, 20);
     c.rectOutline(2, 2, 12, 12, kWhite, Material{});
 
     ToolOptions o;
@@ -591,8 +616,9 @@ void testToolFillViaSession() {
 void testToolHistoryIntegration() {
     section("工具 + 撤销重做 / 端到端");
 
-    Canvas c = makeCanvas(32, 32);
-    Canvas original = c;
+    Document doc(32, 32);
+    Layer& c = doc.active();
+    const Layer original = c;
     History h;
     ToolOptions o;
     o.tool = ToolId::Pencil;
@@ -600,18 +626,18 @@ void testToolHistoryIntegration() {
     o.brushSize = 3;
 
     ToolSession s;
-    h.beginStroke(c);
+    h.beginStroke(doc);
     s.begin(c, o, 5, 5);
     s.update(c, o, 15, 15);
     s.end();
-    CHECK(h.endStroke(c, "铅笔笔画"));
-    CHECK(!sameCanvas(c, original));
+    CHECK(h.commit(doc, "铅笔笔画"));
+    CHECK(!sameCanvas(doc.active(), original));
 
-    const Canvas drawn = c;
-    CHECK(h.undo(c));
-    CHECK(sameCanvas(c, original));
-    CHECK(h.redo(c));
-    CHECK(sameCanvas(c, drawn));
+    const Layer drawn = c;
+    CHECK(h.undo(doc));
+    CHECK(sameCanvas(doc.active(), original));
+    CHECK(h.redo(doc));
+    CHECK(sameCanvas(doc.active(), drawn));
 }
 
 // ---------------------------------------------------------------------------
@@ -701,22 +727,23 @@ void testMaterial() {
     // 材质参与撤销重做的比对。
     // 自发光故意设成 (10,200,30)，与 albedo（白色）**完全不同** ——
     // 用来证明"表面颜色"与"发光颜色"是两个独立的量。
-    Canvas c = makeCanvas(8, 8);
+    Document doc(8, 8);
+    Layer& c = doc.active();
     History h;
-    h.beginStroke(c);
+    h.beginStroke(doc);
     Material glow;
     glow.setEmissionFrom(10, 200, 30);
     c.setPixel(1, 1, kWhite, glow);
-    CHECK(h.endStroke(c, "自发光"));
+    CHECK(h.commit(doc, "自发光"));
     CHECK(c.materialAt(1, 1).emG == 200);
     CHECK(c.materialAt(1, 1).emR == 10);
     CHECK(c.image().at(1, 1) == kWhite);   // albedo 不受自发光影响
 
-    CHECK(h.undo(c));
+    CHECK(h.undo(doc));
     CHECK(c.materialAt(1, 1).emissionLevel() == 0);   // 回到笔画前：空气
     CHECK(c.image().at(1, 1).a == 0);
 
-    CHECK(h.redo(c));
+    CHECK(h.redo(doc));
     CHECK(c.materialAt(1, 1).emG == 200);  // 重做后恢复
     CHECK(c.image().at(1, 1) == kWhite);
 }
@@ -724,13 +751,14 @@ void testMaterial() {
 void testHistoryExternalChange() {
     section("撤销重做 / 越带改动后重做链作废");
 
-    Canvas c = makeCanvas(16, 16);
+    Document doc(16, 16);
+    Layer& c = doc.active();
     History h;
-    h.beginStroke(c);
+    h.beginStroke(doc);
     c.setPixel(5, 5, kRed, Material{});
-    CHECK(h.endStroke(c, "点"));
+    CHECK(h.commit(doc, "点"));
 
-    CHECK(h.undo(c));
+    CHECK(h.undo(doc));
     CHECK(h.canRedo());
 
     // 外部直接改了画布（相当于载入文件），此时重做已不可信
@@ -745,7 +773,7 @@ void testHistoryExternalChange() {
 void testCanvasDirtyRect() {
     section("画布脏矩形");
 
-    Canvas c = makeCanvas(64, 64);
+    Layer c = makeCanvas(64, 64);
     c.clearDirty();
     CHECK(!c.hasDirty());
 
@@ -771,7 +799,7 @@ void testCanvasDirtyRect() {
 void testResize() {
     section("画布尺寸变更");
 
-    Canvas c = makeCanvas(16, 16);
+    Layer c = makeCanvas(16, 16);
     c.fill(kWhite, Material{});
     c.resize(32, 24);
     CHECK(c.width() == 32 && c.height() == 24);
@@ -962,6 +990,128 @@ void testLayerLightingChannels() {
     CHECK(emit[0].g == 0);
 }
 
+// ---------------------------------------------------------------------------
+// 测试：图层化的撤销重做
+// ---------------------------------------------------------------------------
+
+// 判断文档里"除第 skip 层外"的全部内容是否与快照一致
+bool otherLayersMatch(const Document& doc, const std::vector<Layer>& snapshot, int skip) {
+    for (int i = 0; i < doc.layerCount(); i++) {
+        if (i == skip) continue;
+        if (i >= (int)snapshot.size()) return false;
+        if (!sameCanvas(doc.layer(i), snapshot[(size_t)i])) return false;
+    }
+    return true;
+}
+
+void testHistoryLayers() {
+    section("撤销重做 / 笔画只影响当前图层");
+
+    Document doc(8, 8);
+    doc.active().clear(kAir, Material{});
+    const int up = doc.addLayer("上");
+    doc.setActiveIndex(up);
+    doc.active().clear(kAir, Material{});
+    CHECK(doc.layerCount() == 2);
+
+    std::vector<Layer> before(doc.layers().begin(), doc.layers().end());
+
+    // 在上层画一条线
+    History h;
+    h.beginStroke(doc);
+    doc.active().drawLine(0, 0, 7, 7, kWhite, Material{});
+    CHECK(h.commit(doc, "线"));
+    CHECK(doc.active().image().at(3, 3) == kWhite);
+
+    CHECK(h.undo(doc));
+    CHECK(doc.layer(1).image().at(3, 3).a == 0);          // 上层被还原
+    CHECK(otherLayersMatch(doc, before, 1));              // 下层一根汗毛都没动
+    CHECK(doc.activeIndex() == 1);                        // 当前图层不变
+
+    CHECK(h.redo(doc));
+    CHECK(doc.active().image().at(3, 3) == kWhite);
+    CHECK(otherLayersMatch(doc, before, 1));
+}
+
+void testHistoryStructural() {
+    section("撤销重做 / 结构性操作（新建 · 删除 · 移动 · 合并）");
+
+    Document doc(4, 4);
+    doc.layer(0).albedo.fill(RGBA8{200, 0, 0, 255});
+    doc.layer(0).material.assign(16, Material{});
+    History h;
+
+    // --- 新建图层：撤销要把它去掉 ---
+    h.beginAll(doc);
+    const int up = doc.addLayer("上");
+    doc.layer(up).albedo.at(1, 1) = RGBA8{0, 0, 255, 255};
+    CHECK(h.commit(doc, "新建"));
+    CHECK(doc.layerCount() == 2);
+
+    CHECK(h.undo(doc));
+    CHECK(doc.layerCount() == 1);                     // 结构回到 1 层
+    CHECK(doc.layer(0).albedo.at(1, 1) == (RGBA8{200, 0, 0, 255}));
+    CHECK(h.redo(doc));
+    CHECK(doc.layerCount() == 2);
+
+    // --- 删除图层：名字与元数据都要能回来 ---
+    doc.layer(1).name = "有名有姓";
+    doc.layer(1).opacity = 77;
+    h.beginAll(doc);
+    CHECK(doc.removeLayer(1));
+    CHECK(h.commit(doc, "删除"));
+    CHECK(doc.layerCount() == 1);
+
+    CHECK(h.undo(doc));
+    CHECK(doc.layerCount() == 2);
+    CHECK(doc.layer(1).name == "有名有姓");           // 元数据也回来了
+    CHECK(doc.layer(1).opacity == 77);
+    CHECK(doc.layer(1).albedo.at(1, 1) == (RGBA8{0, 0, 255, 255}));
+
+    // --- 移动图层 ---
+    History h2;
+    h2.beginAll(doc);
+    CHECK(doc.moveLayer(1, 0));
+    CHECK(h2.commit(doc, "移动"));
+    CHECK(doc.layer(0).name == "有名有姓");
+    CHECK(h2.undo(doc));
+    CHECK(doc.layer(1).name == "有名有姓");
+
+    // 合并前把上层的不透明度调回 255：这一段要验证的是"合并结果的混合比例"，
+    // 不透明度对混合的影响已经在别处覆盖了，混在一起会让断言难以阅读。
+    doc.layer(1).opacity = 255;
+
+    // --- 合并向下 ---
+    History h3;
+    h3.beginAll(doc);
+    CHECK(doc.mergeDown(1));
+    CHECK(h3.commit(doc, "合并"));
+    CHECK(doc.layerCount() == 1);
+    // 上层不透明的蓝盖住了底层的红
+    CHECK(doc.layer(0).albedo.at(1, 1).b == 255);
+    CHECK(h3.undo(doc));
+    CHECK(doc.layerCount() == 2);
+    CHECK(doc.layer(0).albedo.at(1, 1) == (RGBA8{200, 0, 0, 255}));
+    CHECK(doc.layer(1).albedo.at(1, 1).b == 255);
+    CHECK(doc.layer(1).name == "有名有姓");     // 合并撤销后名字也要回来
+}
+
+void testHistoryStructuralNoChange() {
+    section("撤销重做 / 结构性操作没改动就不入栈");
+
+    Document doc(4, 4);
+    History h;
+    h.beginAll(doc);
+    CHECK(!h.commit(doc, "什么都没做"));    // 层数与内容都没变
+    CHECK(h.undoSteps() == 0);
+
+    // 改可见性**不**走 History，但要能识别为"内容没变"
+    h.beginAll(doc);
+    doc.layer(0).visible = false;
+    CHECK(!h.commit(doc, "只改可见性"));    // 可见性不在像素差里
+    CHECK(h.undoSteps() == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -994,6 +1144,9 @@ int main() {
     testLayerMerge();
     testFlatten();
     testLayerLightingChannels();
+    testHistoryLayers();
+    testHistoryStructural();
+    testHistoryStructuralNoChange();
 
     printf("\n========================================\n");
     printf("通过 %d，失败 %d\n", g_pass, g_fail);

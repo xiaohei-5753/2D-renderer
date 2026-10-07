@@ -19,10 +19,34 @@ void drawCanvasPanel(App& a);       // 中栏：画布（内容由 GL 直接绘�
 void drawPropertiesPanel(App& a);   // 右栏：调色板 / 材质 / 光照
 void drawStatusBar(App& a);         // 底部状态栏
 
-// 右栏的三个可折叠分区（逐步实现）
+// 右栏的四个可折叠分区
 void drawPaletteSection(App& a);
 void drawMaterialSection(App& a);
 void drawLightingSection(App& a);
+// 图层面板（实现在 app/layer_panel.cpp：它自带缩略图缓存，独立成一文件
+// 免得 panels.cpp 继续膨胀）
+void drawLayerSection(App& a);
+
+// --- 图层动作（实现在 app/layer_actions.cpp）---
+//
+// 菜单栏、快捷键、图层面板三个入口共用同一套实现，避免"同一个动作三份代码"。
+// 这些是**结构性操作**：都会改变"哪些层参与合成"，所以统一走 History::beginAll/commit
+// （整份文档快照），而不是像一笔画那样只看当前图层。
+void actAddLayer(App& a);
+void actDuplicateLayer(App& a);
+void actDeleteLayer(App& a);
+void actMergeDown(App& a);
+void actMoveLayer(App& a, int delta);          // delta = +1 上移 / -1 下移
+void actToggleLayerVisible(App& a, int index);
+
+// 图层的非像素属性被改动（不透明度 / 锁定 / 改名）后调用。
+// 不记入撤销（一眼就能看出效果的即时开关，撤销一个眼睛图标没有意义），
+// 但必须让合成与光照重算。
+void notifyLayerPropertiesChanged(App& a);
+
+// 缩略图缓存：让 a.thumbs 与图层数一致，并按 Layer::revision 重建内容。
+// 每帧在 drawUi 之后调用一次（它要访问 GL，所以不在面板函数里）。
+void uploadLayerThumbnails(App& a);
 
 // --- 动作（菜单与工具栏共用）---
 void actUndo(App& a);
@@ -46,5 +70,10 @@ void actLightSettingsChanged(App& a);
 
 // 请求打开"新建画布"对话框（快捷键与菜单共用同一个入口）
 void requestNewCanvasDialog();
+
+// 评测 / 自动化截图用：强制展开或折叠右侧栏的分区（按名字子串匹配，空串 = 不管）。
+// ImGui 的折叠状态存在 .ini 里，功能一多右侧栏就要滚动，于是"改了某一节"在
+// 截图里可能根本看不到。有了它就能稳定地把要验证的那一块放到画面里。
+void setUiSections(const std::string& forceOpen, const std::string& forceClosed);
 
 }  // namespace pb::app

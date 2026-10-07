@@ -105,7 +105,6 @@ int main(int argc, char** argv) {
 
     gfx::DzSweepParams prm;
     prm.directions = dirs;
-    prm.stepsPerLevel = S;
     prm.sky[0] = 0.40f; prm.sky[1] = 0.43f; prm.sky[2] = 0.50f;
     if (!dz.render(prm)) { fprintf(stderr, "render failed\n"); return 1; }
 

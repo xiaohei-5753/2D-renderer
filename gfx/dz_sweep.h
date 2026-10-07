@@ -42,9 +42,6 @@ struct DzSweepParams {
     int directions = 24;
     float sky[3] = {0.35f, 0.38f, 0.45f};   // 天空初始值（环境光）
     float emitScale = 1.0f;
-    // 斜射程度：沿 d 每走 stepsPerLevel 格、射线上升 1 层。
-    // 实现方式是**把 d-z 位图横向拉伸这么多倍**（见文件头说明）。
-    float stepsPerLevel = 4.0f;
 };
 
 class DzSweep {
@@ -55,6 +52,10 @@ public:
     void shutdown();
     bool valid() const { return albedoTex_ != 0; }
 
+    // 采样半径 m：喂给引擎方向表的半径。方向上可用的斜率由它决定
+    // （半径 m 的圆上那些整数点里就含 (1, S) 这类斜率，所以影子长度由它管）。
+    void setRayRadius(int m) { m_ = m; }
+
     void uploadField(const SurfaceField& f);
 
     // 跑完整流程，结果在 resultTexture()。
@@ -62,23 +63,23 @@ public:
 
     GLuint resultTexture() const { return outTex_; }
 
+
 private:
     void releaseTextures();
+    GLuint readBackBitmap(int W, int H);
 
     int w_ = 0, h_ = 0, layers_ = 0;
-
+    int m_ = 128;             // 采样半径（方向表半径）
     GLuint albedoTex_ = 0;    // RGBA8 : 压平后的 albedo
     GLuint matTex_ = 0;       // RGBA32F: 自发光 RGB + (ior + flags*8)
     GLuint heightTex_ = 0;    // R8UI  : 表面层号
     GLuint outTex_ = 0;       // RGBA8 : 最终输出
     GLuint accSSBO_ = 0;      // 定点累积（按方向累加受光）
-
-    // d-z 位图（就是喂给引擎的那张"多层文档"）
-    GLuint pixArray_ = 0;     // RGBA8 : rgb = 颜色, a = 覆盖率
-    GLuint flagArray_ = 0;    // RGBA8 : r = 有像素, g = 表面格
+    GLuint pixTex_ = 0;       // RGBA8 : 截面位图（本方向的）
+    GLuint litTex_ = 0;       // RGBA8 : 引擎在截面上的渲染结果
     int bitmapW_ = 0, bitmapH_ = 0;
-
-    GLuint buildProg_ = 0, resolveProg_ = 0, accumProg_ = 0;
+    SurfaceField field_;      // 投影/上色在 CPU 上做，留一份输入
+    GLuint buildProg_ = 0;
     LightSweep* engine_ = nullptr;   // 现有 2D 光追引擎（射线全交给它）
 };
 

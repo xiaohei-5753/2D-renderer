@@ -45,6 +45,8 @@ struct RenderSettings {
     // 体素锥追踪（Gi::ConeTrace 用）
     int cones = 9;                // 半球上打几个锥
     float coneMaxDist = 96.0f;    // 锥的最远距离
+    int giMaxMip = 3;             // 最大 mip 层级：粗层会把空间上分离的东西混在一起
+                                  // （板子和板上方的光源落进同一个块 -> 光"穿过"板子）
     float giIntensity = 1.0f;     // GI 整体强度
     int giBounces = 0;            // 0 = 只收自发光（单次）；>=1 追加反照率弹射
 

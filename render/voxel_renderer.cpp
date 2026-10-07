@@ -202,6 +202,7 @@ public:
 
                     // ---- 体素锥追踪 ----
                     if (useVct && !mips_.empty()) {
+
                         const int N = (int)(coneDir.size() / 3u);
                         // 半球辐照度积分： I = Σ_c L_c · cosθ_c · Ω_c
                         //   Ω_c = 2π/N（每个锥占的立体角），cosθ_c = 锥方向的 z。
@@ -383,7 +384,7 @@ private:
     // 沿 d 打一个半角 tanA 的锥，累积到 acc
     void traceCone(const float p[3], const float d[3], float tanA, float acc[3]) const {
         if (mips_.empty()) return;
-        const int maxLevel = (int)mips_.size() - 1;
+        const int maxLevel = std::min((int)mips_.size() - 1, std::max(0, set_.giMaxMip));
         const float maxDist = std::max(1.0f, set_.coneMaxDist);
         const float mt = std::max(tanA, 1e-3f);
 
@@ -396,10 +397,24 @@ private:
             while (level < maxLevel && (float)(1 << (level + 1)) <= r * 2.0f) level++;
             float s[4];
             sampleMip(level, p[0] + d[0] * t, p[1] + d[1] * t, p[2] + d[2] * t, s);
-            acc[0] += T * s[0] * s[3];
-            acc[1] += T * s[1] * s[3];
-            acc[2] += T * s[2] * s[3];
-            T *= (1.0f - s[3]);
+
+            // ---- 不透明度补偿（分图层遮挡的关键）----
+            //
+            // mip 层 L 的一个 texel 是 2^L × 2^L × 2^L 个体素的**平均**。
+            // 一层不透明板只占块里很小一部分，平均后 a 很小，
+            // 于是 T *= (1-a) 几乎不掉 —— 光会从板子里漏过去，
+            // 表现就是"看不到分图层的光线遮挡"。
+            // 沿轴看，穿过这个 texel 等于穿过 2^L 个体素，所以累积不透明度为
+            //     1 - (1-a)^(2^L)
+            float a = s[3];
+            if (a > 0.0f && level > 0) {
+                const float k = (float)(1u << level);
+                a = std::min(1.0f, 1.0f - std::pow(1.0f - a, k));
+            }
+            acc[0] += T * s[0] * a;
+            acc[1] += T * s[1] * a;
+            acc[2] += T * s[2] * a;
+            T *= (1.0f - a);
             t += std::max(0.75f, r * 0.5f);
         }
     }

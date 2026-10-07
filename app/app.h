@@ -98,6 +98,7 @@ struct App {
     int vzCones = 9;               // VCT：半球上打几个锥
     float vzGiIntensity = 1.0f;    // VCT：GI 强度
     float vzConeDist = 96.0f;      // VCT：锥最远距离
+    int vzMaxMip = 3;              // VCT：最大 mip 层级（太粗会漏过遮挡物）
     bool vzEmitLights = true;      // （旧）自发光体素当光源
     float vzEmitIntensity = 1.0f;
     int vzLightSamples = 8;        // 每像素每帧抽几个光源

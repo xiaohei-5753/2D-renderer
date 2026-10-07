@@ -17,6 +17,10 @@ using namespace pb;
 int main(int argc, char** argv) {
     int W = 160, H = 96, Z = 16;
     float el = 45.0f, az = 135.0f, sun = 1.0f, sky = 0.20f;
+    float gi = 1.0f;              // VCT GI 强度
+    int maxMip = 3;               // VCT 最大 mip 层级
+    int cones = 9;
+    int plate = 0;                // 0=无板 1=带洞的板 2=整块无洞的板
     std::string out = "out/vox_test";
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -33,6 +37,10 @@ int main(int argc, char** argv) {
         else if (a == "--az") az = (float)std::atof(next().c_str());
         else if (a == "--sun") sun = (float)std::atof(next().c_str());
         else if (a == "--sky") sky = (float)std::atof(next().c_str());
+        else if (a == "--gi") gi = (float)std::atof(next().c_str());
+        else if (a == "--maxmip") maxMip = std::atoi(next().c_str());
+        else if (a == "--cones") cones = std::atoi(next().c_str());
+        else if (a == "--plate") plate = std::atoi(next().c_str());
         else if (a == "--out") out = next();
     }
 
@@ -49,10 +57,32 @@ int main(int argc, char** argv) {
             for (int x = W / 2; x < W * 3 / 4; x++)
                 v.color[v.idx(x, y, z)] = RGBA8{190, 120, 70, 255};
 
-    // 一根发光柱：左侧，高度 6，自发光青色
-    for (int z = 0; z < 6; z++)
-        for (int y = H / 3; y < H / 3 + 3; y++)
-            for (int x = W / 6; x < W / 6 + 3; x++) {
+    // 分图层遮挡的判定场景。
+    //
+    // 关键：**被遮挡的表面和遮挡物不能在同一列**，否则俯视下遮挡物自己就成了柱顶
+    // （我第一版就是这样，量到的"漏光"其实是板子顶面被正常照亮）。
+    // 所以遮挡板只铺 x < W/2，去看**板子范围之外**的地面（x >= W/2）：
+    // 从那里射向光源的斜线会穿过板子 -> 应当明显变暗。
+    // 板中央留一个洞（在光源正下方），洞下面的地面应当仍然很亮。
+    //
+    //   plate=1  放遮挡板
+    //   plate=0  对照，不放板
+    if (plate) {
+        const int zlo = 5, zhi = 7;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W / 4; x++) {
+                if (x >= W / 8 && x < W / 8 + 8 && y >= H / 3 && y < H / 3 + 8)
+                    continue;                       // 洞
+                for (int z = zlo; z < zhi; z++)
+                    v.color[v.idx(x, y, z)] = RGBA8{120, 120, 130, 255};
+            }
+    }
+
+    // 发光柱：放在板子**之上**
+    const int ez0 = plate ? 8 : 0;
+    for (int z = ez0; z < ez0 + 6; z++)
+        for (int y = H / 3; y < H / 3 + 6; y++)
+            for (int x = W / 6; x < W / 6 + 6; x++) {
                 const size_t k = v.idx(x, y, z);
                 v.color[k] = RGBA8{80, 200, 220, 255};
                 v.emission[k] = RGBA8{80, 200, 220, 255};
@@ -68,9 +98,10 @@ int main(int argc, char** argv) {
     rs.sunIntensity = sun;
     rs.skyColor[0] = rs.skyColor[1] = rs.skyColor[2] = sky;
     rs.gi = render::RenderSettings::Gi::ConeTrace;
-    rs.cones = 9;
+    rs.cones = cones;
+    rs.giMaxMip = maxMip;
     rs.coneMaxDist = 96.0f;
-    rs.giIntensity = 1.0f;
+    rs.giIntensity = gi;
     r->setSettings(rs);
 
     std::vector<RGBA8> px;
@@ -93,7 +124,12 @@ int main(int argc, char** argv) {
         printf("%4d", px[(size_t)ly * W + x].r);
     printf("\n");
 
-    // 数值检查 2：高台右侧应当出现阴影（阳光从 az=135 即左上来）
+    // 数值检查 2：**遮挡板之外**的地面（x >= W/2）。板挡住斜射光 -> 应当变暗。
+    printf("  板外地面 y=%d  x=%d..%d 的 G：\n   ", ly, W / 4, W / 4 + 23);
+    for (int x = W / 4; x < W / 4 + 24; x++) printf("%4d", px[(size_t)ly * W + x].g);
+    printf("\n");
+
+    // 数值检查 3：高台右侧应当出现阴影（阳光从 az=135 即左上来）
     const int sy = H / 4 + 2;
     printf("  体素 %dx%dx%d  el=%.0f az=%.0f sun=%.2f sky=%.2f  最后一帧 %.2f ms\n", W, H, Z,
            el, az, sun, sky, r->lastMs());

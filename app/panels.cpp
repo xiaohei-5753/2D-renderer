@@ -1174,6 +1174,14 @@ void drawLightingSection(App& a) {
                 a.vzConeDist = cd;
                 a.vzDirty = true;
             }
+            int mm = a.vzMaxMip;
+            if (ui::labeledSliderInt("vzMm", &mm, 0, 7, "最大 mip 层级")) {
+                a.vzMaxMip = mm;
+                a.vzDirty = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("越粗越快，但太粗时一个块会同时包含遮挡物和它上方的光源，\n"
+                                  "光会从遮挡物里漏过去（分图层遮挡失效）。默认 3。");
         }
         if (a.vzGiMode == 1) {
             // 光源采样：蒙特卡洛，需要累积

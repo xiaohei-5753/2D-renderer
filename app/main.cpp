@@ -548,6 +548,7 @@ int main(int argc, char** argv) {
                                                 : render::RenderSettings::Gi::None;
                     rs.cones = a.vzCones;
                     rs.coneMaxDist = a.vzConeDist;
+                    rs.giMaxMip = a.vzMaxMip;
                     rs.giIntensity = a.vzGiIntensity;
                     rs.emissiveIntensity = a.vzEmitIntensity;
                     rs.lightSamples = a.vzLightSamples;

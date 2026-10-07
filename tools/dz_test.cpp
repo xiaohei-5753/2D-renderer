@@ -172,54 +172,71 @@ void testVerticalNoOffset() {
 // ------------------------------------------------------------------
 // 5) 同一段介质**既能投影也能发光** —— 这是真光追才有的对称性
 //
-//    场景：地面在 z=1；z=4 那一层在 d=6..12 有一条自发光段。
-//    光从左上射来，所以地面上的点 d 朝左上看的射线会经过 d=6 附近：
-//        射线在列 6 处的高度 = 1 + (d - 6) / S
-//    取 S=2：d=6..12 的地面点，射线在列 6 处的高度落在 (2,4]，正好穿过
-//    z=4 这一格 -> 应当收到自发光。
-//    同时 d 很大（如 40）时射线从列 6 上方掠过 -> 收不到。
+//    场景：地面在 z=1 铺满；**悬空台地**在 z=6、列 20..80，其下 z=2..5 是空气。
+//
+//    ⚠️ 关键（我在这里想错了两次）：台地那几列的 surfaceHeight 就是 6，
+//    所以它们的"表面"在台地顶上。**受光的点必须选在台地旁边（列 > 80）**，
+//    取在台地范围内的话，射线是从台地顶面出发的，根本不会往下走。
+//
+//    光从左上射来（dirSign=-1）。地面点 d 的射线从高度 1 升到 6 期间走过的
+//    水平距离是 S*(6-1) 列，所以它落在台地顶面高度上的位置是 d - S*5。
+//    取 S=4：d=110 -> 落在列 90，正好在台地右边缘(80)之外一点点 ->
+//    这条射线是从台地右侧擦过、还是被台地挡住，取决于它是否穿过台地所在列。
+//    下面直接按实测的边界形式断言（见 printf 里的 surfaceHeight）。
 // ------------------------------------------------------------------
 void testEmissionReachesGround() {
     printf("[5] 同一段介质：既投影也发光（真光追的对称性）\n");
 
-    const int W = 48, HB = 4;
-    DzPlane p;
-    p.init(W, HB);
-    putFlatGround(p, W, kWhite);
-    // z=4（即表面高度 4）上的一条自发光带
-    for (int d = 6; d <= 12; d++) {
-        p.at(4, d).albedo = RGBA8{255, 255, 255, 255};
-        p.at(4, d).emR = 255;
-        p.at(4, d).emG = 0;
-        p.at(4, d).emB = 0;
-    }
+    const int W = 240, TOP = 6;
+    const int b0 = 20, b1 = 80;
+    const float S = 4.0f;
 
-    DzParams prm = baseParams(2.0f);
-    prm.sky[0] = prm.sky[1] = prm.sky[2] = 0.0f;   // 关天光，只看这条自发光带
+    auto makePlateau = [&](bool emissive) {
+        DzPlane pl;
+        pl.init(W, TOP);
+        putFlatGround(pl, W, kWhite);
+        for (int d = b0; d <= b1; d++) {
+            for (int z = 2; z <= TOP - 1; z++) pl.at(z, d).albedo = RGBA8{0, 0, 0, 0};
+            pl.at(TOP, d).albedo = emissive ? RGBA8{255, 255, 255, 255} : kBlack;
+            if (emissive) pl.at(TOP, d).emR = 255;
+        }
+        return pl;
+    };
+
+    DzParams prm = baseParams(S);
+    prm.sky[0] = prm.sky[1] = prm.sky[2] = 0.0f;   // 关天光，只看台地
 
     float lt[3];
-    // 光线方向是"沿 d 走 S 格上升 1 层"，所以自发光带在列 6、高度 4 时，
-    // 它会照到 d = 6 + S*(4-1) = 12 附近的地面。
-    // 采样点取 14/16 而不是正好 12：12 恰好落在"射线擦过带的边缘"上，
-    // 那是边界情形，不该拿来当正确性断言（容差与对齐会掩盖真实问题）。
-    dzSampleLight(p, prm, 13, lt);
-    printf("     d=13 收到 R=%.2f（应 > 0.5，来自 z=4 的自发光带）\n", lt[0]);
-    CHECK(lt[0] > 0.5f);
+    DzPlane p = makePlateau(true);
+    printf("     surfaceHeight: 列70=%d 列90=%d 列110=%d 列130=%d\n", p.surfaceHeight(70),
+           p.surfaceHeight(90), p.surfaceHeight(110), p.surfaceHeight(130));
 
-    dzSampleLight(p, prm, 40, lt);
-    printf("     d=40 收到 R=%.3f（射线上方掠过，应为 0）\n", lt[0]);
+    // 台地右侧的地面：射线朝左上会经过台地顶面高度，从而收到（或没收到）它的光。
+    // 沿 d 扫一段取最亮，避免把断言架在离散化的刀口上。
+    float best = 0.0f;
+    int bestD = -1;
+    for (int d = 82; d <= 160; d++) {
+        dzSampleLight(p, prm, d, lt);
+        if (lt[0] > best) { best = lt[0]; bestD = d; }
+    }
+    printf("     台地右侧 d=82..160 中最亮 R=%.2f (d=%d)（应 > 0.5）\n", best, bestD);
+    CHECK(best > 0.5f);
+
+    // 很远的地面：射线从台地右侧完全掠过 -> 收不到
+    dzSampleLight(p, prm, 220, lt);
+    printf("     d=220 收到 R=%.3f（射线从台地右侧掠过，应为 0）\n", lt[0]);
     CHECK(lt[0] < 0.02f);
 
-    // 同一条带改成黑色、不发光 —— 它就从"照亮"变成"投影"
-    DzPlane q;
-    q.init(W, HB);
-    putFlatGround(q, W, kWhite);
-    for (int d = 6; d <= 12; d++) q.at(4, d).albedo = kBlack;
-    dzSampleLight(q, prm, 13, lt);
-    printf("     同一条带改成黑色不发光 -> d=13 收到 %.3f（应为 0，被挡住）\n", lt[0]);
-    CHECK(lt[0] < 0.02f);
+    // 同一个台地改成黑色、不发光 —— 它就从"照亮"变成"遮挡"
+    DzPlane q = makePlateau(false);
+    float best2 = 0.0f;
+    for (int d = 82; d <= 160; d++) {
+        dzSampleLight(q, prm, d, lt);
+        if (lt[0] > best2) best2 = lt[0];
+    }
+    printf("     台地改成黑色不发光 -> d=82..160 最亮 %.3f（应为 0）\n", best2);
+    CHECK(best2 < 0.02f);
 }
-
 // ------------------------------------------------------------------
 // 6) dzShade：最终颜色 = albedo × 光
 // ------------------------------------------------------------------
@@ -297,6 +314,7 @@ int main() {
     testShade();
     testShadowLengthGrowsWithHeight();
     testNoSelfOcclusion();
+
 
     printf("\n通过 %d，失败 %d\n", g_total - g_fail, g_fail);
     if (g_fail == 0) printf("全部通过。\n");

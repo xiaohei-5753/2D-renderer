@@ -143,11 +143,27 @@ struct DzParams {
 
 // 求某一个 d 处、最高像素上表面收到的光（RGB，线性空间，可以超过 1）。
 // 这就是"把射线投射到顶端像素得到的光"。
+//
+// ⚠️ 这是 **gather** 版本：对每个点独立地反向追踪一条射线。
+// 慢，但实现最直白，用来当参考解 / 断言基准。
 void dzSampleLight(const DzPlane& p, const DzParams& prm, int d, float out[3]);
 
 // 对整个平面求一遍：每个 d 一格 RGB 结果。out 会被 resize 成 width*3。
 void dzTraceLine(const DzPlane& p, const DzParams& prm, std::vector<float>& out);
 
+// ## 关于"更快的等价算法"（第一版没做成，记在这里免得重走）
+//
+// 我试过一个"沿射线推进、一次扫完整条线 O(宽×高)"的 sweep，靠递推
+//     lt(z, d) = lt(z-1, d - sgn) * 介质 + 自发光
+// 来省掉逐点反向追踪。**它是错的**：在整数格上，一条射线的落格链是
+// "每下降一层、横向走一格"（45°），而真实斜率 S 决定的是**这条链在高度 h 处
+// 落在哪一列**。链的形状与 S 无关，所以固定递推根本无法表达 S ≠ 1 的遮挡关系 ——
+// 实测它给出的影子完全没有被拉开（甚至整片全暗）。
+//
+// 结论：斜射的遮挡关系在整数格 DP 里没有简单的定点递推。
+// 要做快，正确方向是**精确的格子遍历（DDA）**：只在格子边界处取样，
+// 每条射线的代价与它真正穿过的格子数成正比，而不是与 1/步长 成正比。
+// 那才是有希望接近 O(宽×高) 的路线。
 // 最终颜色 = albedo * 光 + 自发光（都归一化到 0..1）。方便出图与断言。
 RGBA8 dzShade(const DzCell& surface, const float light[3], const DzParams& prm);
 

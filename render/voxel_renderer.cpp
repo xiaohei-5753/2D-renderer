@@ -202,16 +202,21 @@ public:
 
                     // ---- 体素锥追踪 ----
                     if (useVct && !mips_.empty()) {
-                        float acc[3] = {0, 0, 0};
                         const int N = (int)(coneDir.size() / 3u);
+                        // 半球辐照度积分： I = Σ_c L_c · cosθ_c · Ω_c
+                        //   Ω_c = 2π/N（每个锥占的立体角），cosθ_c = 锥方向的 z。
+                        // 我第一版只写了 Σ L_c/N —— 漏了 cosθ 和 2π，
+                        // 亮度就低了 2π 倍（约 6.3 倍），所以看着发暗。
+                        const float omega = (N > 0) ? 2.0f * 3.14159265f / (float)N : 0.0f;
                         for (int i = 0; i < N; i++) {
                             const float d[3] = {coneDir[(size_t)i * 3u],
                                                 coneDir[(size_t)i * 3u + 1],
                                                 coneDir[(size_t)i * 3u + 2]};
+                            float acc[3] = {0, 0, 0};
                             traceCone(p, d, coneTan, acc);
+                            const float w = d[2] * omega * set_.giIntensity;
+                            for (int c = 0; c < 3; c++) lit[c] += acc[c] * w;
                         }
-                        const float inv = (N > 0) ? set_.giIntensity / (float)N : 0.0f;
-                        for (int c = 0; c < 3; c++) lit[c] += acc[c] * inv;
                     }
 
                     // ---- 光源采样（对照）----

@@ -106,8 +106,13 @@ void main(){
       //   a=1 -> 完全覆盖下面
       acc=c.rgb+(acc-c.rgb)*(1.0-c.a*op);
     }else{
-      // 受光结果：所见即所得，只按图层不透明度叠上去
-      acc=mix(acc,c.rgb,op);
+      // 受光结果：
+      //   有覆盖的地方 -> 按**逐像素覆盖率**覆盖（原来只按"整层不透明度"，
+      //                    于是空的上层会把下层整片擦掉：图层2的绿块看不见）
+      //   空气处       -> 这一层的光晕**加法**叠上去，而不是把下面的层擦掉
+      float cov=clamp(c.a,0.0,1.0);
+      acc=mix(acc,c.rgb,cov*op);
+      acc+=c.rgb*(1.0-cov)*op;
     }
   }
   imageStore(u_out,p,vec4(acc,1.0));

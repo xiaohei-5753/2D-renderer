@@ -72,12 +72,14 @@ void main(){
   //
   // 环境光：每层的光场里都含了一份环境光，n 层相加就会过曝 n 倍。
   // 所以这里从每层光场里减掉环境光，最后只在 C_i 里加一次
+  // 死区 0.006：没有发光内容的层，其空气色就是环境光本身，减去后只剩浮点残渣；
+  // 层数一多，这些残渣累加起来就表现为"每新建一层环境光更亮一点"。
   // （等价于你说的"每层环境光 1/n"，但不会过曝）。
   vec3 gtotal=vec3(0.0);
   if(u_fieldStrength>0.0){
     for(int i=0;i<u_n;i++){
       vec4 L=texelFetch(u_tex,ivec3(p,i),0);
-      gtotal+=max(vec3(0.0),L.rgb-u_backdrop)*(1.0-clamp(L.a,0.0,1.0));
+      gtotal+=max(vec3(0.0),L.rgb-u_backdrop-vec3(0.006))*(1.0-clamp(L.a,0.0,1.0));
     }
   }
   vec3 Ftot=gtotal;
@@ -91,7 +93,7 @@ void main(){
       float a=clamp(c.a,0.0,1.0)*op;
       acc=mix(acc,C,a);                       // 覆盖 / 半覆盖
       // 本层光场继续往下传（"Ln 与 Ln-1 相加"）
-      Ftot-=max(vec3(0.0),c.rgb-u_backdrop)*(1.0-clamp(c.a,0.0,1.0));
+      Ftot-=max(vec3(0.0),c.rgb-u_backdrop-vec3(0.006))*(1.0-clamp(c.a,0.0,1.0));
       continue;
     }
     if(op<=0.0)continue;

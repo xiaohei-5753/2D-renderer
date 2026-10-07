@@ -308,6 +308,12 @@ int main(int argc, char** argv) {
 
     app::App a;
     a.doc.resize(cw, ch);
+    // 普通启动（非演示）时底层铺纯白：它相当于整幅画的"底纸"。
+    // 光场是"照亮下层"的，最下面那层不能是空的，否则光没东西可打。
+    if (!demo) {
+        a.doc.layers()[0].image().fill(RGBA8{255, 255, 255, 255});
+        a.doc.layers()[0].markAllDirty();
+    }
     a.history.reset();
     a.opts.color = a.palette.current();
     a.demo = demo;

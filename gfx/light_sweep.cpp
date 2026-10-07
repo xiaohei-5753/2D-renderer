@@ -444,7 +444,15 @@ void LightSweep::renderLayer(int layer) {
     glUniform1f(uScan_.cp, st_.propagate);
     glUniform1f(uScan_.emitScale, st_.emitScale);
     glUniform1i(uScan_.layer, layer);
-    glUniform1i(uScan_.crossLayers, cross);
+    // 光场模型打开时**必须**关掉旧的层间耦合：否则每一层的受光里都含
+
+    // '其他层透过来的光'（emX），空图层也会有值 —— 层数一多，光场累加
+
+    // 就让画面越来越亮（实测新建空图层亮度持续变大）。
+
+    // 而且用户给的模型本来就是'每层做一轮**独立**的 2D 光追'。
+
+    glUniform1i(uScan_.crossLayers, (fieldStrength_ > 0.0f) ? 0 : cross);
     {
         const int maxrc = 2 * std::max(w_, h_) + 1;
         glDispatchCompute((GLuint)((maxrc + 255) / 256), 1, (GLuint)dirCount_);
@@ -481,7 +489,7 @@ void LightSweep::renderLayer(int layer) {
     glUniform2i(uBlend_.cs, w_, h_);
     glUniform1f(uBlend_.emitScale, st_.emitScale);
     glUniform1i(uBlend_.layer, layer);
-    glUniform1i(uBlend_.crossLayers, cross);
+    glUniform1i(uBlend_.crossLayers, (fieldStrength_ > 0.0f) ? 0 : cross);
     // 注意：glBindImageTexture 的 layered=GL_TRUE 才能把 image2DArray 的
     // 所有层都暴露给着色器，否则只有 layer 0 可写。
     glBindImageTexture(0, litArray_, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA8);

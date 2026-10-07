@@ -34,9 +34,14 @@ struct RenderSettings {
     // --- 开关 ---
     bool shadows = true;
 
-    // --- 采样 ---
-    int samples = 1;          // 每像素主光采样数（>1 走软阴影）
-    float sunRadius = 0.0f;   // 主光角半径（0 = 硬阴影）
+    // --- 自发光体素当光源（重点）---
+    bool emissiveLights = true;   // 把 E>0 的体素当面光源采样
+    float emissiveIntensity = 1.0f;
+    int lightSamples = 4;         // 每像素每帧抽多少个光源
+
+    // --- 渐进累积 ---
+    bool progressive = true;      // 帧间累积平均（噪点随时间收敛）
+    int maxAccumFrames = 256;     // 累积多少帧后停（省 GPU/CPU）
 };
 
 // +z 面的 3D 光追渲染器
@@ -49,8 +54,15 @@ public:
 
     virtual void setSettings(const RenderSettings& s) = 0;
 
-    // 渲染：out 会 resize 成 X*Y，元素为 RGBA8（alpha 恒 255）
+    // 渲染：out 会 resize 成 X*Y，元素为 RGBA8（alpha 恒 255）。
+    // progressive 打开时，反复调用会逐步收敛；几何/参数变了要先 resetAccumulation()。
     virtual void render(std::vector<RGBA8>& out) = 0;
+
+    // 几何或光照参数变了：丢掉累积，重新开始收敛
+    virtual void resetAccumulation() = 0;
+
+    // 已累积的帧数（UI 显示进度用）
+    virtual int accumFrames() const = 0;
 
     // 供 UI 显示用的统计
     virtual double lastMs() const = 0;

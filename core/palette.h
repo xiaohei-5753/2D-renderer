@@ -61,6 +61,18 @@ public:
         return RGBA8{m.r, m.g, m.b, m.a};
     }
 
+    // 换预设后调用：材质回到"本项颜色 + 不发光 + 全不透明"的干净默认值。
+    // 不做的话 mats_ 会残留上一个色板的材质，挂到新颜色上。
+    void resetMats() {
+        mats_.assign(colors_.size(), Mat7{});
+        for (size_t i = 0; i < mats_.size() && i < colors_.size(); i++) {
+            mats_[i].r = colors_[i].r;
+            mats_[i].g = colors_[i].g;
+            mats_[i].b = colors_[i].b;
+            mats_[i].a = 255;
+        }
+    }
+
     int size() const { return (int)colors_.size(); }
     bool empty() const { return colors_.empty(); }
     RGBA8 color(int i) const;

@@ -666,6 +666,7 @@ void drawPaletteSection(App& a) {
             std::snprintf(label, sizeof(label), "%s  (%d 色)", p.name, p.count);
             if (ImGui::Selectable(label, selected)) {
                 a.palette.loadPreset(i);
+                a.palette.resetMats();
                 actSetPaletteColor(a, 0);
                 a.lastAction = std::string("色板 ") + a.palette.presetName();
             }
@@ -693,12 +694,27 @@ void drawPaletteSection(App& a) {
                       ImGuiChildFlags_None);
     for (int i = 0; i < n; i++) {
         const RGBA8 c = a.palette.color(i);
-        char tip[64];
-        std::snprintf(tip, sizeof(tip), "#%02X%02X%02X", c.r, c.g, c.b);
+        const Palette::Mat7& m = a.palette.mat(i);
+        const int em = std::max(m.eR, std::max(m.eG, m.eB));
+        // tooltip 直接把 7 个分量都列出来，用户不用猜这一项带什么材质
+        char tip[128];
+        std::snprintf(tip, sizeof(tip), "#%02X%02X%02X   a=%d   发光=(%d,%d,%d)", c.r, c.g,
+                      c.b, m.a, m.eR, m.eG, m.eB);
         ImGui::PushID(i);
-        if (ui::colorSwatch("sw", IM_COL32(c.r, c.g, c.b, 255), ImVec2(sw, sw),
+        // 色块按**真实 alpha** 画：半透明的项一眼看出来
+        if (ui::colorSwatch("sw", IM_COL32(c.r, c.g, c.b, m.a), ImVec2(sw, sw),
                             i == a.palette.currentIndex(), tip)) {
             actSetPaletteColor(a, i);
+        }
+        // 发光标记：右上角一个小圆点，亮度越高越亮
+        if (em > 0) {
+            const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+            const float rr = (mx.x - mn.x) * 0.17f;
+            const ImVec2 ctr(mx.x - rr * 1.5f, mn.y + rr * 1.5f);
+            const int gv = std::min(255, 110 + em / 2);
+            ImGui::GetWindowDrawList()->AddCircleFilled(ctr, rr, IM_COL32(gv, gv, 255, 255));
+            ImGui::GetWindowDrawList()->AddCircle(ctr, rr, IM_COL32(20, 20, 24, 220), 0,
+                                                  a.ui(1.0f));
         }
         ImGui::PopID();
         if (((i + 1) % perRow) != 0 && i + 1 < n) ImGui::SameLine(0.0f, gap);
@@ -1016,6 +1032,16 @@ void drawMaterialSection(App& a) {
         a.opts.color = a.cursorColor;
         a.opts.material = a.cursorMaterial;
         pushRecentColor(a, a.opts.color);
+        // 吸到的颜色+材质写回当前色板项：色板是唯一真相
+        {
+            const int pi = a.palette.currentIndex();
+            Palette::Mat7 mm = a.palette.mat(pi);
+            mm.r = a.opts.color.r; mm.g = a.opts.color.g; mm.b = a.opts.color.b;
+            mm.a = a.opts.color.a;
+            mm.eR = a.opts.material.emR; mm.eG = a.opts.material.emG;
+            mm.eB = a.opts.material.emB;
+            a.palette.setMat(pi, mm);
+        }
         a.lastAction = "已吸取材质";
     }
     ImGui::TextDisabled("也可以直接用取色器工具（K）在画布上点");

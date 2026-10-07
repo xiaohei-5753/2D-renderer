@@ -52,6 +52,8 @@ uniform vec2  u_sunDir;       // 太阳方向（xy 平面上的单位向量）
 uniform float u_sunSc;        // 太阳角大小（1 - dot <= sunSc 判为太阳）
 uniform float u_emitScale;
 uniform int   u_zRate;        // 每走 1 个水平像素，z 上升多少
+uniform int   u_jitter;       // 方向抖动幅度：把采样晶格打散成噪声
+uniform int   u_sampleSeed;   // 每帧变化的样本种子
 layout(rgba8,binding=0)writeonly uniform image2D u_out;
 
 // 体素中心采样（越界返回 0）
@@ -62,6 +64,13 @@ vec4 fetchVox(ivec3 p){
 vec3 fetchEmit(ivec3 p){
   if(p.x<0||p.y<0||p.z<0||p.x>=u_size.x||p.y>=u_size.y||p.z>=u_size.z) return vec3(0.0);
   return texelFetch(u_emit,p,0).rgb*u_emitScale;
+}
+
+// 便宜的整数 hash：给每个像素/每条射线一个稳定的伪随机数
+uint hash3(uint a, uint b, uint c){
+  uint h=a*374761393u + b*668265263u + c*2246822519u;
+  h=(h^(h>>13))*1274126177u;
+  return h^(h>>16);
 }
 
 // 3D 整数步进（DDA）：沿 (dx,dy,dz) 一步一步走，每步只前进"最短的那一维"一格。
@@ -150,14 +159,37 @@ void main(){
   while(x<y){
     // 竖直爬升：从 1 层到 (Z-1) 层，覆盖所有可能的仰角
     for(int dz=1; dz<u_size.z; dz++){
-      sum+=castRay(p,  x,  y, dz); ++cnt;
-      sum+=castRay(p, -x,  y, dz); ++cnt;
-      sum+=castRay(p,  x, -y, dz); ++cnt;
-      sum+=castRay(p, -x, -y, dz); ++cnt;
-      sum+=castRay(p,  y,  x, dz); ++cnt;
-      sum+=castRay(p, -y,  x, dz); ++cnt;
-      sum+=castRay(p,  y, -x, dz); ++cnt;
-      sum+=castRay(p, -y, -x, dz); ++cnt;
+      // 方向抖动：把整数格线的采样晶格打散。
+      //
+      // 不做抖动时，(dx,dy,dz) 都是小整数，射线只能沿有限的几族整数格线走；
+      // 相邻方向的射线在远处会跳过好几个体素，于是"能打到光源"与"打不到"
+      // 交替出现 —— 累加起来就是明显的带状条纹。
+      // 抖动后这些条纹变成不相关的噪声，视觉上就消失了。
+      const int J=u_jitter;
+      int j1=0,j2=0,j3=0,j4=0,j5=0,j6=0,j7=0,j8=0;
+      int k1=0,k2=0,k3=0,k4=0,k5=0,k6=0,k7=0,k8=0;
+      if(J>0){
+        const uint hs=hash3(uint(q.x),uint(q.y),uint(u_sampleSeed)+uint(dz));
+        j1=int(hs%uint(2*J+1))-J;  k1=int((hs>>8)%uint(2*J+1))-J;
+        j2=int((hs>>16)%uint(2*J+1))-J; k2=int((hs>>24)%uint(2*J+1))-J;
+        const uint hs2=hash3(uint(q.y)+7777u,uint(q.x),uint(u_sampleSeed)*3u+uint(dz)*31u);
+        j3=int(hs2%uint(2*J+1))-J; k3=int((hs2>>8)%uint(2*J+1))-J;
+        j4=int((hs2>>16)%uint(2*J+1))-J; k4=int((hs2>>24)%uint(2*J+1))-J;
+        const uint hs3=hash3(uint(q.x)*5u,uint(q.y)*7u,uint(u_sampleSeed)+uint(dz)*97u);
+        j5=int(hs3%uint(2*J+1))-J; k5=int((hs3>>8)%uint(2*J+1))-J;
+        j6=int((hs3>>16)%uint(2*J+1))-J; k6=int((hs3>>24)%uint(2*J+1))-J;
+        const uint hs4=hash3(uint(q.x)*11u,uint(q.y)*13u,uint(u_sampleSeed)*7u+uint(dz)*131u);
+        j7=int(hs4%uint(2*J+1))-J; k7=int((hs4>>8)%uint(2*J+1))-J;
+        j8=int((hs4>>16)%uint(2*J+1))-J; k8=int((hs4>>24)%uint(2*J+1))-J;
+      }
+      sum+=castRay(p,  x+j1,  y+k1, dz); ++cnt;
+      sum+=castRay(p, -x+j2,  y+k2, dz); ++cnt;
+      sum+=castRay(p,  x+j3, -y+k3, dz); ++cnt;
+      sum+=castRay(p, -x+j4, -y+k4, dz); ++cnt;
+      sum+=castRay(p,  y+j5,  x+k5, dz); ++cnt;
+      sum+=castRay(p, -y+j6,  x+k6, dz); ++cnt;
+      sum+=castRay(p,  y+j7, -x+k7, dz); ++cnt;
+      sum+=castRay(p, -y+j8, -x+k8, dz); ++cnt;
     }
     ++x;
     if(m<0) m+=2*x+1; else { --y; m+=2*(x-y)+1; }
@@ -276,6 +308,8 @@ bool DzTrace::render(const DzTraceParams& prm) {
     glUniform1f(glGetUniformLocation(prog_, "u_emitScale"), prm.emitScale);
     int zRate = prm.zRate;   // 允许 0：那是诊断模式
     glUniform1i(glGetUniformLocation(prog_, "u_zRate"), zRate);
+    glUniform1i(glGetUniformLocation(prog_, "u_jitter"), std::max(0, prm.jitter));
+    glUniform1i(glGetUniformLocation(prog_, "u_sampleSeed"), prm.sampleSeed);
     glBindImageTexture(0, outTex_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glDispatchCompute((GLuint)((X_ + 7) / 8), (GLuint)((Y_ + 7) / 8), 1);
     glMemoryBarrier(GL_ALL_BARRIER_BITS);

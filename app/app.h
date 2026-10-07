@@ -61,7 +61,7 @@ struct App {
     gfx::GLContext* ctx = nullptr;
     gfx::LightSweep* sweep = nullptr;
     gfx::PathTrace* pt = nullptr;
-    gfx::DzTrace* dz = nullptr;          // 2.5D 光线追踪（柱顶曲面 + 上半球辐照度）
+
     gfx::Viewport* vp = nullptr;
 
     // --- 图层面板 ---
@@ -88,9 +88,10 @@ struct App {
     bool lightDirty = true;
     float lightMs = 0.0f;
     // --- 2.5D 光追参数 ---
-    float dz25Radius = 24.0f;      // 方向集合半径：越大光晕越铺开、越慢
+    float dz25Radius = 96.0f;      // 只收这个半径内的发光体素（0 = 不限）
     float dz25Sun = 0.35f;         // 天光（太阳）强度
     float dz25EmitScale = 1.0f;    // 自发光倍率
+    float dz25Gain = 8.0f;         // 辐照度增益（朗伯权重 cosθ/r² 的缩放）
     bool dz25Dirty = true;
 
     // --- 视图选项 ---

@@ -1113,12 +1113,19 @@ void drawLightingSection(App& a) {
         // ---- 2.5D 光追的专属参数 ----
         ImGui::SeparatorText("2.5D 光追");
         float r = a.dz25Radius;
-        if (ui::labeledSliderFloat("dz25r", &r, 4.0f, 96.0f, "方向半径", "%.0f")) {
+        if (ui::labeledSliderFloat("dz25r", &r, 8.0f, 320.0f, "作用半径", "%.0f")) {
             a.dz25Radius = r;
             a.dz25Dirty = true;
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("方向集合半径：越大光晕铺得越开，也越慢");
+            ImGui::SetTooltip("只收这个半径内的发光体素（1/r³ 让远处贡献迅速变得无关紧要）");
+        float g2 = a.dz25Gain;
+        if (ui::labeledSliderFloat("dz25gain", &g2, 0.5f, 40.0f, "辐照度增益", "%.1f")) {
+            a.dz25Gain = g2;
+            a.dz25Dirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("光晕整体亮度。太大时高光会被归一化压成纯白");
         float sun = a.dz25Sun;
         if (ui::labeledSliderFloat("dz25sun", &sun, 0.0f, 1.0f, "天光强度")) {
             a.dz25Sun = sun;
@@ -1130,7 +1137,7 @@ void drawLightingSection(App& a) {
             a.dz25EmitScale = es;
             a.dz25Dirty = true;
         }
-        ImGui::TextDisabled("图层 = z 层，上层的光会照亮下层柱顶");
+        ImGui::TextDisabled("图层 = z 层；解析 gather，无方向采样 -> 无条带");
     } else if (a.pt) {
         ImGui::SeparatorText("路径追踪");
         gfx::PathTraceSettings& s = a.pt->settings();

@@ -62,22 +62,37 @@ void main(){
   if(p.x>=u_cs.x||p.y>=u_cs.y)return;
 
   vec3 acc=u_backdrop;
-  // 上方所有层的光场之和。自下而上遍历时每层减掉自己，gabove 就正好是
-  // "第 i 层**上方**所有层的光场"。
+  // ---- 光场模型（用户给的规格）----
+  //
+  //   L_i = 第 i 层的光场：只含光、**不含原始像素**（就是 2D 光追图里空气像素
+  //         的颜色），并把环境光减掉
+  //   自下而上 F_i = Σ_{k>=i} L_k     "Ln 与 Ln-1 相加得到更下层的光场"
+  //   C_i = A_i × F_i                  "A_{n-1} × Ln"
+  //   result = C_i 按透明度覆盖 result  "通过透明度覆盖或半覆盖"
+  //
+  // 环境光：每层的光场里都含了一份环境光，n 层相加就会过曝 n 倍。
+  // 所以这里从每层光场里减掉环境光，最后只在 C_i 里加一次
+  // （等价于你说的"每层环境光 1/n"，但不会过曝）。
   vec3 gtotal=vec3(0.0);
-  // 光场 = 各层**空气像素**的颜色（去掉环境光）。
-  // 空气像素的 rgb 就是这一层洒出来的光晕（alpha=0 但 rgb 有值），
-  // 也就是 2D 光追那张渲染图里"没有实体像素"的区域 —— 不需要另建纹理。
-  if(u_fieldStrength>0.0){for(int i=0;i<u_n;i++){vec4 L=texelFetch(u_tex,ivec3(p,i),0);
-    gtotal+=max(vec3(0.0),L.rgb-u_backdrop)*(1.0-clamp(L.a,0.0,1.0));}}
-  vec3 gabove=gtotal;
+  if(u_fieldStrength>0.0){
+    for(int i=0;i<u_n;i++){
+      vec4 L=texelFetch(u_tex,ivec3(p,i),0);
+      gtotal+=max(vec3(0.0),L.rgb-u_backdrop)*(1.0-clamp(L.a,0.0,1.0));
+    }
+  }
+  vec3 Ftot=gtotal;
   for(int i=0;i<u_n;i++){
     vec4 c=texelFetch(u_tex,ivec3(p,i),0);
     float op=texelFetch(u_opacity,ivec3(p,i),0).r;
     if(u_fieldStrength>0.0){
-      gabove-=max(vec3(0.0),c.rgb-u_backdrop)*(1.0-clamp(c.a,0.0,1.0));
-      // 乘法叠加：光场乘到这一层的颜色上（没有光时是 1.0，颜色不变）
-      c.rgb*=(1.0+gabove*u_fieldStrength);
+      // 这一层的颜色 = 原始颜色 A_i × 累计光场 F_i
+      vec3 A=texelFetch(u_albedo,ivec3(p,i),0).rgb;
+      vec3 C=A*(Ftot*u_fieldStrength+u_backdrop);
+      float a=clamp(c.a,0.0,1.0)*op;
+      acc=mix(acc,C,a);                       // 覆盖 / 半覆盖
+      // 本层光场继续往下传（"Ln 与 Ln-1 相加"）
+      Ftot-=max(vec3(0.0),c.rgb-u_backdrop)*(1.0-clamp(c.a,0.0,1.0));
+      continue;
     }
     if(op<=0.0)continue;
     if(u_albedoAsOpaque!=0){

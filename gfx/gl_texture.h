@@ -11,6 +11,10 @@ namespace pb::gfx {
 // （像素画必须 NEAREST，否则缩放会糊）
 GLuint createTexture(GLenum internalFormat, int w, int h, GLenum format, GLenum type);
 
+// 分配一张不可变尺寸的 3D 纹理（2.5D 光追的体素空间用），同样 NEAREST + CLAMP。
+GLuint createTexture3D(GLenum internalFormat, int w, int h, int d, GLenum format,
+                       GLenum type);
+
 // 带 mip 层数的纹理（用 glTexStorage2D 分配）
 GLuint createTextureWithStorage(GLenum internalFormat, int w, int h, int levels);
 

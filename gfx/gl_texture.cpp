@@ -19,6 +19,23 @@ GLuint createTexture(GLenum internalFormat, int w, int h, GLenum format, GLenum 
     glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
 }
+// 3D 纹理：体素空间用。参数与 createTexture 一致，只是多一维深度。
+GLuint createTexture3D(GLenum internalFormat, int w, int h, int d, GLenum format,
+                       GLenum type) {
+    if (w <= 0 || h <= 0 || d <= 0) return 0;
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_3D, tex);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage3D(GL_TEXTURE_3D, 0, (GLint)internalFormat, w, h, d, 0, format, type, nullptr);
+    glBindTexture(GL_TEXTURE_3D, 0);
+    return tex;
+}
 
 GLuint createTextureWithStorage(GLenum internalFormat, int w, int h, int levels) {
     if (levels < 1) levels = 1;

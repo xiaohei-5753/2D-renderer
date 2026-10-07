@@ -1120,12 +1120,19 @@ void drawLightingSection(App& a) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("只收这个半径内的发光体素（1/r³ 让远处贡献迅速变得无关紧要）");
         float g2 = a.dz25Gain;
-        if (ui::labeledSliderFloat("dz25gain", &g2, 0.5f, 40.0f, "辐照度增益", "%.1f")) {
+        if (ui::labeledSliderFloat("dz25gain", &g2, 0.1f, 20.0f, "辐照度增益", "%.2f")) {
             a.dz25Gain = g2;
             a.dz25Dirty = true;
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("光晕整体亮度。太大时高光会被归一化压成纯白");
+        float fo = a.dz25Falloff;
+        if (ui::labeledSliderFloat("dz25fo", &fo, 0.5f, 3.0f, "距离衰减", "%.2f")) {
+            a.dz25Falloff = fo;
+            a.dz25Dirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("1 = 1/r（2D 泛光，铺得开）；2 = 1/r²（物理平方反比，衰减快、光晕窄）");
         float sun = a.dz25Sun;
         if (ui::labeledSliderFloat("dz25sun", &sun, 0.0f, 1.0f, "天光强度")) {
             a.dz25Sun = sun;

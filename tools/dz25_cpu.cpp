@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/dz25.h"
+#include "core/dz25slice.h"
 #include "core/image.h"
 #include "core/voxel.h"
 
@@ -19,6 +20,7 @@ using namespace pb;
 int main(int argc, char** argv) {
     int W = 320, H = 180, Z = 4, S = 1, radius = 64;
     float emit = 1.0f;
+    int baseA = 110;
     float gain = 400.0f;
     float amb = 0.0f;
     std::string out = "out/dz25cpu";
@@ -37,6 +39,7 @@ int main(int argc, char** argv) {
         else if (a == "--emit") emit = (float)std::atof(next().c_str());
         else if (a == "--amb") amb = (float)std::atof(next().c_str());
         else if (a == "--gain") gain = (float)std::atof(next().c_str());
+        else if (a == "--basea") baseA = std::atoi(next().c_str());
         else if (a == "--out") out = next();
     }
 
@@ -44,7 +47,8 @@ int main(int argc, char** argv) {
     g.init(W, H, Z);
     // z=0：中灰受光面
     for (int y = 0; y < H; y++)
-        for (int x = 0; x < W; x++) g.at(x, y, 0).color = RGBA8{128, 128, 132, 255};
+        for (int x = 0; x < W; x++)
+            g.at(x, y, 0).color = RGBA8{128, 128, 132, (uint8_t)baseA};
     // z=Z-1：粉色发光竖线
     const int lx = W / 2;
     for (int y = (int)(H * 0.20f); y < (int)(H * 0.85f); y++) {
@@ -53,16 +57,25 @@ int main(int argc, char** argv) {
         v.mat.setEmissionFrom(255, 90, 160);
     }
 
-    Dz25Params prm;
-    prm.radius = 0;
-    prm.ambientOn = (amb > 0.0f);
-    prm.ambient[0] = prm.ambient[1] = prm.ambient[2] = amb;
-    prm.emitScale = emit;
-    prm.gain = gain;
-    prm.radius = 64;
-
     std::vector<RGBA8> px;
-    trace25D(g, prm, px);
+    if (getenv("PB_SLICE")) {
+        // 新方案：截面 + 「顶边→底边」斜线扫描
+        Dz25SliceParams sp;
+        sp.ambientOn = (amb > 0.0f);
+        sp.ambient[0] = sp.ambient[1] = sp.ambient[2] = amb;
+        sp.emitScale = emit;
+        sp.directions = 4;
+        trace25DSlice(g, sp, px);
+    } else {
+        // 旧方案：解析 gather（作为对照）
+        Dz25Params prm;
+        prm.radius = radius;
+        prm.ambientOn = (amb > 0.0f);
+        prm.ambient[0] = prm.ambient[1] = prm.ambient[2] = amb;
+        prm.emitScale = emit;
+        prm.gain = gain;
+        trace25D(g, prm, px);
+    }
 
     Image img(W, H);
     for (int i = 0; i < W * H; i++) img.data()[i] = px[(size_t)i];

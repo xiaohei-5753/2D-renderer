@@ -88,10 +88,11 @@ struct App {
     bool lightDirty = true;
     float lightMs = 0.0f;
     // --- 2.5D 光追参数 ---
-    float dz25Radius = 96.0f;      // 只收这个半径内的发光体素（0 = 不限）
+    float dz25Radius = 96.0f;      // 只收这个半径内的发光体素
     float dz25Sun = 0.35f;         // 天光（太阳）强度
     float dz25EmitScale = 1.0f;    // 自发光倍率
-    float dz25Gain = 8.0f;         // 辐照度增益（朗伯权重 cosθ/r² 的缩放）
+    float dz25Gain = 1.0f;         // 辐照度增益
+    float dz25Falloff = 1.0f;      // 距离衰减指数（1 = 1/r，铺得开）
     bool dz25Dirty = true;
 
     // --- 视图选项 ---

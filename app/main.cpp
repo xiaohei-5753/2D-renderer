@@ -245,6 +245,7 @@ int main(int argc, char** argv) {
     app::LightMode startMode = app::LightMode::Sweep;
     float startDzRadius = 96.0f;   // --dz-radius：2.5D 作用半径
     float startDzSun = 0.35f;      // --dz-sun：2.5D 天光
+    float startDzGain = 1.0f;      // --dz-gain：辐照度增益
     std::string outFile;
     std::string forceOpen, forceClosed;
     std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
@@ -279,6 +280,8 @@ int main(int argc, char** argv) {
             startDzRadius = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--dz-sun" && i + 1 < argCount) {
             startDzSun = (float)std::atof(args[(size_t)++i].c_str());
+        } else if (arg == "--dz-gain" && i + 1 < argCount) {
+            startDzGain = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--visible") {
             forceVisible = true;
         } else if (arg == "--hidden") {
@@ -319,6 +322,7 @@ int main(int argc, char** argv) {
     a.lightMode = startMode;
     a.dz25Radius = startDzRadius;
     a.dz25Sun = startDzSun;
+    a.dz25Gain = startDzGain;
 
     // 自动化/回归用：直接切到某一套色板（例如 NES 55 色，验证色块网格的自动换行）
     if (paletteIndex >= 0) {
@@ -505,10 +509,17 @@ int main(int argc, char** argv) {
                     Dz25Params dp;
                     dp.emitScale = a.dz25EmitScale;
                     dp.gain = a.dz25Gain;
+                    dp.falloff = a.dz25Falloff;
                     dp.radius = (int)a.dz25Radius;   // 只收这个半径内的发光体素
                     dp.ambientOn = a.dz25Sun > 0.0f;
                     dp.ambient[0] = dp.ambient[1] = dp.ambient[2] = a.dz25Sun;
                     trace25D(voxGrid, dp, dz25Px);
+                    if (getenv("PB_DZDUMP")) {
+                        Image di(cw, ch);
+                        for (int i = 0; i < cw * ch; i++) di.data()[i] = dz25Px[(size_t)i];
+                        writePNG("out/dz25_app_out.png", di);
+                        fprintf(stderr, "[app] 2.5D 输出已写出 out/dz25_app_out.png\\n");
+                    }
                     glBindTexture(GL_TEXTURE_2D, dz25Tex);
                     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cw, ch, GL_RGBA,

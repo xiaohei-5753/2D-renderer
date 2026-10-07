@@ -39,6 +39,9 @@ struct Dz25Params {
     int radius = 0;
     // 辐照度增益：把朗伯权重 cosθ/r² 缩放到与方向采样版本相近的亮度。
     float gain = 400.0f;
+    // 距离衰减指数：2 = 1/r²（物理平方反比，衰减快、光晕窄）；
+    // 1 = 1/r（2D 泛光惯例，铺得开）。像素画要的是后者。
+    float falloff = 1.0f;
     // 出界天光：解析版里天光就是"环境项"，直接加在辐照度上（可选）。
     bool ambientOn = false;
     float ambient[3] = {0.0f, 0.0f, 0.0f};

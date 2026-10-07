@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <string>
 
 #ifdef _WIN32
@@ -59,24 +60,125 @@ int g_newW = 320, g_newH = 180;
 std::string g_forceOpen;
 std::string g_forceClosed;
 
-bool sectionOpen(const char* name, bool defaultOpen) {
+// ⚠️ 强制状态只能**施加一次**，不能每帧都施加。
+//
+// 这里踩过一个很难看的坑：一开始用的是
+//     ImGui::SetNextItemOpen(..., ImGuiCond_Always);
+// 结果**面板再也点不开了** —— Always 的含义是"每一帧都把状态设成这个值"，
+// 用户点一下展开，下一帧立刻被按回去，表现就是点击完全没反应。
+// 而且默认折叠的「材质」分区首当其冲（它的默认值就是 false），
+// 于是具体症状就是"点材质栏无法展开"。
+//
+// 正确做法：只在**第一次**施加，之后完全交给 ImGui（它会把用户的选择存进 .ini）。
+// 用户若想下次仍强制，再传一次 --open / --close 即可。
+std::set<std::string> g_forcedOnce;
+
+// 每个分区标题栏的屏幕矩形（配合 scripts/collapse_test.ps1 之类做自动点击验证）。
+// 记录它几乎不花代价，但换来"折叠交互可以被自动化证明"，很值。
+struct HeaderRect {
+    std::string name;
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    bool open = false;
+};
+std::vector<HeaderRect> g_headers;
+
+bool sectionOpen(const char* name, bool defaultOpen, bool& alreadyForced) {
     const std::string n = name;
-    if (!g_forceOpen.empty() && g_forceOpen.find(n) != std::string::npos) return true;
-    if (!g_forceClosed.empty() && g_forceClosed.find(n) != std::string::npos) return false;
+    alreadyForced = g_forcedOnce.count(n) > 0;
+    if (alreadyForced) return defaultOpen;   // 本轮不再干预
+    bool v = defaultOpen;
+    if (!g_forceOpen.empty() && g_forceOpen.find(n) != std::string::npos) v = true;
+    else if (!g_forceClosed.empty() && g_forceClosed.find(n) != std::string::npos) v = false;
+    return v;
+}
+
+// 记录上一次 CollapsingHeader 的矩形（必须在它之后立刻调用）。
+// 展开状态由调用方传入 —— ImGui 没有"查询上一个 Tree 节点是否展开"的公开 API，
+// 但 CollapsingHeader 的返回值本身就是它，直接拿来用即可。
+void recordHeader(const char* name, bool open) {
+    HeaderRect h;
+    h.name = name;
+    const ImVec2 mn = ImGui::GetItemRectMin();
+    const ImVec2 mx = ImGui::GetItemRectMax();
+    h.x0 = mn.x;
+    h.y0 = mn.y;
+    h.x1 = mx.x;
+    h.y1 = mx.y;
+    h.open = open;
+    g_headers.push_back(h);
+}
+
+// 分区标题栏的提交。返回"默认是否展开"，调用方拿去当 CollapsingHeader 的 flags。
+//
+// ## 这里踩过一个很难看、也很典型的坑（用户报了"点材质栏无法展开"）
+//
+// 第一版为了给「材质」一个"默认折叠"的初始状态，每帧都调
+//     ImGui::SetNextItemOpen(open, ImGuiCond_Always);
+// 结果**所有分区都点不动了** —— Always 的含义是"每一帧都把状态设成这个值"，
+// 用户点一下展开，下一帧立刻被按回去，表现就是点击完全没反应。
+// 「材质」默认是折叠的，所以症状最明显：它永远展不开。
+//
+// 正确的做法是**不主动设置状态**，而是用 ImGui 自己的
+// `ImGuiTreeNodeFlags_DefaultOpen`：它只在"用户还没有做过选择"时生效，
+// 用户一旦点过（或被 .ini 记住过）就完全由用户说了算。
+// `--open` / `--close` 也只在**第一次**提交那个分区时施加一次，之后不干预。
+//
+// 顺带说清另一个写法上的坑：`if (ImGui::CollapsingHeader(...))` 里
+// CollapsingHeader **每一帧都必须调用**（它的返回值才是展开状态）。
+// 写成 `if (open) CollapsingHeader(...)` 会让折叠后的控件再也不被提交，
+// 状态永远翻不回来。
+bool sectionHeader(const char* name, bool defaultOpen) {
+    bool already = false;
+    const bool forced = sectionOpen(name, defaultOpen, already);
+    if (!already) {
+        g_forcedOnce.insert(name);
+        // 只有用户显式传了 --open / --close（forced 与默认值不一致）时才需要
+        // 主动设一次初始状态，而且只设一次。
+        if (forced != defaultOpen) ImGui::SetNextItemOpen(forced, ImGuiCond_Once);
+    }
+    // 默认展开交给 ImGuiTreeNodeFlags_DefaultOpen：它不会覆盖用户的选择
     return defaultOpen;
 }
 
-void sectionHeader(const char* name, bool defaultOpen) {
-    ImGui::SetNextItemOpen(sectionOpen(name, defaultOpen), ImGuiCond_Always);
+// 供 main 的自动点击验证使用。
+//
+// ⚠️ 关键：鼠标位置必须在 **ImGui::NewFrame() 之后**注入。
+// GLFW 后端在 NewFrame 里会发现鼠标不在窗口上（自动化跑的是隐藏窗口），
+// 于是拿真实光标位置去 AddMousePosEvent —— 把我们在 NewFrame 之前设的位置**冲掉**。
+// 这也正是第一版脚本点击"派发了但 hovered=0"的原因。
+bool sectionHeaderRect(const char* name, float& cx, float& cy) {
+    for (const HeaderRect& h : g_headers) {
+        if (h.name != name) continue;
+        cx = (h.x0 + h.x1) * 0.5f;
+        cy = (h.y0 + h.y1) * 0.5f;
+        return true;
+    }
+    return false;
+}
+
+bool sectionHeaderOpen(const char* name) {
+    for (const HeaderRect& h : g_headers)
+        if (h.name == name) return h.open;
+    return false;
 }
 
 }  // namespace
+
+// 上面两个函数的对外入口（见 panels.h 的说明）
+bool panelSectionPoint(const char* name, float& cx, float& cy) {
+    return sectionHeaderRect(name, cx, cy);
+}
+bool panelSectionOpen(const char* name) { return sectionHeaderOpen(name); }
+void beginPanelHeaderCapture() { g_headers.clear(); }
 
 // 见上面 g_forceOpen 的说明
 void setUiSections(const std::string& forceOpen, const std::string& forceClosed) {
     g_forceOpen = forceOpen;
     g_forceClosed = forceClosed;
+    g_forcedOnce.clear();   // 新的一轮强制
 }
+
+
 
 namespace {
 
@@ -519,21 +621,37 @@ void drawPropertiesPanel(App& a) {
     // 调一次 sectionHeader（不能抽成循环：中间还有 Spacing）。
     // 默认展开状态：材质分区参数最多、最长，默认折起来 ——
     // 否则右侧栏一开就要滚动才能看到「图层」，而图层是这一版的主角。
-    sectionHeader("调色板", true);
-    if (ImGui::CollapsingHeader("调色板")) drawPaletteSection(a);
+    //
+    // ⚠️ 注意 `if (...CollapsingHeader(...))` 这个写法：**每一帧都要调用**
+    // CollapsingHeader，它的返回值才是"是否展开"。不能写成
+    // `if (open) CollapsingHeader(...)` —— 那样一旦折叠就再也不提交这个控件，
+    // 状态永远无法翻转（同类的坑在 ImGui 里很常见）。
+    const bool palDefault = sectionHeader("调色板", true);
+    const bool palOpen = ImGui::CollapsingHeader(
+        "调色板", palDefault ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+    if (palOpen) drawPaletteSection(a);
+    recordHeader("调色板", palOpen);
     ImGui::Spacing();
-    sectionHeader("材质", false);
-    if (ImGui::CollapsingHeader("材质")) drawMaterialSection(a);
+    const bool matDefault = sectionHeader("材质", false);
+    const bool matOpen = ImGui::CollapsingHeader(
+        "材质", matDefault ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+    if (matOpen) drawMaterialSection(a);
+    recordHeader("材质", matOpen);
     ImGui::Spacing();
-    sectionHeader("光照", true);
-    if (ImGui::CollapsingHeader("光照")) drawLightingSection(a);
+    const bool lightDefault = sectionHeader("光照", true);
+    const bool lightOpen = ImGui::CollapsingHeader(
+        "光照", lightDefault ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+    if (lightOpen) drawLightingSection(a);
+    recordHeader("光照", lightOpen);
     ImGui::Spacing();
-    sectionHeader("图层", true);
-    if (ImGui::CollapsingHeader("图层")) drawLayerSection(a);
+    const bool layerDefault = sectionHeader("图层", true);
+    const bool layerOpen = ImGui::CollapsingHeader(
+        "图层", layerDefault ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+    if (layerOpen) drawLayerSection(a);
+    recordHeader("图层", layerOpen);
 
     ImGui::PopStyleVar();
 }
-
 void drawPaletteSection(App& a) {
     // ------------------------------------------------------------------
     // 1. 预设下拉

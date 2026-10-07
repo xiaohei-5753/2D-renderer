@@ -243,6 +243,8 @@ int main(int argc, char** argv) {
     app::LightMode startMode = app::LightMode::Sweep;
     std::string outFile;
     std::string forceOpen, forceClosed;
+    std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
+    int clickFrame = 10;   // 等布局稳定（右侧栏宽度会自适应，前几帧的矩形还在变）
 
     const int argCount = (int)args.size();
     for (int i = 1; i < argCount; i++) {
@@ -271,6 +273,8 @@ int main(int argc, char** argv) {
             forceVisible = true;
         } else if (arg == "--hidden") {
             forceHidden = true;
+        } else if (arg == "--click-section" && i + 1 < argCount) {
+            clickSection = args[(size_t)++i];
         } else if (arg == "--open" && i + 1 < argCount) {
             forceOpen = args[(size_t)++i];
         } else if (arg == "--close" && i + 1 < argCount) {
@@ -407,7 +411,44 @@ int main(int argc, char** argv) {
         app::handleNavigation(a);
 
         // --- 4. 构建 UI（顺带确定画布矩形）---
+        //
+        // 自动点击验证：`--click-section NAME` 会用**真实鼠标事件**点一下那个分区，
+        // 再打印它的展开状态。于是"点一下能不能折叠/展开"就成了可自动判定的事实
+        // —— 折叠交互靠截图是看不出来的（点过和没点长得一样）。
+        //
+        // 三个必须注意的时序问题（都踩过，逐一说明）：
+        //   1. 位置必须在 beginFrame **之后**注入：GLFW 后端在 NewFrame 里发现鼠标
+        //      不在窗口上（自动化跑的是隐藏窗口），会用真实光标位置把它冲掉。
+        //   2. 按键事件排到**下一帧**才生效（ImGui 在帧首统一处理事件队列）。
+        //   3. 取点必须在**按下前一帧**、并且在 drawUi **之后**取，而且那一刻要
+        //      先把鼠标移上去。否则取到的是布局还没稳定时的旧矩形 —— 我因此
+        //      点了半天都点不到：坐标落在分区的内容区而不是标题栏上
+        //      （表现为 hovered=0、anyHovered=1）。
+        //
+        // 时间线：clickFrame 悬停取点 -> +1 按下 -> +2 抬起 -> +3 读结果。
+        float pointX = 0.0f, pointY = 0.0f;
+        bool havePoint = false;
+        if (!clickSection.empty() && frameIndex >= clickFrame) {
+            havePoint = app::panelSectionPoint(clickSection.c_str(), pointX, pointY);
+        }
+        if (havePoint && frameIndex <= clickFrame + 2) {
+            // 这几帧都把鼠标摁在这个点上，别被后端的真实光标位置带跑
+            ImGui::GetIO().AddMousePosEvent(pointX, pointY);
+            if (frameIndex == clickFrame + 1) ImGui::GetIO().AddMouseButtonEvent(0, true);
+            if (frameIndex == clickFrame + 2) ImGui::GetIO().AddMouseButtonEvent(0, false);
+        }
+
+        app::beginPanelHeaderCapture();
         app::drawUi(a);
+
+        // 取点：在 drawUi 之后读这一帧的矩形，得到的是布局稳定后的位置
+        if (havePoint && frameIndex == clickFrame) {
+            app::panelSectionPoint(clickSection.c_str(), pointX, pointY);
+        }
+        if (!clickSection.empty() && frameIndex == clickFrame + 3) {
+            printf("[ui] 点击「%s」后，展开状态 = %d\n", clickSection.c_str(),
+                   app::panelSectionOpen(clickSection.c_str()) ? 1 : 0);
+        }
         // 图层面板的缩略图：等 UI 跑完再重建，这样这一帧显示的就是最新内容，
         // 而且不必让面板函数关心 GPU 资源
         app::uploadLayerThumbnails(a);

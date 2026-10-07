@@ -97,4 +97,16 @@ void requestNewCanvasDialog();
 // 截图里可能根本看不到。有了它就能稳定地把要验证的那一块放到画面里。
 void setUiSections(const std::string& forceOpen, const std::string& forceClosed);
 
+// --- 分区折叠的自动验证钩子 ---
+//
+// 折叠交互是"看不出来对不对"的典型：我只能靠截图，而截图里点过和没点长得一样。
+// 所以把分区标题栏的矩形暴露出来，让 main 用**真实鼠标事件**点它、再回读展开状态。
+// 这样"点材质无法展开"这类缺陷就能被自动证明／证伪，而不是靠人肉点。
+void beginPanelHeaderCapture();
+// 取某个分区标题栏的中心点（屏幕坐标）。返回是否找到了它。
+// 拿到点之后由调用方在 NewFrame 之后 io.AddMousePosEvent + 按下/抬起，
+// 顺序不能反（见 panels.cpp 里的说明）。
+bool panelSectionPoint(const char* name, float& cx, float& cy);
+bool panelSectionOpen(const char* name);
+
 }  // namespace pb::app

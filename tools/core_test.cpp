@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/canvas.h"
+#include "core/composite.h"
 #include "core/console.h"
 #include "core/history.h"
 #include "core/layer.h"
@@ -872,6 +873,95 @@ void testLayerMerge() {
     CHECK(!doc.mergeDown(5));
 }
 
+// ---------------------------------------------------------------------------
+// 测试：图层合成与层间光照通道
+// ---------------------------------------------------------------------------
+
+void testFlatten() {
+    section("多图层 / 压平合成");
+
+    Document doc(4, 4);
+    doc.layer(0).albedo.fill(RGBA8{200, 0, 0, 255});      // 底：不透明红
+    doc.layer(0).material.assign(16, Material{});
+    const int up = doc.addLayer("上");
+    doc.layer(up).albedo.fill(RGBA8{0, 0, 0, 0});         // 上：只一个半透明蓝像素
+    doc.layer(up).material.assign(16, Material{});
+    Material glow;
+    glow.setEmissionFrom(0, 200, 0);
+    doc.layer(up).albedo.at(2, 2) = RGBA8{0, 0, 200, 128};
+    doc.layer(up).materialAt(2, 2) = glow;
+
+    Image flat(4, 4);
+    std::vector<Material> mats(16);
+    flattenDocument(doc, flat, mats, Rect{0, 0, 3, 3});
+
+    CHECK(flat.at(0, 0) == (RGBA8{200, 0, 0, 255}));      // 未被覆盖：底层红
+    const RGBA8 m = flat.at(2, 2);
+    CHECK(m.a == 255);                                    // 半透明叠不透明 -> 不透明
+    CHECK(m.r > 0 && m.b > 0);                            // 红蓝都参与了混合
+    CHECK(mats[2 * 4 + 2].emG == 200);                    // 材质取最上层有覆盖者
+    CHECK(mats[0].emissionLevel() == 0);                  // 未覆盖处材质来自底层
+
+    // 隐藏图层不参与合成
+    doc.layer(up).visible = false;
+    flattenDocument(doc, flat, mats, Rect{0, 0, 3, 3});
+    CHECK(flat.at(2, 2) == (RGBA8{200, 0, 0, 255}));
+    CHECK(mats[2 * 4 + 2].emissionLevel() == 0);
+
+    // 整层不透明度 0 也不参与
+    doc.layer(up).visible = true;
+    doc.layer(up).opacity = 0;
+    flattenDocument(doc, flat, mats, Rect{0, 0, 3, 3});
+    CHECK(flat.at(2, 2) == (RGBA8{200, 0, 0, 255}));
+}
+
+void testLayerLightingChannels() {
+    section("多图层 / 层间光照通道（occlAbove 与 emitFor）");
+
+    Document doc(4, 4);
+    // 层 0：一个自发光绿像素
+    doc.layer(0).albedo.fill(RGBA8{0, 0, 0, 0});
+    doc.layer(0).material.assign(16, Material{});
+    Material green;
+    green.setEmissionFrom(0, 200, 0);
+    doc.layer(0).materialAt(1, 1) = green;
+
+    // 层 1：一个半透明像素（覆盖率 128）
+    const int mid = doc.addLayer("中");
+    doc.layer(mid).albedo.fill(RGBA8{0, 0, 0, 0});
+    doc.layer(mid).material.assign(16, Material{});
+    doc.layer(mid).albedo.at(1, 1) = RGBA8{10, 10, 10, 128};
+
+    // 层 2：全透明
+    doc.addLayer("上");
+
+    const Rect all{0, 0, 3, 3};
+    std::vector<uint8_t> occl;
+    std::vector<RGBA8> emit;
+
+    // --- occlAbove：第 1 层上方只有全透明的层 2 -> 0 ---
+    buildOcclAbove(doc, mid, all, occl);
+    CHECK(occl[1 * 4 + 1] == 0);
+    // 第 0 层上方有半透明的层 1 -> 约 128
+    buildOcclAbove(doc, 0, all, occl);
+    CHECK(occl[1 * 4 + 1] > 120 && occl[1 * 4 + 1] < 136);
+    // 未被任何东西盖住的像素 -> 0
+    CHECK(occl[0] == 0);
+
+    // --- emitFor：层 2 应当看到层 0 的绿光，但被层 1 衰减一半左右 ---
+    buildEmitFor(doc, 2, all, emit);
+    CHECK(emit[1 * 4 + 1].g > 90 && emit[1 * 4 + 1].g < 110);   // 200 * (1-0.502)
+    CHECK(emit[1 * 4 + 1].r == 0);
+    // 层 1 与层 0 紧邻，中间没有东西 -> 不衰减
+    buildEmitFor(doc, mid, all, emit);
+    CHECK(emit[1 * 4 + 1].g == 200);
+    // 层 0 自己不该把自己的光算进"其他层"的来源
+    buildEmitFor(doc, 0, all, emit);
+    CHECK(emit[1 * 4 + 1].g == 0);
+    // 没有发光体的位置 -> 0
+    CHECK(emit[0].g == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -902,6 +992,8 @@ int main() {
     testResize();
     testDocument();
     testLayerMerge();
+    testFlatten();
+    testLayerLightingChannels();
 
     printf("\n========================================\n");
     printf("通过 %d，失败 %d\n", g_pass, g_fail);

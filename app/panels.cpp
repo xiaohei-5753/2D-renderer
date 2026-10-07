@@ -283,11 +283,11 @@ void actSetTool(App& a, ToolId t) { a.opts.tool = t; }
 void actSetPaletteColor(App& a, int index) {
     a.palette.setCurrent(index);
     const RGBA8 c = a.palette.current();
-    // 色板只提供 albedo 的 RGB。遮挡 alpha 是独立的笔刷属性，这里刻意**不**覆盖它，
-    // 否则每次点色板都会把用户设好的半透明度重置掉。
-    a.opts.color.r = c.r;
-    a.opts.color.g = c.g;
-    a.opts.color.b = c.b;
+    // 色板项 = **7 维材质**（颜色 RGB + 自发光 RGB + 透明度）。
+    // 选色 = 同时选定这一笔要用的颜色与材质，不再有"色板和材质两套东西"的困惑。
+    const Palette::Mat7& m = a.palette.mat(index);
+    a.opts.color = RGBA8{c.r, c.g, c.b, m.a};
+    a.opts.material.setEmissionFrom(m.eR, m.eG, m.eB);
     pushRecentColor(a, a.opts.color);
 }
 
@@ -824,6 +824,9 @@ void applyMaterialPreset(App& a, int i) {
 
 void drawMaterialSection(App& a) {
     Material& m = a.opts.material;
+    // 交给下面那些控件改；本函数末尾会把结果写回**当前色板项**，
+    // 这样每个色板项记住自己的材质（改完再点回来还是这套）。
+    const int palIdx = a.palette.currentIndex();
     RGBA8& col = a.opts.color;
 
     // ------------------------------------------------------------------
@@ -1016,6 +1019,20 @@ void drawMaterialSection(App& a) {
         a.lastAction = "已吸取材质";
     }
     ImGui::TextDisabled("也可以直接用取色器工具（K）在画布上点");
+
+    // 把这一轮编辑的结果写回**当前色板项**：色板项 = 7 维材质，
+    // 所以每个色板项记住自己的颜色/自发光/透明度，点回来还是这套。
+    {
+        Palette::Mat7 mm = a.palette.mat(palIdx);
+        mm.r = a.opts.color.r;
+        mm.g = a.opts.color.g;
+        mm.b = a.opts.color.b;
+        mm.a = a.opts.color.a;
+        mm.eR = a.opts.material.emR;
+        mm.eG = a.opts.material.emG;
+        mm.eB = a.opts.material.emB;
+        a.palette.setMat(palIdx, mm);
+    }
 }
 
 void drawLightingSection(App& a) {

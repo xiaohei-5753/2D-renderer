@@ -1,9 +1,9 @@
 // gfx/path_trace.cpp
 //
 // 每个像素每帧只投 1 条射线，靠时间累积收敛（见头文件里"怎么做到实时"的说明）。
-// 表面交互按材质权重在三者之间**显式选一个**（而不是全部叠加），
+// 表面交互按材质权重在二者之间**显式选一个**（而不是全部叠加），
 // 这样每次弹射只走一条路径，每帧成本固定且与材质复杂度无关：
-//   镜面反射 / 折射 / 漫反射
+//   折射 / 漫反射
 #include "path_trace.h"
 
 #include <algorithm>
@@ -80,25 +80,14 @@ void main(){
   // 收集到的入射辐照度再乘自己的 albedo（见循环之后的处理）。
   float cov0=coverageOf(px);
   bool primarySolid=(cov0>0.5);
-  int fl0=int(floor(texelFetch(u_mat,px,0).a/8.0+0.5));
-  bool primaryMirror=primarySolid&&((fl0&1)!=0);
   vec2 pos,dir;
   if(primarySolid){
     vec2 n0=normalOf(px);
     pos=vec2(px)+n0*1.1;
-    if(primaryMirror){
-      // 镜面像素：沿法线**锐利地**看出去，方向完全不抖动。
-      //
-      // 为什么必须这样：镜面属性如果只影响"别的射线弹到它"的时候，那么镜面像素自己
-      // 看起来会和漫反射像素一模一样（当初就是这么写的，所以反射完全看不出来）。
-      // 让初级射线沿法线单向看出去、并保持全强度（不乘 albedo），
-      // 镜面像素才会明确显示它正对的场景 —— 这才是用户期待的"镜子"。
-      dir=n0;
-    }else{
-      float t=asin(clamp(2.0*rnd(seed)-1.0,-1.0,1.0));
-      float ct=cos(t),st=sin(t);
-      dir=vec2(n0.x*ct-n0.y*st,n0.x*st+n0.y*ct);
-    }
+    // 余弦加权地朝空气那半边发射
+    float t=asin(clamp(2.0*rnd(seed)-1.0,-1.0,1.0));
+    float ct=cos(t),st=sin(t);
+    dir=vec2(n0.x*ct-n0.y*st,n0.x*st+n0.y*ct);
   }else{
     pos=vec2(px)+vec2(rnd(seed),rnd(seed));   // 亚像素抖动
     float ang=rnd(seed)*6.2831853;
@@ -166,22 +155,17 @@ void main(){
     float aFl=floor(m.a/8.0+0.5);
     int fl=int(aFl);
     float iorv=m.a-aFl*8.0;          // 折射率就存在材质纹理的第 4 个通道里
-    float wSpec=((fl&1)!=0)?1.0:0.0;
     float wRefr=(iorv>1.01)?0.85:0.0;
     float wDiff=1.0;
-    float sum=wSpec+wRefr+wDiff;
+    float sum=wRefr+wDiff;
 
     vec2 n=normalOf(hp);
     if(dot(n,dir)>0.0)n=-n;       // 法线必须迎着入射线
 
     float pick=rnd(seed)*sum;
     vec2 nd;
-    if(pick<wSpec){
-      nd=reflect(dir,n);          // 镜面反射
-      tp*=a.rgb;
-      pos=vec2(hp)+n*1.0+nd*0.5;
-    }else if(pick<wSpec+wRefr){
-      // 折射（Snell）；全内反射时退回镜面反射
+    if(pick<wRefr){
+      // 折射（Snell）。全内反射是折射自身的物理后果，此时退回镜面方向
       float cosi=clamp(-dot(dir,n),0.0,1.0);
       float eta=1.0/iorv;
       float k=1.0-eta*eta*(1.0-cosi*cosi);
@@ -208,13 +192,7 @@ void main(){
     vec4 ap=texelFetch(u_alb,px,0);
     vec4 mp=texelFetch(u_mat,px,0);
     vec3 selfEm=mp.rgb*u_emit;       // 自发光是独立的 RGB，与 albedo 无关
-    if(primaryMirror){
-      // 镜面保持全强度：乘 albedo 会让它和普通表面难以区分（当初就是这个原因
-      // 让"反射看不见"）。这样镜面明显更亮、且显示的是正对的场景。
-      rad=selfEm+rad;
-    }else{
-      rad=selfEm+ap.rgb*(u_base+rad);
-    }
+    rad=selfEm+ap.rgb*(u_base+rad);
   }
 
   // ---- 时间累积：滑动平均。第 n+1 个样本的权重是 1/(n+1) ----

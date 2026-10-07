@@ -679,7 +679,6 @@ void testMaterial() {
     CHECK(m.emissionLevel() == 0);
     CHECK(!m.emissive());
     CHECK(m.ior == 0);
-    CHECK(!m.reflective());
     CHECK(!m.solid());
 
     m.setIorValue(1.5f);
@@ -692,13 +691,10 @@ void testMaterial() {
     m.setIorValue(99.0f);  // 夹到 3.55
     CHECK(m.iorValue() > 3.54f && m.iorValue() < 3.56f);
 
-    m.setReflective(true);
-    CHECK(m.reflective());
     m.setSolid(true);
     CHECK(m.solid());
-    m.setReflective(false);
-    CHECK(!m.reflective());
-    CHECK(m.solid());      // 清一个标志不该影响另一个
+    m.setSolid(false);
+    CHECK(!m.solid());
 
     // 材质参与撤销重做的比对。
     // 自发光故意设成 (10,200,30)，与 albedo（白色）**完全不同** ——

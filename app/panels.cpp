@@ -631,8 +631,6 @@ const MaterialPreset kMaterialPresets[] = {
     {"彩色玻璃", "半透明 + 带色，透过的光被染色。建议用于细线/薄片："
                  "遮挡是逐格吸收的，大块填充会因厚度而变得不透明", 120, 0, 1.5f, 0},
     {"实心墙", "完全挡光，画面显示自身颜色", 255, 0, 1.0f, 0},
-    {"镜面", "完全挡光 + 反射（反射需 P2 的光追通道）", 255, 0, 1.0f,
-     Material::kReflective},
     {"自发光屏", "不透明但自发光 —— 旧模型表达不了的一类像素", 255, 230, 1.0f, 0},
 };
 const int kMaterialPresetCount = (int)(sizeof(kMaterialPresets) / sizeof(kMaterialPresets[0]));
@@ -778,16 +776,13 @@ void drawMaterialSection(App& a) {
     if (ImGui::SliderFloat("##matIor", &ior, 1.0f, 3.55f, "折射率 %.2f")) {
         m.setIorValue(ior);
     }
-    bool refl = m.reflective();
-    if (ImGui::Checkbox("镜面反射", &refl)) m.setReflective(refl);
-    ImGui::SameLine();
     bool solid = m.solid();
     if (ImGui::Checkbox("强制实心", &solid)) m.setSolid(solid);
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.35f, 1.0f));
     ImGui::TextWrapped("遮挡与自发光：两种模式都生效。"
-                       "反射与折射：只在「路径追踪」模式下生效"
+                       "折射：只在「路径追踪」模式下生效"
                        "（扫描 GI 是直线扫描，物理上做不了弯曲光路）。");
     ImGui::PopStyleColor();
 

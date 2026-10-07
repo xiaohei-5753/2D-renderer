@@ -32,14 +32,10 @@ struct Material {
 
     uint8_t reserved = 0;
 
-    static constexpr uint8_t kReflective = 1u << 0;  // 镜面反射
-    static constexpr uint8_t kSolid = 1u << 1;       // 强制完全遮挡（忽略 alpha）
+    // 唯一的标志位：强制完全遮挡（忽略 alpha）
+    static constexpr uint8_t kSolid = 1u << 1;
 
-    bool reflective() const { return (flags & kReflective) != 0; }
     bool solid() const { return (flags & kSolid) != 0; }
-    void setReflective(bool on) {
-        flags = on ? (uint8_t)(flags | kReflective) : (uint8_t)(flags & ~kReflective);
-    }
     void setSolid(bool on) {
         flags = on ? (uint8_t)(flags | kSolid) : (uint8_t)(flags & ~kSolid);
     }

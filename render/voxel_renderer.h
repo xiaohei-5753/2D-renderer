@@ -14,6 +14,8 @@
 #include <memory>
 #include <vector>
 
+#include "gfx/gl_common.h"
+
 #include "core/types.h"
 #include "render/voxel_volume.h"
 
@@ -94,10 +96,18 @@ public:
     // 是否已经收敛（可以停止继续采样）
     virtual bool converged() const = 0;
 
+    // GPU 实现会把结果**留在显存**里直接给 GUI 用（省掉一次读回+上传）。
+    // 返回 0 表示"没有纹理，请用 render() 拿 CPU 像素"。
+    virtual GLuint resultTexture() const { return 0; }
+
     // 供 UI 显示用的统计
     virtual double lastMs() const = 0;
 };
 
 std::unique_ptr<VoxelRenderer> createVoxelRenderer();
+
+// GPU 版（OpenGL 4.3 compute）。失败时返回 nullptr，调用方回退到 CPU 版。
+// 需要当前线程已经有 GL context。
+std::unique_ptr<VoxelRenderer> createVoxelGpuRenderer();
 
 }  // namespace pb::render

@@ -5,11 +5,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "core/image.h"
 #include "render/voxel_renderer.h"
+#include "gfx/gl_context.h"
 #include "render/voxel_volume.h"
 
 using namespace pb;
@@ -21,6 +23,7 @@ int main(int argc, char** argv) {
     float ap = 1.0f;              // 锥孔径缩放
     int alg = 3;                  // GI 算法
     bool compare = false;         // 与反向光追（参照物）对比
+    bool gpu = false;             // 用 GPU 版
     int k0 = 4;                   // RC 最细一层的射线数
     float l0 = 2.0f;              // RC 最细一层的距离区间上限
     int ncs = 7;                  // RC 层数
@@ -50,6 +53,7 @@ int main(int argc, char** argv) {
         else if (a == "--plate") plate = std::atoi(next().c_str());
         else if (a == "--alg") alg = std::atoi(next().c_str());   // 0关 1光源采样 2VCT 3RC
         else if (a == "--compare") compare = true;
+        else if (a == "--gpu") gpu = true;
         else if (a == "--k0") k0 = std::atoi(next().c_str());
         else if (a == "--l0") l0 = (float)std::atof(next().c_str());
         else if (a == "--nc") ncs = std::atoi(next().c_str());
@@ -113,7 +117,17 @@ int main(int argc, char** argv) {
                 v.emission[k] = RGBA8{80, 200, 220, 255};
             }
 
-    auto r = render::createVoxelRenderer();
+    // 按需构造：CPU 路径下不能有无条件构造的 GLContext
+    // （它没被 create，析构时会对未初始化状态 destroy -> 访问违例 0xC0000005）
+    std::unique_ptr<gfx::GLContext> ctx;
+    if (gpu) {
+        gfx::ContextDesc cd;
+        cd.width = 64; cd.height = 64; cd.visible = false; cd.title = "vox_gpu";
+        ctx = std::make_unique<gfx::GLContext>();
+        if (!ctx->create(cd)) { fprintf(stderr, "GL context failed\n"); return 1; }
+    }
+    auto r = gpu ? render::createVoxelGpuRenderer() : render::createVoxelRenderer();
+    if (!r) { fprintf(stderr, "renderer create failed\\n"); return 1; }
     if (!r->setVolume(v)) { fprintf(stderr, "setVolume failed\n"); return 1; }
     render::RenderSettings rs;
     const float azr = az * 3.14159265f / 180.0f, elr = el * 3.14159265f / 180.0f;
@@ -216,5 +230,6 @@ int main(int argc, char** argv) {
     for (int x = W / 2 - 6; x < W * 3 / 4 + 14 && x < W; x++)
         printf("%4d", px[(size_t)sy * W + x].r);
     printf("\n   -> %s\n", path.c_str());
+    if (ctx) ctx->destroy();
     return 0;
 }

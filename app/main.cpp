@@ -245,6 +245,9 @@ int main(int argc, char** argv) {
     app::LightMode startMode = app::LightMode::Sweep;
     float startDzEl = 45.0f;       // --dz-el：太阳仰角
     float startDzAz = 135.0f;      // --dz-az：太阳方位角
+    float startDzSunI = 1.0f;      // --dz-sun：阳光强度
+    bool startDzEmit = true;       // --dz-emit：自发光当光源
+    float startDzEmitI = 1.0f;     // --dz-ei：自发光强度
     std::string outFile;
     std::string forceOpen, forceClosed;
     std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
@@ -279,6 +282,12 @@ int main(int argc, char** argv) {
             startDzEl = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--dz-az" && i + 1 < argCount) {
             startDzAz = (float)std::atof(args[(size_t)++i].c_str());
+        } else if (arg == "--dz-sun" && i + 1 < argCount) {
+            startDzSunI = (float)std::atof(args[(size_t)++i].c_str());
+        } else if (arg == "--dz-emit" && i + 1 < argCount) {
+            startDzEmit = (std::atoi(args[(size_t)++i].c_str()) != 0);
+        } else if (arg == "--dz-ei" && i + 1 < argCount) {
+            startDzEmitI = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--visible") {
             forceVisible = true;
         } else if (arg == "--hidden") {
@@ -319,6 +328,9 @@ int main(int argc, char** argv) {
     a.lightMode = startMode;
     a.vzSunEl = startDzEl;
     a.vzSunAz = startDzAz;
+    a.vzSunIntensity = startDzSunI;
+    a.vzEmitLights = startDzEmit;
+    a.vzEmitIntensity = startDzEmitI;
 
     // 自动化/回归用：直接切到某一套色板（例如 NES 55 色，验证色块网格的自动换行）
     if (paletteIndex >= 0) {
@@ -505,10 +517,16 @@ int main(int argc, char** argv) {
                 // 光线怎么走、怎么加速，全在渲染端里面。
                 const bool geomChanged = !voxUploaded || app::anyLayerDirty(a);
                 if (geomChanged) {
-                    app::buildVoxelVolume(a.doc, voxVol);
-                    voxRenderer->setVolume(voxVol);
+                    app::buildVoxelVolume(a.doc, voxVol, a.vzLayerStride);
+                    voxRenderer->setVolume(voxVol);   // 内部会重置累积
                     voxUploaded = true;
                     a.vzDirty = true;
+                    // 消费掉"脏"状态。syncLightDirty() 每帧按图层签名重算，
+                    // 但 lightAllLayers 只有消费方会清（别的模式是 runLighting 清的）。
+                    // 不清的话 anyLayerDirty() 永远为真 -> 体素每帧重建 ->
+                    // 渐进累积被反复重置，永远收敛不了。
+                    a.lightAllLayers = false;
+                    for (auto& v : a.lightDirtyLayers) v = 0;
                 }
                 if (a.vzDirty || geomChanged) {
                     render::RenderSettings rs;
@@ -525,7 +543,16 @@ int main(int argc, char** argv) {
                     rs.skyColor[2] *= 1.25f;                 // 天光偏冷
                     rs.emitScale = a.vzEmitScale;
                     rs.shadows = a.vzShadows;
-                    voxRenderer->setSettings(rs);
+                    rs.emissiveLights = a.vzEmitLights;
+                    rs.emissiveIntensity = a.vzEmitIntensity;
+                    rs.lightSamples = a.vzLightSamples;
+                    rs.progressive = true;
+                    rs.maxAccumFrames = a.vzMaxFrames;
+                    voxRenderer->setSettings(rs);   // 参数变了自己会重置累积
+                    a.vzDirty = false;
+                }
+                // 渐进累积：每帧推进一步，UI 不失响应；收敛后停手
+                if (!voxRenderer->converged()) {
                     lightTimer.begin();
                     voxRenderer->render(voxPx);
                     lightTimer.end();
@@ -534,7 +561,14 @@ int main(int argc, char** argv) {
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cw, ch, GL_RGBA,
                                     GL_UNSIGNED_BYTE, voxPx.data());
                     glBindTexture(GL_TEXTURE_2D, 0);
-                    a.vzDirty = false;
+                }
+                a.vzFrames = voxRenderer->accumFrames();
+                a.vzMs = (float)voxRenderer->lastMs();
+                if (getenv("PB_VOXDUMP") && voxRenderer->converged()) {
+                    Image di(cw, ch);
+                    for (int i = 0; i < cw * ch; i++) di.data()[i] = voxPx[(size_t)i];
+                    writePNG("out/vox_app_out.png", di);
+                    fprintf(stderr, "[app] 体素光追输出已写出 out/vox_app_out.png\\n");
                 }
             } else {
                 // 画布一变，路径追踪的旧累积样本就和新几何对不上了（会拖影），必须重置累积

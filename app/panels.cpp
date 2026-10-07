@@ -1140,6 +1140,43 @@ void drawLightingSection(App& a) {
             a.vzDirty = true;
         }
         if (ImGui::Checkbox("阴影（3D 阴影射线）", &a.vzShadows)) a.vzDirty = true;
+        int st = a.vzLayerStride;
+        if (ui::labeledSliderInt("vzSt", &st, 1, 16, "图层厚度")) {
+            a.vzLayerStride = st;
+            a.vzDirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("每个图层在 z 方向占几格。太小的话上层光源对下层是掠射、照不亮");
+        ImGui::SeparatorText("自发光当光源");
+        if (ImGui::Checkbox("开启自发光照明", &a.vzEmitLights)) a.vzDirty = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("把 E>0 的体素当面光源采样（光源表 + 功率 CDF）");
+        float ei = a.vzEmitIntensity;
+        if (ui::labeledSliderFloat("vzEi", &ei, 0.0f, 8.0f, "自发光强度")) {
+            a.vzEmitIntensity = ei;
+            a.vzDirty = true;
+        }
+        int ls = a.vzLightSamples;
+        if (ui::labeledSliderInt("vzLs", &ls, 1, 32, "每帧光源采样")) {
+            a.vzLightSamples = ls;
+            a.vzDirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("每像素每帧抽几个光源。越大单帧越慢、收敛越快");
+        int mf = a.vzMaxFrames;
+        if (ui::labeledSliderInt("vzMf", &mf, 8, 512, "累积帧数")) {
+            a.vzMaxFrames = mf;
+            a.vzDirty = true;
+        }
+        {
+            const float frac = (a.vzMaxFrames > 0)
+                                   ? (float)a.vzFrames / (float)a.vzMaxFrames
+                                   : 0.0f;
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%d / %d 帧  %.1f ms", a.vzFrames, a.vzMaxFrames,
+                          a.vzMs);
+            ImGui::ProgressBar(std::min(1.0f, frac), ImVec2(-1.0f, a.ui(14.0f)), buf);
+        }
         ImGui::TextDisabled("渲染 +z 法相面，光照走正统 3D 光追");
     } else if (a.pt) {        ImGui::SeparatorText("路径追踪");
         gfx::PathTraceSettings& s = a.pt->settings();

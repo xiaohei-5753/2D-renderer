@@ -93,7 +93,15 @@ struct App {
     float vzSky = 0.20f;           // 天空亮度
     float vzEmitScale = 1.0f;
     bool vzShadows = true;
+    int vzLayerStride = 4;         // 每个图层在 z 方向占几格（层间留空 -> 光才照得下来）
+    bool vzEmitLights = true;      // 自发光体素当光源
+    float vzEmitIntensity = 1.0f;
+    int vzLightSamples = 8;        // 每像素每帧抽几个光源
+    int vzMaxFrames = 128;         // 累积多少帧
     bool vzDirty = true;
+    // 只读：进度显示
+    int vzFrames = 0;
+    float vzMs = 0.0f;
 
     // --- 视图选项 ---
     bool showPixelGrid = false;

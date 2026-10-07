@@ -64,6 +64,9 @@ public:
     // 已累积的帧数（UI 显示进度用）
     virtual int accumFrames() const = 0;
 
+    // 是否已经收敛（可以停止继续采样）
+    virtual bool converged() const = 0;
+
     // 供 UI 显示用的统计
     virtual double lastMs() const = 0;
 };

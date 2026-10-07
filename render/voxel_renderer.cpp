@@ -31,6 +31,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -95,6 +97,9 @@ public:
                     totalPower_ += p;
                     cdf_.push_back(totalPower_);
                 }
+        if (getenv("PB_VOXDBG"))
+            fprintf(stderr, "[vox] 体素 %dx%dx%d  实体光源 %zu  总功率 %.1f\\n", X, Y, Z,
+                    lights_.size(), totalPower_);
         resetAccumulation();
         return true;
     }
@@ -117,6 +122,10 @@ public:
     }
 
     int accumFrames() const override { return frames_; }
+
+    bool converged() const override {
+        return !set_.progressive || frames_ >= set_.maxAccumFrames;
+    }
 
     void render(std::vector<RGBA8>& out) override {
         const auto t0 = std::chrono::steady_clock::now();
@@ -246,6 +255,13 @@ public:
         }
 
         frames_++;
+        if (getenv("PB_VOXDBG") && frames_ == 1) {
+            float mx = 0.0f;
+            for (float v : accum_) mx = std::max(mx, v);
+            fprintf(stderr, "[vox] 第1帧累积最大值 %.4f  K=%d  useEm=%d\\n", mx,
+                    std::max(1, set_.lightSamples),
+                    (set_.emissiveLights && !lights_.empty()) ? 1 : 0);
+        }
         toImage(out);
         lastMs_ = std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - t0)

@@ -65,17 +65,19 @@ void main(){
   // 上方所有层的光场之和。自下而上遍历时每层减掉自己，gabove 就正好是
   // "第 i 层**上方**所有层的光场"。
   vec3 gtotal=vec3(0.0);
-  if(u_fieldStrength>0.0){for(int i=0;i<u_n;i++)gtotal+=texelFetch(u_field,ivec3(p,i),0).rgb;}
+  // 光场 = 各层**空气像素**的颜色（去掉环境光）。
+  // 空气像素的 rgb 就是这一层洒出来的光晕（alpha=0 但 rgb 有值），
+  // 也就是 2D 光追那张渲染图里"没有实体像素"的区域 —— 不需要另建纹理。
+  if(u_fieldStrength>0.0){for(int i=0;i<u_n;i++){vec4 L=texelFetch(u_tex,ivec3(p,i),0);
+    gtotal+=max(vec3(0.0),L.rgb-u_backdrop)*(1.0-clamp(L.a,0.0,1.0));}}
   vec3 gabove=gtotal;
   for(int i=0;i<u_n;i++){
     vec4 c=texelFetch(u_tex,ivec3(p,i),0);
     float op=texelFetch(u_opacity,ivec3(p,i),0).r;
-    // 光场：只做**追加**，不改下面原有的混合路径。
-    // 这样 strength=0 时与原来的实现逐字节等价，出问题一定在光场项里。
     if(u_fieldStrength>0.0){
-      gabove-=texelFetch(u_field,ivec3(p,i),0).rgb;
-      // 彩色光打在彩色表面上：表面色 * 光色
-      c.rgb+=gabove*u_fieldStrength;
+      gabove-=max(vec3(0.0),c.rgb-u_backdrop)*(1.0-clamp(c.a,0.0,1.0));
+      // 乘法叠加：光场乘到这一层的颜色上（没有光时是 1.0，颜色不变）
+      c.rgb*=(1.0+gabove*u_fieldStrength);
     }
     if(op<=0.0)continue;
     if(u_albedoAsOpaque!=0){

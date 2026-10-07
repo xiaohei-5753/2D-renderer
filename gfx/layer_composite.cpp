@@ -52,16 +52,33 @@ uniform sampler2DArray u_opacity;  // 每层：一个 float 的图层不透明�
 uniform ivec2 u_cs;
 uniform int u_n;                   // 参与合成的层数
 uniform int u_albedoAsOpaque;      // 1 = 原始 albedo（alpha 是"有多不透明"）
-uniform vec3 u_backdrop;           // 所有层都没盖住时显示什么
+uniform vec3 u_backdrop;
+uniform sampler2DArray u_field;       // 每层的"光场"：这一层平面内有多少光
+uniform sampler2DArray u_albedo;      // 每层的原始颜色（受光就是它乘上光）
+uniform float u_fieldStrength;        // 0 = 关掉这个模型           // 所有层都没盖住时显示什么
 layout(rgba8,binding=0)writeonly uniform image2D u_out;
 void main(){
   ivec2 p=ivec2(gl_GlobalInvocationID.xy);
   if(p.x>=u_cs.x||p.y>=u_cs.y)return;
 
   vec3 acc=u_backdrop;
+  // 上方所有层的光场之和。自下而上遍历时每层减掉自己，gabove 就正好是
+  // "第 i 层**上方**所有层的光场"。
+  vec3 gtotal=vec3(0.0);
+  if(u_fieldStrength>0.0){for(int i=0;i<u_n;i++)gtotal+=texelFetch(u_field,ivec3(p,i),0).rgb;}
+  vec3 gabove=gtotal;
   for(int i=0;i<u_n;i++){
     vec4 c=texelFetch(u_tex,ivec3(p,i),0);
     float op=texelFetch(u_opacity,ivec3(p,i),0).r;
+    if(u_fieldStrength>0.0){
+      // 上层光场照亮这一层：彩色光打在彩色表面上 = 表面色 * 光色
+      gabove-=texelFetch(u_field,ivec3(p,i),0).rgb;
+      vec3 alb=texelFetch(u_albedo,ivec3(p,i),0).rgb;
+      vec3 C=c.rgb+alb*gabove*u_fieldStrength;
+      // 逐像素覆盖率（c.a），而不是整层一个标量
+      if(op>0.0)acc=C+(acc-C)*(1.0-clamp(c.a,0.0,1.0)*op);
+      continue;
+    }
     if(op<=0.0)continue;
     if(u_albedoAsOpaque!=0){
       // 原始 albedo：**以完整颜色显示**（画上去什么颜色就是什么颜色），
@@ -95,6 +112,9 @@ bool LayerComposite::init() {
 
     u_.opaque = glGetUniformLocation(prog_, "u_albedoAsOpaque");
     u_.backdrop = glGetUniformLocation(prog_, "u_backdrop");
+    u_.field = glGetUniformLocation(prog_, "u_field");
+    u_.albedo2 = glGetUniformLocation(prog_, "u_albedo");
+    u_.fieldStrength = glGetUniformLocation(prog_, "u_fieldStrength");
     return !checkGLError("layers/composite/init");
 }
 
@@ -105,7 +125,8 @@ void LayerComposite::shutdown() {
 
 void LayerComposite::composite(GLuint layersTex, GLuint opacityTex, int layerCount, int w,
                                int h, GLuint outTex, bool albedoAsOpaque,
-                               const float backdrop[3]) {
+                               const float backdrop[3], GLuint fieldTex, GLuint albedoTex,
+                               float fieldStrength) {
     if (!valid() || !layersTex || !outTex || w <= 0 || h <= 0) return;
     layerCount = layerCount < 0 ? 0 : layerCount;
 
@@ -118,6 +139,19 @@ void LayerComposite::composite(GLuint layersTex, GLuint opacityTex, int layerCou
     glUniform1i(u_.opacity, 1);
     glUniform2i(u_.cs, w, h);
     glUniform1i(u_.n, layerCount);
+    // 光场模型：上层的光场照亮下层
+    glUniform1f(u_.fieldStrength, fieldTex && albedoTex ? fieldStrength : 0.0f);
+    if (fieldTex && albedoTex) {
+        // 注意用 3/4：unit 0 是各层结果、unit 1 是**不透明度数组**，
+        // 占用 1/2 会把不透明度覆盖掉（实测光场整个消失）。
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, fieldTex);
+        glUniform1i(u_.field, 3);
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, albedoTex);
+        glUniform1i(u_.albedo2, 4);
+        glActiveTexture(GL_TEXTURE0);
+    }
     glUniform1i(u_.opaque, albedoAsOpaque ? 1 : 0);
     if (backdrop) {
         glUniform3fv(u_.backdrop, 1, backdrop);

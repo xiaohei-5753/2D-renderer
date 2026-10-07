@@ -1096,6 +1096,17 @@ void drawLightingSection(App& a) {
         if (ui::labeledSliderFloat("##cp", &s.propagate, 0.5f, 2.0f, "沿程增益")) {
             actLightSettingsChanged(a);
         }
+        // 上层光场照亮下层：每层独立扫出一个"光场"，再按"彩色光打在彩色表面"
+        // 的方式乘到下面各层上。纯后期，不做阴影。
+        float fs = a.fieldStrength;
+        if (ui::labeledSliderFloat("##fs", &fs, 0.0f, 3.0f, "光场照亮下层", "%.2f")) {
+            a.fieldStrength = fs;
+            if (a.sweep) a.sweep->setFieldStrength(fs);
+            actLightSettingsChanged(a);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("0 = 关（原来的模型）\\n每层先独立扫出自己的光场，\\n"
+                              "再乘到下面各层的颜色上照亮它们");
     } else if (a.pt) {        ImGui::SeparatorText("路径追踪");
         gfx::PathTraceSettings& s = a.pt->settings();
 

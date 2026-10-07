@@ -150,7 +150,8 @@ bool runLighting(App& a) {
                                  all);
             a.sweep->renderLayer(i);
         }
-        a.sweep->composite();
+        a.sweep->setFieldStrength(a.fieldStrength);
+    a.sweep->composite();
     } else {
         if (!a.pt) return false;
         // 路径追踪是"每帧累积一个样本"，所以每一层每帧都要推进。

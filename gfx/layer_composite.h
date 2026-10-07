@@ -58,12 +58,16 @@ public:
     // backdrop 是所有层都没盖住时显示的底色，可为 nullptr（= 黑）。
     void composite(GLuint layersTex, GLuint opacityTex, int layerCount, int w, int h,
                    GLuint outTex, bool albedoAsOpaque = false,
-                   const float backdrop[3] = nullptr);
+                   const float backdrop[3] = nullptr,
+                   GLuint fieldTex = 0, GLuint albedoTex = 0, float fieldStrength = 0.0f);
 
 private:
     GLuint prog_ = 0;
     struct {
         GLint tex = -1, opacity = -1, cs = -1, n = -1, opaque = -1, backdrop = -1;
+        GLint field = -1;         // 每层光场（sampler2DArray）
+        GLint albedo2 = -1;       // 每层原始颜色
+        GLint fieldStrength = -1;
     } u_;
 };
 

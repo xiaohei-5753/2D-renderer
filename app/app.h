@@ -84,6 +84,7 @@ struct App {
     // --- 光照 ---
     bool lightOn = true;
     LightMode lightMode = LightMode::Sweep;
+    float fieldStrength = 0.0f;      // 上层光场照亮下层的强度（0 = 关）
     bool lightDirty = true;
     float lightMs = 0.0f;
     // --- 视图选项 ---

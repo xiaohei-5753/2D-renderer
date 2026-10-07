@@ -104,6 +104,11 @@ public:
     // 把已经算好的各层光结果按图层不透明度合成到 resultTexture()。
     void composite();
 
+    // 每层的光场（这一层平面内有多少光）。合成时用它照亮下面的层。
+    GLuint fieldTexture() const { return fieldArray_; }
+    // 0 = 关掉"上层光场照亮下层"这个模型
+    void setFieldStrength(float s) { fieldStrength_ = s; }
+
     // --- 单层便捷入口 ---
     //
     // 单层时 occl / emit 恒为 0，整套公式退化成原来的平面内扫描。
@@ -145,6 +150,8 @@ private:
 
     int w_ = 0, h_ = 0;
     int layers_ = 0;
+    // 0 = 关（用原来那套 occl/emit 模型）；>0 打开"上层光场照亮下层"
+    float fieldStrength_ = 0.0f;
     LightSettings st_;
 
     // --- 输入（每层一层）---
@@ -155,7 +162,8 @@ private:
 
     // --- 中间与输出 ---
     GLuint scanTex_ = 0;        // RGBA16F: 单层的扫描累积结果（逐层复用）
-    GLuint litArray_ = 0;       // RGBA8 : 每层的受光结果
+    GLuint litArray_ = 0;
+    GLuint fieldArray_ = 0;      // 每层的'光场'（RGBA16F，逐层一张）       // RGBA8 : 每层的受光结果
     GLuint opacityArray_ = 0;   // R32F  : 每层的不透明度（合成用）
     GLuint renderTex_ = 0;      // RGBA8 : 合成后的最终输出
     GLuint scanSSBO_ = 0;       // R32UI 定点累积缓冲（原子加）

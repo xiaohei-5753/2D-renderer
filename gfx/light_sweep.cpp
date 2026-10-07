@@ -236,6 +236,8 @@ void LightSweep::releaseLayerTextures() {
     if (opacityArray_) glDeleteTextures(1, &opacityArray_);
     canvasArray_ = matArray_ = occlArray_ = emitArray_ = 0;
     litArray_ = opacityArray_ = 0;
+    if (fieldArray_) glDeleteTextures(1, &fieldArray_);
+    fieldArray_ = 0;
 }
 
 void LightSweep::setLayerCount(int n) {
@@ -253,6 +255,8 @@ void LightSweep::setLayerCount(int n) {
     litArray_ = createTextureArray(GL_RGBA8, w_, h_, layers_, GL_RGBA, GL_UNSIGNED_BYTE);
     opacityArray_ =
         createTextureArray(GL_R32F, w_, h_, layers_, GL_RED, GL_FLOAT);
+    // 每层的光场：逐层一张，合成时照亮下面的层
+    fieldArray_ = createTextureArray(GL_RGBA16F, w_, h_, kMaxLayers, GL_RGBA, GL_HALF_FLOAT);
 
     clearAllLayers();
 }
@@ -455,6 +459,11 @@ void LightSweep::renderLayer(int layer) {
     glDispatchCompute((GLuint)((w_ + 7) / 8), (GLuint)((h_ + 7) / 8), 1);
     glMemoryBarrier(GL_ALL_BARRIER_BITS);
 
+    // --- 3b. 把这一层的光场存下来（后面照亮下层用）---
+    if (fieldArray_ && layer >= 0 && layer < layers_)
+        glCopyImageSubData(scanTex_, GL_TEXTURE_2D, 0, 0, 0, 0, fieldArray_,
+                           GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, w_, h_, 1);
+
     // --- 4. 合成这一层，写进结果数组纹理的第 layer 层 ---
     glUseProgram(blendProg_);
     glActiveTexture(GL_TEXTURE0);
@@ -484,7 +493,8 @@ void LightSweep::renderLayer(int layer) {
 
 void LightSweep::composite() {
     if (!valid() || !litArray_ || !comp_.valid()) return;
-    comp_.composite(litArray_, opacityArray_, layers_, w_, h_, renderTex_, false);
+    comp_.composite(litArray_, opacityArray_, layers_, w_, h_, renderTex_, false, nullptr,
+                    fieldArray_, canvasArray_, fieldStrength_);
 }
 
 }  // namespace pb::gfx

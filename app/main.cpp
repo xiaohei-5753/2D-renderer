@@ -28,7 +28,7 @@
 #include "app/input.h"
 #include "app/panels.h"
 #include "app/voxel_build.h"
-#include "core/dz25.h"
+#include "render/voxel_renderer.h"
 #include "core/composite.h"
 #include "gfx/layer_composite.h"
 #include "core/console.h"
@@ -243,9 +243,8 @@ int main(int argc, char** argv) {
     int framesToRun = 0;
     int paletteIndex = -1;
     app::LightMode startMode = app::LightMode::Sweep;
-    float startDzRadius = 96.0f;   // --dz-radius：2.5D 作用半径
-    float startDzSun = 0.35f;      // --dz-sun：2.5D 天光
-    float startDzGain = 1.0f;      // --dz-gain：辐照度增益
+    float startDzEl = 45.0f;       // --dz-el：太阳仰角
+    float startDzAz = 135.0f;      // --dz-az：太阳方位角
     std::string outFile;
     std::string forceOpen, forceClosed;
     std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
@@ -276,12 +275,10 @@ int main(int argc, char** argv) {
             if (m == "pathtrace" || m == "pt") startMode = app::LightMode::PathTrace;
             else if (m == "25d" || m == "dz") startMode = app::LightMode::Trace25D;
             else startMode = app::LightMode::Sweep;
-        } else if (arg == "--dz-radius" && i + 1 < argCount) {
-            startDzRadius = (float)std::atof(args[(size_t)++i].c_str());
-        } else if (arg == "--dz-sun" && i + 1 < argCount) {
-            startDzSun = (float)std::atof(args[(size_t)++i].c_str());
-        } else if (arg == "--dz-gain" && i + 1 < argCount) {
-            startDzGain = (float)std::atof(args[(size_t)++i].c_str());
+        } else if (arg == "--dz-el" && i + 1 < argCount) {
+            startDzEl = (float)std::atof(args[(size_t)++i].c_str());
+        } else if (arg == "--dz-az" && i + 1 < argCount) {
+            startDzAz = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--visible") {
             forceVisible = true;
         } else if (arg == "--hidden") {
@@ -320,9 +317,8 @@ int main(int argc, char** argv) {
     a.opts.color = a.palette.current();
     a.demo = demo;
     a.lightMode = startMode;
-    a.dz25Radius = startDzRadius;
-    a.dz25Sun = startDzSun;
-    a.dz25Gain = startDzGain;
+    a.vzSunEl = startDzEl;
+    a.vzSunAz = startDzAz;
 
     // 自动化/回归用：直接切到某一套色板（例如 NES 55 色，验证色块网格的自动换行）
     if (paletteIndex >= 0) {
@@ -382,12 +378,13 @@ int main(int argc, char** argv) {
     pt.settings().ambient[2] = 0.14f;
     a.pt = &pt;
 
-    // 2.5D 光追：图层 = z 层，解析 gather（见 core/dz25.h）。
-    // 它是纯 CPU 的（不采样方向 -> 没有条带），结果上传到这张纹理显示。
-    const GLuint dz25Tex =
-        gfx::createTexture(GL_RGBA8, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE);
-    VoxelGrid voxGrid;                    // 2.5D 模式下的体素空间
-    std::vector<RGBA8> dz25Px;            // 2.5D 的输出像素
+    // 体素光追：GUI 只通过 render/voxel_renderer.h 这个接口用它。
+    // 渲染端内部（加速结构、线程、GPU 资源）GUI 一概不知道。
+    auto voxRenderer = render::createVoxelRenderer();
+    const GLuint voxTex = gfx::createTexture(GL_RGBA8, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE);
+    render::VoxelVolume voxVol;
+    std::vector<RGBA8> voxPx;
+    bool voxUploaded = false;
 
     gfx::Viewport vp;
     if (!vp.init()) {
@@ -502,32 +499,44 @@ int main(int argc, char** argv) {
         app::syncLightDirty(a);
         if (a.lightOn && a.canvasVisible) {
             if (a.lightMode == app::LightMode::Trace25D) {
-                // ---- 2.5D 光追：解析 gather ----
-                if (a.dz25Dirty || app::anyLayerDirty(a)) {
+                // ---- 体素光追（+z 面）----
+                //
+                // GUI 只做两件事：把图层翻成体素空间、把参数摆好。
+                // 光线怎么走、怎么加速，全在渲染端里面。
+                const bool geomChanged = !voxUploaded || app::anyLayerDirty(a);
+                if (geomChanged) {
+                    app::buildVoxelVolume(a.doc, voxVol);
+                    voxRenderer->setVolume(voxVol);
+                    voxUploaded = true;
+                    a.vzDirty = true;
+                }
+                if (a.vzDirty || geomChanged) {
+                    render::RenderSettings rs;
+                    // 方位角 / 仰角 -> 指向光源的单位向量（z 向上）
+                    const float az = a.vzSunAz * 3.14159265f / 180.0f;
+                    const float el = a.vzSunEl * 3.14159265f / 180.0f;
+                    const float ce = std::cos(el);
+                    rs.sunDir[0] = std::cos(az) * ce;
+                    rs.sunDir[1] = std::sin(az) * ce;
+                    rs.sunDir[2] = std::sin(el);
+                    rs.sunColor[0] = 1.0f; rs.sunColor[1] = 0.96f; rs.sunColor[2] = 0.88f;
+                    rs.sunIntensity = a.vzSunIntensity;
+                    rs.skyColor[0] = rs.skyColor[1] = rs.skyColor[2] = a.vzSky;
+                    rs.skyColor[2] *= 1.25f;                 // 天光偏冷
+                    rs.emitScale = a.vzEmitScale;
+                    rs.shadows = a.vzShadows;
+                    voxRenderer->setSettings(rs);
                     lightTimer.begin();
-                    app::buildVoxelGrid(a.doc, voxGrid);
-                    Dz25Params dp;
-                    dp.emitScale = a.dz25EmitScale;
-                    dp.gain = a.dz25Gain;
-                    dp.falloff = a.dz25Falloff;
-                    dp.radius = (int)a.dz25Radius;   // 只收这个半径内的发光体素
-                    dp.ambientOn = a.dz25Sun > 0.0f;
-                    dp.ambient[0] = dp.ambient[1] = dp.ambient[2] = a.dz25Sun;
-                    trace25D(voxGrid, dp, dz25Px);
-                    if (getenv("PB_DZDUMP")) {
-                        Image di(cw, ch);
-                        for (int i = 0; i < cw * ch; i++) di.data()[i] = dz25Px[(size_t)i];
-                        writePNG("out/dz25_app_out.png", di);
-                        fprintf(stderr, "[app] 2.5D 输出已写出 out/dz25_app_out.png\\n");
-                    }
-                    glBindTexture(GL_TEXTURE_2D, dz25Tex);
+                    voxRenderer->render(voxPx);
+                    lightTimer.end();
+                    glBindTexture(GL_TEXTURE_2D, voxTex);
                     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cw, ch, GL_RGBA,
-                                    GL_UNSIGNED_BYTE, dz25Px.data());
+                                    GL_UNSIGNED_BYTE, voxPx.data());
                     glBindTexture(GL_TEXTURE_2D, 0);
-                    lightTimer.end();
-                    a.dz25Dirty = false;
-                }            } else {
+                    a.vzDirty = false;
+                }
+            } else {
                 // 画布一变，路径追踪的旧累积样本就和新几何对不上了（会拖影），必须重置累积
                 if (app::anyLayerDirty(a)) pt.resetAccumulation();
                 lightTimer.begin();
@@ -572,7 +581,7 @@ int main(int argc, char** argv) {
                 glMemoryBarrier(GL_ALL_BARRIER_BITS);
                 shown = albedoFlat;
             } else {
-                if (a.lightMode == app::LightMode::Trace25D) shown = dz25Tex;
+                if (a.lightMode == app::LightMode::Trace25D) shown = voxTex;
                 else shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
             }
             vp.draw(shown);
@@ -616,7 +625,7 @@ int main(int argc, char** argv) {
     vp.shutdown();
     sweep.shutdown();
     pt.shutdown();
-    glDeleteTextures(1, &dz25Tex);
+    glDeleteTextures(1, &voxTex);
     lightTimer.shutdown();
     uiCtx.shutdown();
     ctx.destroy();

@@ -483,7 +483,7 @@ void drawMainMenuBar(App& a) {
                             a.lightMode == LightMode::Trace25D)) {
             a.lightMode = LightMode::Trace25D;
             a.lightDirty = true;
-            a.dz25Dirty = true;
+            a.vzDirty = true;
         }
         ImGui::EndMenu();
     }
@@ -1110,43 +1110,38 @@ void drawLightingSection(App& a) {
             actLightSettingsChanged(a);
         }
     } else if (is25D) {
-        // ---- 2.5D 光追的专属参数 ----
-        ImGui::SeparatorText("2.5D 光追");
-        float r = a.dz25Radius;
-        if (ui::labeledSliderFloat("dz25r", &r, 8.0f, 320.0f, "作用半径", "%.0f")) {
-            a.dz25Radius = r;
-            a.dz25Dirty = true;
+        // ---- 体素光追的参数 ----
+        // GUI 只摆控件、写进 App 的状态；怎么渲染是渲染端的事。
+        ImGui::SeparatorText("体素光追");
+        float el = a.vzSunEl;
+        if (ui::labeledSliderFloat("vzEl", &el, 5.0f, 89.0f, "太阳仰角", "%.0f")) {
+            a.vzSunEl = el;
+            a.vzDirty = true;
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("只收这个半径内的发光体素（1/r³ 让远处贡献迅速变得无关紧要）");
-        float g2 = a.dz25Gain;
-        if (ui::labeledSliderFloat("dz25gain", &g2, 0.1f, 20.0f, "辐照度增益", "%.2f")) {
-            a.dz25Gain = g2;
-            a.dz25Dirty = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("越大越接近正上方顶光");
+        float az = a.vzSunAz;
+        if (ui::labeledSliderFloat("vzAz", &az, 0.0f, 360.0f, "太阳方位", "%.0f")) {
+            a.vzSunAz = az;
+            a.vzDirty = true;
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("光晕整体亮度。太大时高光会被归一化压成纯白");
-        float fo = a.dz25Falloff;
-        if (ui::labeledSliderFloat("dz25fo", &fo, 0.5f, 3.0f, "距离衰减", "%.2f")) {
-            a.dz25Falloff = fo;
-            a.dz25Dirty = true;
+        float si = a.vzSunIntensity;
+        if (ui::labeledSliderFloat("vzSun", &si, 0.0f, 4.0f, "阳光强度")) {
+            a.vzSunIntensity = si;
+            a.vzDirty = true;
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("1 = 1/r（2D 泛光，铺得开）；2 = 1/r²（物理平方反比，衰减快、光晕窄）");
-        float sun = a.dz25Sun;
-        if (ui::labeledSliderFloat("dz25sun", &sun, 0.0f, 1.0f, "天光强度")) {
-            a.dz25Sun = sun;
-            a.dz25Dirty = true;
+        float sk = a.vzSky;
+        if (ui::labeledSliderFloat("vzSky", &sk, 0.0f, 1.0f, "天空亮度")) {
+            a.vzSky = sk;
+            a.vzDirty = true;
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("上半球里非太阳方向的背景光");
-        float es = a.dz25EmitScale;
-        if (ui::labeledSliderFloat("dz25em", &es, 0.0f, 4.0f, "自发光倍率")) {
-            a.dz25EmitScale = es;
-            a.dz25Dirty = true;
+        float es = a.vzEmitScale;
+        if (ui::labeledSliderFloat("vzEm", &es, 0.0f, 4.0f, "自发光倍率")) {
+            a.vzEmitScale = es;
+            a.vzDirty = true;
         }
-        ImGui::TextDisabled("图层 = z 层；解析 gather，无方向采样 -> 无条带");
-    } else if (a.pt) {
-        ImGui::SeparatorText("路径追踪");
+        if (ImGui::Checkbox("阴影（3D 阴影射线）", &a.vzShadows)) a.vzDirty = true;
+        ImGui::TextDisabled("渲染 +z 法相面，光照走正统 3D 光追");
+    } else if (a.pt) {        ImGui::SeparatorText("路径追踪");
         gfx::PathTraceSettings& s = a.pt->settings();
 
         int steps = s.maxSteps;

@@ -32,6 +32,18 @@
 #include <vector>
 
 namespace pb {
+
+// 统计（调优用）
+static long long g_statPairs = 0;      // 过距离检查的对数
+static long long g_statSteps = 0;      // 细 DDA 步数
+static long long g_statCoarse = 0;     // 块级粗判步数
+void dz25Stats(long long* pairs, long long* steps, long long* coarse) {
+    if (pairs) *pairs = g_statPairs;
+    if (steps) *steps = g_statSteps;
+    if (coarse) *coarse = g_statCoarse;
+}
+void dz25ResetStats() { g_statPairs = g_statSteps = g_statCoarse = 0; }
+
 namespace {
 
 inline float u8f(uint8_t v) { return (float)v / 255.0f; }
@@ -90,6 +102,28 @@ void trace25D(const VoxelGrid& g, const Dz25Params& prm, std::vector<RGBA8>& out
         fprintf(stderr, "\\n");
     }
 
+    // ---- 1.5 块级占据网格（加速遮挡判定）----
+    //
+    // 逐对做细步进是主要开销，而画布上绝大部分区间是空的。
+    // 用块级（xy 每 8 格、z 每 4 层）的"这一块里有没有实体"来做粗判：
+    // 一条线经过的所有块都空 -> 透射率必为 1，直接跳过细步进。
+    // 只要有任何一块非空，才落到原来的细 DDA。
+    // BZ 必须 = 1：块高若跨层，底层受光面会把射线所在层的块也标成非空，
+    // 粗判就永远失败（实测 7.0M 配对 -> 7.0M 粗步，即每对只走 1 步就放弃）。
+    constexpr int BXY = 8, BZ = 1;
+    const int BW = (X + BXY - 1) / BXY, BH = (Y + BXY - 1) / BXY,
+              BL = (Z + BZ - 1) / BZ;
+    std::vector<uint8_t> occ((size_t)BW * (size_t)BH * (size_t)BL, 0);
+    for (int z = 0; z < Z; z++)
+        for (int y = 0; y < Y; y++)
+            for (int x = 0; x < X; x++)
+                if (g.at(x, y, z).solid()) {
+                    const size_t k = ((size_t)(z / BZ) * (size_t)BH + (size_t)(y / BXY)) *
+                                         (size_t)BW +
+                                     (size_t)(x / BXY);
+                    occ[k] = 1;
+                }
+
     // ---- 2. 柱高 ----
     const size_t plane = (size_t)X * (size_t)Y;
     std::vector<int> height(plane, -1);
@@ -126,10 +160,45 @@ void trace25D(const VoxelGrid& g, const Dz25Params& prm, std::vector<RGBA8>& out
                 const float r2 = (float)(dx * dx + dy * dy + dz * dz);
                 if (r2 < 1e-6f) continue;              // 同一格
                 if (r2 > outer * outer) continue;      // 太远：1/r² 已经无关紧要
+                g_statPairs++;
+
+                // 块级粗判：这条线经过的块全空吗？全空就不用细步进了。
+                // 默认：先用块级粗判，只有发现非空块才落到细步进。
+                // PB_NOCOARSE=1 时跳过粗判（用于 A/B 对照）。
+                bool needFine = (getenv("PB_NOCOARSE") != nullptr);
+                if (!needFine) {
+                    const int adx = std::abs(dx), ady = std::abs(dy);
+                    const int sx = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+                    const int sy = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+                    int bx = x / BXY, by = y / BXY, bz = pz / BZ;
+                    const int tbx = q.x / BXY, tby = q.y / BXY, tbz = q.z / BZ;
+                    float tx = adx > 0 ? 0.5f / (float)adx : 1e30f;
+                    float ty = ady > 0 ? 0.5f / (float)ady : 1e30f;
+                    float tz = dz > 0 ? 0.5f / (float)dz : 1e30f;
+                    const float dtx = adx > 0 ? 1.0f / (float)adx : 1e30f;
+                    const float dty = ady > 0 ? 1.0f / (float)ady : 1e30f;
+                    const float dtz = dz > 0 ? 1.0f / (float)dz : 1e30f;
+                    int guard = adx / BXY + ady / BXY + dz / BZ + 4;
+                    while (guard-- > 0) {
+                        g_statCoarse++;
+                        if (bx == tbx && by == tby && bz == tbz) break;
+                        if (tx < ty && tx < tz) { bx += sx; tx += dtx; }
+                        else if (ty < tz) { by += sy; ty += dty; }
+                        else if (tz < 1e29f) { bz += 1; tz += dtz; }
+                        else break;
+                        if (bx < 0 || by < 0 || bz < 0 || bx >= BW || by >= BH || bz >= BL)
+                            break;
+                        if (occ[((size_t)bz * (size_t)BH + (size_t)by) * (size_t)BW +
+                                (size_t)bx]) {
+                            needFine = true;
+                            break;
+                        }
+                    }
+                }
 
                 // 从 p 沿直线走到 q，累透射率；遇到不透明就断
                 float T = 1.0f;
-                {
+                if (needFine) {
                     const int adx = std::abs(dx), ady = std::abs(dy);
                     const int sx = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
                     const int sy = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
@@ -142,6 +211,7 @@ void trace25D(const VoxelGrid& g, const Dz25Params& prm, std::vector<RGBA8>& out
                     const float dtz = dz > 0 ? 1.0f / (float)dz : 1e30f;
                     int guard = adx + ady + dz + 4;
                     while (guard-- > 0) {
+                        g_statSteps++;
                         if (tx < ty && tx < tz) { cx += sx; tx += dtx; }
                         else if (ty < tz) { cy += sy; ty += dty; }
                         else if (tz < 1e29f) { cz += 1; tz += dtz; }
@@ -167,7 +237,12 @@ void trace25D(const VoxelGrid& g, const Dz25Params& prm, std::vector<RGBA8>& out
                 // 水平方向的光才能传出去（这也是 2D 像素画希望的"同层泛光"）。
                 // 衰减：1/r^falloff。falloff=2 是物理平方反比（衰减太快，
                 // 细线光源稍远就看不见）；像素画用 1/r 才铺得开。
-                const float wgt = prm.gain / std::pow(r2, prm.falloff * 0.5f);
+                // 常见指数用 sqrt 特化，避免每个配对都调一次 pow()。
+                float atten;
+                if (prm.falloff == 1.0f) atten = 1.0f / std::sqrt(r2);
+                else if (prm.falloff == 2.0f) atten = 1.0f / r2;
+                else atten = 1.0f / std::pow(r2, prm.falloff * 0.5f);
+                const float wgt = prm.gain * atten;
                 acc[0] += q.e[0] * T * wgt;
                 acc[1] += q.e[1] * T * wgt;
                 acc[2] += q.e[2] * T * wgt;

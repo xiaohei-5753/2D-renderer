@@ -47,6 +47,10 @@ struct Dz25Params {
     float ambient[3] = {0.0f, 0.0f, 0.0f};
 };
 
+// 统计（调优用）：过距离检查的对数 / 细步进步数 / 块级粗判步数
+void dz25Stats(long long* pairs, long long* steps, long long* coarse);
+void dz25ResetStats();
+
 // 输出：X×Y 的 RGB 画布（RGBA8，alpha = 255）
 void trace25D(const VoxelGrid& g, const Dz25Params& prm, std::vector<RGBA8>& out);
 

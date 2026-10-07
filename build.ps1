@@ -197,6 +197,7 @@ function Invoke-Compile {
 $libSources = @()
 $libSources += @(Get-ChildItem -Path (Join-Path $root 'core') -Filter '*.cpp' | ForEach-Object { $_.FullName })
 $libSources += @(Get-ChildItem -Path (Join-Path $root 'gfx')  -Filter '*.cpp' | ForEach-Object { $_.FullName })
+$libSources += @(Get-ChildItem -Path (Join-Path $root 'render') -Filter '*.cpp' | ForEach-Object { $_.FullName })
 $libSources += @(Get-ChildItem -Path (Join-Path $root 'ui')   -Filter '*.cpp' | ForEach-Object { $_.FullName })
 if ($libSources.Count -eq 0) { Write-Error "no library sources found"; exit 1 }
 

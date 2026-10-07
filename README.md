@@ -246,6 +246,53 @@ Canvas 的脏矩形 -> GPU 上传        （只传那一块）
 （成本同量级，因为 3D DDA 一条线最多穿 `W+H+N` 个体素），但光照会变成 3D 的，
 霓虹在平面内传播的观感会改变。
 
+### 伪 3D 的 GPU 落地：逐层数组纹理
+
+`LightSweep` / `PathTrace` 的 albedo / 材质 / occl / emit / 结果**全部是
+`GL_TEXTURE_2D_ARRAY`**，着色器用 `texelFetch(sampler2DArray, ivec3(x,y,layer), 0)`
+取任意一层，"哪一层"只是一个 uniform。这样不必为每层写一套分支，也不必把 N 张纹理
+绑到 N 个 texture unit（硬件一般只有 16 个）。
+
+`gfx/layer_composite` 用一个 compute pass 把各层按 source-over 叠起来。
+留在 GPU 上是因为逐层结果有 N 张，回读 CPU 再合成会让每帧多出
+"下载 N 张全画布 + 上传 1 张"的往返。
+
+**只重算脏层**（`app/lighting.cpp`）：每多一层就多一整个光照 pass，所以那里记录
+每一层的 `Layer::revision` + 可见性 + 不透明度，只有真正变了的层才重算 ——
+画一笔通常只影响当前图层，代价与单层时一样。这是"实时"的关键。
+
+单层文档时 occl/emit 恒为 0，整套公式退化成原来的平面内扫描 ——
+`render_cli` 的单层路径因此与改造前逐像素一致。
+
+### ⚠️ 一个花了很久才理清的坑：合成要按"可见度"而不是"覆盖率"
+
+"先逐层照亮"意味着每层的受光结果里**空气像素也是有内容的** —— 那正是这一层
+贡献的光晕。但空气的覆盖率是 0。如果按 albedo 的语义（alpha = 不透明度）去合成，
+空气就会被当成"什么都没画"而整片丢掉：**泛光全部消失、只剩几条线**
+（实测平均亮度 73 → 0.47）。
+
+受光结果的 alpha 必须回答一个与 albedo 不同的问题：
+
+| 数据 | alpha 回答的问题 | 空气的含义 |
+|---|---|---|
+| 未受光的 albedo | 这个像素有多不透明 | 空的，露出下面那层 |
+| 受光结果 | 这一层的颜色要盖住下面多少 | 覆盖率为 0，但**光晕要留下** |
+
+所以受光结果的 alpha 存 `1 - cov`（可见度），合成时取反回 `cov`。
+`gfx/layer_composite.h` 与 `.cpp` 的头部都写了完整推导 —— 别再搞反。
+
+### 怎么验证这类改动（这次教训）
+
+只看最终画面，"扫描对不对"和"合成对不对"是同一个数字，无法区分。
+所以有两个诊断工具：
+
+| 工具 | 作用 |
+|---|---|
+| `tools/png_stat` | 读两张 PNG，给出平均亮度 / 亮度直方图 / 逐像素差。自带 inflate + PNG 逆滤波（环境里装不到读 PNG 的库，`stb_image` 下载回来是搜索引擎错误页） |
+| `tools/scan_dump` | 把一个场景的**扫描 / 逐层受光 / 最终结果**三个阶段分别 dump 成 PNG 并报平均亮度 |
+
+正是 `scan_dump` 报出"扫描 74.03、受光 73.35、最终 0.47"才一眼定位到合成那一步。
+
 ### 撤销重做
 
 每个步骤是一个**补丁列表**（`Step { before[], after[], metaBefore[], metaAfter[], ... }`），
@@ -293,6 +340,18 @@ build\render_cli.exe --scene neon --size 320x180 --radius 128 --out out.png
 | `--emit` / `--ambient` | 自发光倍率 / 环境光 `r,g,b` |
 | `--out` | 输出 PNG |
 | `--dump-canvas` | 额外导出未受光的画布原图，便于对照 |
+
+**逐层光照的诊断回路**（改了光照/合成之后先跑它，再看画面）：
+
+```powershell
+build\scan_dump.exe --size 320x180 --radius 128 --out out\d
+#   扫描         平均亮度   74.03  最大  202.3  -> out\d_scan.png
+#   lit0         平均亮度   73.35  最大  162.0  -> out\d_lit0.png
+#   result       平均亮度   73.35  最大  162.0  -> out\d_result.png
+# 三个阶段一致才算对；哪个阶段掉下去，问题就在那一步。
+build\png_stat.exe out\a.png out\b.png     # 平均亮度 / 直方图 / 逐像素差
+```
+
 
 **画板的演示 / 截图模式**（自动画一张演示图 → 渲染 N 帧 → 截下整个帧缓冲含 HUD）：
 
@@ -358,14 +417,13 @@ build\core_test.exe      # 或 .\build.ps1 -Test
 - [x] **P4-1** 多图层：数据模型 + 图层操作 + 压平合成 + 层间光照通道
 - [x] **P4-2** 工具 / History / 面板改造为作用于当前图层（图层感知的撤销重做）
 - [x] **P4-3** 图层面板 UI（缩略图 / 眼睛 / 锁定 / 不透明度 / 拖拽排序 / 增删移并）
-- [ ] **P4-4** 逐层光照接入 `occlAbove` / `emitFor`（模型 B 的最终落地，当前 `LightSweep` /
-  `PathTrace` 仍只接收压平结果）
+- [x] **P4-4** 逐层光照接入 `occlAbove` / `emitFor`（模型 B 落地：伪 3D 效果）
 - [ ] **P5** 选区与变换、工程文件（`.pxc`）读写、导出打磨
 
 ### 已知待办
 
-- 逐层光照尚未接入：`buildOcclAbove` / `buildEmitFor` 已实现并测试（`core/composite.h`），
-  但 `LightSweep` / `PathTrace` 目前仍然只吃压平后的那张图。这是 P4-4 的内容
+- 参与 GPU 光照的图层数上限是 16（每层一整个光照 pass）。超出部分仍会显示，
+  但不参与光照 —— 图层列表里应当给出提示
 - 画布最大尺寸仍受 `LightSweep` 一次性分配的限制（改尺寸要重新 `init`）
 - 路径追踪的残余蒙特卡洛噪声（下一步：next-event estimation 或 à-trous 降噪）
 - 厚半透明区域会因逐格吸收而变得不透明（遮挡是沿光路累乘的）

@@ -101,6 +101,7 @@ public:
 
     void setSettings(const RenderSettings& s) override {
         const bool diff = s.gi != set_.gi || s.lightSamples != set_.lightSamples ||
+                          s.coneAperture != set_.coneAperture ||
                           s.emissiveIntensity != set_.emissiveIntensity ||
                           s.cones != set_.cones || s.coneMaxDist != set_.coneMaxDist ||
                           s.giIntensity != set_.giIntensity ||
@@ -119,8 +120,10 @@ public:
     }
     int accumFrames() const override { return frames_; }
     bool converged() const override {
-        // 锥追踪是确定性的：一帧就是最终结果
-        if (set_.gi == RenderSettings::Gi::ConeTrace) return frames_ >= 1;
+        // 锥追踪第一帧就能出图（确定性），但继续跑会靠"逐帧旋转锥集合 +
+        // 帧间平均"把离散锥的结构性误差抹平，所以也让它参与累积。
+        if (set_.gi == RenderSettings::Gi::ConeTrace)
+            return !set_.progressive || frames_ >= std::max(1, set_.maxAccumFrames);
         return !set_.progressive || frames_ >= set_.maxAccumFrames;
     }
 
@@ -160,18 +163,34 @@ public:
             const int N = std::max(1, set_.cones);
             coneDir.reserve((size_t)N * 3u);
             const float ga = 2.39996323f;
+            // 逐帧把整个锥集合转一个角度。
+            //
+            // 离散锥集合的积分误差是"结构性"的（相邻锥之间的覆盖不匀），
+            // 光靠加锥只能压到一定程度。让它每帧转一个角度再帧间平均，
+            // 残余误差就摊成噪声被抹平 —— 这是 VCT 的标准做法。
+            const float frameRot = (set_.progressive && set_.maxAccumFrames > 1)
+                                       ? (float)frames_ * 2.39996323f
+                                       : 0.0f;
             for (int i = 0; i < N; i++) {
                 const float cz = 1.0f - ((float)i + 0.5f) / (float)N;
                 const float sz = std::sqrt(std::max(0.0f, 1.0f - cz * cz));
-                const float phi = (float)i * ga;
+                const float phi = (float)i * ga + frameRot;
                 coneDir.push_back(sz * std::cos(phi));
                 coneDir.push_back(sz * std::sin(phi));
                 coneDir.push_back(cz);
             }
-            // N 个锥大致铺满半球：每个占 2π/N 立体角
-            const float omega = 2.0f * 3.14159265f / (float)N;
-            const float cosA = std::max(-1.0f, 1.0f - omega / (2.0f * 3.14159265f));
-            coneTan = std::tan(std::acos(std::min(1.0f, cosA)));
+            // 锥半角：必须用点集的**覆盖半径**，不能用"面积等效半径"。
+            //
+            // 我第一版按"每个锥占 2π/N 立体角"算 α = acos(1-1/N)。
+            // 那是面积等效半径；而 Fibonacci 点集的覆盖半径大约是它的 1.8 倍，
+            // 于是相邻锥之间有空隙、某些方位角一个锥都覆盖不到。
+            // 表现：等距圆环上 min=0、光斑状伪影。
+            // （实测 N=9 时最近邻要 63°，公式只给 27°。）
+            //
+            // 半球上 N 个点的覆盖半径约为 2.5/√N（整球面是 2/√N）。
+            const float cover = 2.5f / std::sqrt((float)N);
+            const float ap = std::clamp(set_.coneAperture, 0.3f, 3.0f);
+            coneTan = std::tan(std::min(1.396f, cover * ap));   // 上限 80°
         }
 
         auto rows = [&](int y0, int y1) {

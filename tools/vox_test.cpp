@@ -18,6 +18,7 @@ int main(int argc, char** argv) {
     int W = 160, H = 96, Z = 16;
     float el = 45.0f, az = 135.0f, sun = 1.0f, sky = 0.20f;
     float gi = 1.0f;              // VCT GI 强度
+    float ap = 1.0f;              // 锥孔径缩放
     int maxMip = 3;               // VCT 最大 mip 层级
     int cones = 9;
     int plate = 0;                // 0=无板 1=带洞的板 2=整块无洞的板
@@ -38,11 +39,16 @@ int main(int argc, char** argv) {
         else if (a == "--sun") sun = (float)std::atof(next().c_str());
         else if (a == "--sky") sky = (float)std::atof(next().c_str());
         else if (a == "--gi") gi = (float)std::atof(next().c_str());
+        else if (a == "--ap") ap = (float)std::atof(next().c_str());
         else if (a == "--maxmip") maxMip = std::atoi(next().c_str());
         else if (a == "--cones") cones = std::atoi(next().c_str());
         else if (a == "--plate") plate = std::atoi(next().c_str());
         else if (a == "--out") out = next();
     }
+
+    // ring 场景：**单个发光体素** + 平坦地面。用来暴露锥的采样足迹：
+    // 半球积分应当径向对称，沿等距圆环亮度应当基本一致（min≈max）。
+    const bool ring = (getenv("PB_RING") != nullptr);
 
     render::VoxelVolume v;
     v.init(W, H, Z);
@@ -51,11 +57,20 @@ int main(int argc, char** argv) {
     for (int y = 0; y < H; y++)
         for (int x = 0; x < W; x++) v.color[v.idx(x, y, 0)] = RGBA8{150, 150, 155, 255};
 
-    // 一个高台：中间偏右，高度 10
-    for (int z = 0; z < 10; z++)
+    // 一个高台：中间偏右，高度 10（ring 模式下不要，它会盖住采样圆环）
+    if (!ring) for (int z = 0; z < 10; z++)
         for (int y = H / 4; y < H / 2; y++)
             for (int x = W / 2; x < W * 3 / 4; x++)
                 v.color[v.idx(x, y, z)] = RGBA8{190, 120, 70, 255};
+
+    if (ring) {
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) v.color[v.idx(x, y, 0)] = RGBA8{150, 150, 155, 255};
+        const int cx = W / 2, cy = H / 2;
+        const size_t k = v.idx(cx, cy, 6);
+        v.color[k] = RGBA8{255, 210, 140, 255};
+        v.emission[k] = RGBA8{255, 210, 140, 255};
+    }
 
     // 分图层遮挡的判定场景。
     //
@@ -67,7 +82,7 @@ int main(int argc, char** argv) {
     //
     //   plate=1  放遮挡板
     //   plate=0  对照，不放板
-    if (plate) {
+    if (plate && !ring) {
         const int zlo = 5, zhi = 7;
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W / 4; x++) {
@@ -80,7 +95,7 @@ int main(int argc, char** argv) {
 
     // 发光柱：放在板子**之上**
     const int ez0 = plate ? 8 : 0;
-    for (int z = ez0; z < ez0 + 6; z++)
+    if (!ring) for (int z = ez0; z < ez0 + 6; z++)
         for (int y = H / 3; y < H / 3 + 6; y++)
             for (int x = W / 6; x < W / 6 + 6; x++) {
                 const size_t k = v.idx(x, y, z);
@@ -102,17 +117,41 @@ int main(int argc, char** argv) {
     rs.giMaxMip = maxMip;
     rs.coneMaxDist = 96.0f;
     rs.giIntensity = gi;
+    rs.coneAperture = ap;
     r->setSettings(rs);
 
     std::vector<RGBA8> px;
-    const int frames = 4;
+    const int frames = 16;
     for (int f = 0; f < frames; f++) r->render(px);
-    printf("  锥追踪（确定性）：跑了 %d 帧\n", r->accumFrames());
+    printf("  锥追踪：跑了 %d 帧（逐帧旋转锥集合 + 帧间平均）\n", r->accumFrames());
 
     Image img(W, H);
     for (int i = 0; i < W * H; i++) img.data()[i] = px[(size_t)i];
     const std::string path = out + ".png";
     writePNG(path, img);
+
+    if (ring) {
+        // 沿半径 R 的圆环统计：半球积分径向对称 -> min 应当接近 max
+        const double cxf = (double)(W / 2) + 0.5, cyf = (double)(H / 2) + 0.5;
+        printf("  圆环统计（亮度的最小/最大/均值，理想情况 min≈max）：\\n");
+        for (int R = 6; R <= 40; R += 4) {
+            int mn = 999, mx = -1; double sum = 0; int n = 0;
+            for (int i = 0; i < 720; i++) {
+                const double a = i * 3.14159265 / 360.0;
+                const int x = (int)std::lround(cxf + R * std::cos(a));
+                const int y = (int)std::lround(cyf + R * std::sin(a));
+                if (x < 0 || y < 0 || x >= W || y >= H) continue;
+                const int g = px[(size_t)y * W + x].g;
+                if (g < mn) mn = g;
+                if (g > mx) mx = g;
+                sum += g; n++;
+            }
+            if (n == 0) continue;
+            const double mean = sum / n;
+            printf("    R=%2d  min=%3d  max=%3d  mean=%6.1f  不匀度=%.1f%%\\n", R, mn, mx, mean,
+                   mean > 0.5 ? 100.0 * (mx - mn) / mean : 0.0);
+        }
+    }
 
     // 数值检查 1：穿过发光柱那一行的地面（应当被染成青色）
     const int ly = H / 3 + 1;

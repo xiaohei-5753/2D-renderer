@@ -43,7 +43,10 @@ struct RenderSettings {
     int lightSamples = 4;         // 每像素每帧抽多少个光源
 
     // 体素锥追踪（Gi::ConeTrace 用）
-    int cones = 9;                // 半球上打几个锥
+    int cones = 32;               // 半球上打几个锥（实测 9 个时圆环不匀度 366%，
+                                  // 32 个降到 215%，64 个 54%）
+    float coneAperture = 1.0f;    // 锥半角缩放：1 = 让 N 个锥刚好铺满半球（无重叠）。
+                                  // 太小 -> 锥之间有空隙 -> 光斑；太大 -> 过模糊
     float coneMaxDist = 96.0f;    // 锥的最远距离
     int giMaxMip = 3;             // 最大 mip 层级：粗层会把空间上分离的东西混在一起
                                   // （板子和板上方的光源落进同一个块 -> 光"穿过"板子）

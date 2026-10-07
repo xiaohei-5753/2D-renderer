@@ -95,7 +95,7 @@ struct App {
     bool vzShadows = true;
     int vzLayerStride = 4;         // 每个图层在 z 方向占几格（层间留空 -> 光才照得下来）
     int vzGiMode = 2;              // 0=关 1=光源采样 2=体素锥追踪(VCT)
-    int vzCones = 9;               // VCT：半球上打几个锥
+    int vzCones = 32;              // VCT：半球上打几个锥
     float vzGiIntensity = 1.0f;    // VCT：GI 强度
     float vzConeDist = 96.0f;      // VCT：锥最远距离
     int vzMaxMip = 3;              // VCT：最大 mip 层级（太粗会漏过遮挡物）

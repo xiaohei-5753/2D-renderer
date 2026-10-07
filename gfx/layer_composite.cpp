@@ -70,14 +70,12 @@ void main(){
   for(int i=0;i<u_n;i++){
     vec4 c=texelFetch(u_tex,ivec3(p,i),0);
     float op=texelFetch(u_opacity,ivec3(p,i),0).r;
+    // 光场：只做**追加**，不改下面原有的混合路径。
+    // 这样 strength=0 时与原来的实现逐字节等价，出问题一定在光场项里。
     if(u_fieldStrength>0.0){
-      // 上层光场照亮这一层：彩色光打在彩色表面上 = 表面色 * 光色
       gabove-=texelFetch(u_field,ivec3(p,i),0).rgb;
-      vec3 alb=texelFetch(u_albedo,ivec3(p,i),0).rgb;
-      vec3 C=c.rgb+alb*gabove*u_fieldStrength;
-      // 逐像素覆盖率（c.a），而不是整层一个标量
-      if(op>0.0)acc=C+(acc-C)*(1.0-clamp(c.a,0.0,1.0)*op);
-      continue;
+      // 彩色光打在彩色表面上：表面色 * 光色
+      c.rgb+=gabove*u_fieldStrength;
     }
     if(op<=0.0)continue;
     if(u_albedoAsOpaque!=0){
@@ -140,7 +138,7 @@ void LayerComposite::composite(GLuint layersTex, GLuint opacityTex, int layerCou
     glUniform2i(u_.cs, w, h);
     glUniform1i(u_.n, layerCount);
     // 光场模型：上层的光场照亮下层
-    glUniform1f(u_.fieldStrength, fieldTex && albedoTex ? fieldStrength : 0.0f);
+    glUniform1f(u_.fieldStrength, fieldTex ? fieldStrength : 0.0f);
     if (fieldTex && albedoTex) {
         // 注意用 3/4：unit 0 是各层结果、unit 1 是**不透明度数组**，
         // 占用 1/2 会把不透明度覆盖掉（实测光场整个消失）。

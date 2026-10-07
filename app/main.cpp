@@ -242,6 +242,7 @@ int main(int argc, char** argv) {
     int framesToRun = 0;
     int paletteIndex = -1;
     app::LightMode startMode = app::LightMode::Sweep;
+    float startField = 0.0f;      // --field：光场照亮下层的强度
     std::string outFile;
     std::string forceOpen, forceClosed;
     std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
@@ -267,6 +268,8 @@ int main(int argc, char** argv) {
             outFile = args[(size_t)++i];
         } else if (arg == "--palette" && i + 1 < argCount) {
             paletteIndex = std::atoi(args[(size_t)++i].c_str());
+        } else if (arg == "--field" && i + 1 < argCount) {
+            startField = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--mode" && i + 1 < argCount) {
             const std::string& m = args[(size_t)++i];
             if (m == "pathtrace" || m == "pt") startMode = app::LightMode::PathTrace;
@@ -309,6 +312,7 @@ int main(int argc, char** argv) {
     a.opts.color = a.palette.current();
     a.demo = demo;
     a.lightMode = startMode;
+    a.fieldStrength = startField;
 
     // 自动化/回归用：直接切到某一套色板（例如 NES 55 色，验证色块网格的自动换行）
     if (paletteIndex >= 0) {

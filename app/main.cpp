@@ -28,6 +28,7 @@
 #include "app/input.h"
 #include "app/panels.h"
 #include "app/voxel_build.h"
+#include "core/image.h"
 #include "render/voxel_renderer.h"
 #include "core/composite.h"
 #include "gfx/layer_composite.h"
@@ -392,8 +393,17 @@ int main(int argc, char** argv) {
 
     // 体素光追：GUI 只通过 render/voxel_renderer.h 这个接口用它。
     // 渲染端内部（加速结构、线程、GPU 资源）GUI 一概不知道。
-    auto voxRenderer = render::createVoxelRenderer();
+    // 优先 GPU 版（Radiance Cascades 在 GPU 上约 20 倍快）；建不起来就回退 CPU 版
+    auto voxRenderer = render::createVoxelGpuRenderer();
+    if (!voxRenderer) {
+        fprintf(stderr, "[体素光追] GPU 版不可用，回退 CPU 版\\n");
+        voxRenderer = render::createVoxelRenderer();
+    }
     const GLuint voxTex = gfx::createTexture(GL_RGBA8, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE);
+    GLuint voxShown = voxTex;      // 实际显示用的纹理（GPU 版直接用渲染端的）
+    // GPU 版是"一次 dispatch 就出结果"，converged() 恒为 true。
+    // 所以不能只靠 !converged() 来决定要不要渲染，否则永远不渲染（画面全黑）。
+    bool voxNeedsFrame = true;
     render::VoxelVolume voxVol;
     std::vector<RGBA8> voxPx;
     bool voxUploaded = false;
@@ -527,6 +537,7 @@ int main(int argc, char** argv) {
                     // 渐进累积被反复重置，永远收敛不了。
                     a.lightAllLayers = false;
                     for (auto& v : a.lightDirtyLayers) v = 0;
+                    voxNeedsFrame = true;      // 几何变了要重画一帧
                 }
                 if (a.vzDirty || geomChanged) {
                     render::RenderSettings rs;
@@ -560,17 +571,28 @@ int main(int argc, char** argv) {
                     rs.maxAccumFrames = a.vzMaxFrames;
                     voxRenderer->setSettings(rs);   // 参数变了自己会重置累积
                     a.vzDirty = false;
+                    voxNeedsFrame = true;      // 参数变了要重画一帧
                 }
-                // 渐进累积：每帧推进一步，UI 不失响应；收敛后停手
-                if (!voxRenderer->converged()) {
+                // 渐进累积：每帧推进一步，UI 不失响应；收敛后停手。
+                // voxNeedsFrame 兜住"一次就出结果"的 GPU 版。
+                if (voxNeedsFrame || !voxRenderer->converged()) {
                     lightTimer.begin();
                     voxRenderer->render(voxPx);
                     lightTimer.end();
-                    glBindTexture(GL_TEXTURE_2D, voxTex);
-                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cw, ch, GL_RGBA,
-                                    GL_UNSIGNED_BYTE, voxPx.data());
-                    glBindTexture(GL_TEXTURE_2D, 0);
+                    // GPU 实现把结果留在显存里（resultTexture），直接用它，
+                    // 省掉一次上传；CPU 实现才需要把像素传上去。
+                    const GLuint rt = voxRenderer->resultTexture();
+                    if (rt) {
+                        voxShown = rt;
+                    } else {
+                        glBindTexture(GL_TEXTURE_2D, voxTex);
+                        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cw, ch, GL_RGBA,
+                                        GL_UNSIGNED_BYTE, voxPx.data());
+                        glBindTexture(GL_TEXTURE_2D, 0);
+                        voxShown = voxTex;
+                    }
+                    if (voxRenderer->converged()) voxNeedsFrame = false;
                 }
                 a.vzFrames = voxRenderer->accumFrames();
                 a.vzMs = (float)voxRenderer->lastMs();
@@ -625,7 +647,7 @@ int main(int argc, char** argv) {
                 glMemoryBarrier(GL_ALL_BARRIER_BITS);
                 shown = albedoFlat;
             } else {
-                if (a.lightMode == app::LightMode::Trace25D) shown = voxTex;
+                if (a.lightMode == app::LightMode::Trace25D) shown = voxShown;
                 else shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
             }
             vp.draw(shown);

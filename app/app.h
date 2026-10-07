@@ -84,7 +84,10 @@ struct App {
     // --- 光照 ---
     bool lightOn = true;
     LightMode lightMode = LightMode::Sweep;
-    float fieldStrength = 0.0f;      // 上层光场照亮下层的强度（0 = 关）
+    // 上层光场照亮下层的强度。**默认开**：
+    // 每层的颜色 = 原始颜色 × (本层+上方各层的光场 + 环境光)，
+    // 所以只有环境光时白纸是暗的（这正是期望行为）；0 = 退回旧的 mix 路径。
+    float fieldStrength = 1.0f;
     bool lightDirty = true;
     float lightMs = 0.0f;
     // --- 视图选项 ---

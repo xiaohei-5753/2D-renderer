@@ -151,7 +151,7 @@ private:
     int w_ = 0, h_ = 0;
     int layers_ = 0;
     // 0 = 关（用原来那套 occl/emit 模型）；>0 打开"上层光场照亮下层"
-    float fieldStrength_ = 0.0f;
+    float fieldStrength_ = 1.0f;
     LightSettings st_;
 
     // --- 输入（每层一层）---

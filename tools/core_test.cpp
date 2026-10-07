@@ -13,6 +13,7 @@
 #include "core/canvas.h"
 #include "core/console.h"
 #include "core/history.h"
+#include "core/layer.h"
 #include "core/material.h"
 #include "core/palette.h"
 #include "core/tool.h"
@@ -779,6 +780,98 @@ void testResize() {
     CHECK(c.materialData() != nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// 测试：多图层文档
+// ---------------------------------------------------------------------------
+
+void testDocument() {
+    section("多图层 / 文档与图层操作");
+
+    Document doc(16, 16);
+    CHECK(doc.layerCount() == 1);
+    CHECK(doc.activeIndex() == 0);
+    CHECK(doc.width() == 16 && doc.height() == 16);
+    CHECK(doc.layer(0).pixelCount() == 16 * 16);
+    CHECK(doc.layer(0).material.size() == 16 * 16);
+
+    // 新建层插在**当前层之上**并选中它
+    const int a = doc.addLayer("测试层");
+    CHECK(doc.layerCount() == 2);
+    CHECK(a == 1);
+    CHECK(doc.activeIndex() == 1);
+    CHECK(doc.layer(1).name == "测试层");
+
+    // 复制
+    doc.setActiveIndex(0);
+    const int d = doc.duplicateLayer(0);
+    CHECK(doc.layerCount() == 3);
+    CHECK(d == 1);
+    CHECK(doc.layer(1).name.find("副本") != std::string::npos);
+
+    // 不允许删空
+    CHECK(doc.removeLayer(0));
+    CHECK(doc.removeLayer(0));
+    CHECK(doc.layerCount() == 1);
+    CHECK(!doc.removeLayer(0));      // 只剩一层时拒绝
+
+    // 上下移动
+    doc.addLayer("A");
+    doc.addLayer("B");
+    CHECK(doc.layerCount() == 3);
+    const std::string top = doc.layer(2).name;
+    CHECK(doc.moveLayer(2, 0));
+    CHECK(doc.layer(0).name == top);
+    CHECK(doc.activeIndex() == 0);
+    CHECK(!doc.moveLayer(1, 1));     // 原地移动是空操作
+
+    // 越界索引被夹取，不应崩
+    doc.setActiveIndex(999);
+    CHECK(doc.activeIndex() == doc.layerCount() - 1);
+    doc.setActiveIndex(-5);
+    CHECK(doc.activeIndex() == 0);
+
+    // 改尺寸会重置成一个空层
+    doc.resize(8, 8);
+    CHECK(doc.layerCount() == 1);
+    CHECK(doc.width() == 8 && doc.height() == 8);
+}
+
+void testLayerMerge() {
+    section("多图层 / 合并向下（source-over）");
+
+    Document doc(4, 4);
+    // 底层：不透明的红
+    doc.layer(0).albedo.fill(RGBA8{200, 0, 0, 255});
+    doc.layer(0).material.assign(16, Material{});
+
+    // 上层：除了一个像素外全透明
+    const int up = doc.addLayer("上");
+    doc.layer(up).albedo.fill(RGBA8{0, 0, 0, 0});
+    doc.layer(up).material.assign(16, Material{});
+    Material glow;
+    glow.setEmissionFrom(0, 200, 0);
+    doc.layer(up).albedo.at(1, 1) = RGBA8{0, 0, 200, 128};
+    doc.layer(up).materialAt(1, 1) = glow;
+
+    CHECK(doc.mergeDown(up));
+    CHECK(doc.layerCount() == 1);
+
+    // 未被覆盖处保持底层的红
+    CHECK(doc.layer(0).albedo.at(0, 0) == (RGBA8{200, 0, 0, 255}));
+    // 半透明蓝叠在不透明红上 -> 结果不透明，且红蓝都参与了混合
+    const RGBA8 m = doc.layer(0).albedo.at(1, 1);
+    CHECK(m.a == 255);
+    CHECK(m.r > 0 && m.b > 0);
+    // 材质采用上层的（"最上层有覆盖的像素，其材质胜出"）
+    CHECK(doc.layer(0).materialAt(1, 1).emG == 200);
+    // 未被覆盖处的材质保持底层的（自发光为 0）
+    CHECK(doc.layer(0).materialAt(0, 0).emissionLevel() == 0);
+
+    // 层数不足时拒绝
+    CHECK(!doc.mergeDown(0));
+    CHECK(!doc.mergeDown(5));
+}
+
 }  // namespace
 
 int main() {
@@ -807,6 +900,8 @@ int main() {
     testHistoryExternalChange();
     testCanvasDirtyRect();
     testResize();
+    testDocument();
+    testLayerMerge();
 
     printf("\n========================================\n");
     printf("通过 %d，失败 %d\n", g_pass, g_fail);

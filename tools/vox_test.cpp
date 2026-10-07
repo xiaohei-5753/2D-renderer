@@ -19,6 +19,11 @@ int main(int argc, char** argv) {
     float el = 45.0f, az = 135.0f, sun = 1.0f, sky = 0.20f;
     float gi = 1.0f;              // VCT GI 强度
     float ap = 1.0f;              // 锥孔径缩放
+    int alg = 3;                  // GI 算法
+    bool compare = false;         // 与反向光追（参照物）对比
+    int k0 = 4;                   // RC 最细一层的射线数
+    float l0 = 2.0f;              // RC 最细一层的距离区间上限
+    int ncs = 7;                  // RC 层数
     int maxMip = 3;               // VCT 最大 mip 层级
     int cones = 9;
     int plate = 0;                // 0=无板 1=带洞的板 2=整块无洞的板
@@ -43,6 +48,11 @@ int main(int argc, char** argv) {
         else if (a == "--maxmip") maxMip = std::atoi(next().c_str());
         else if (a == "--cones") cones = std::atoi(next().c_str());
         else if (a == "--plate") plate = std::atoi(next().c_str());
+        else if (a == "--alg") alg = std::atoi(next().c_str());   // 0关 1光源采样 2VCT 3RC
+        else if (a == "--compare") compare = true;
+        else if (a == "--k0") k0 = std::atoi(next().c_str());
+        else if (a == "--l0") l0 = (float)std::atof(next().c_str());
+        else if (a == "--nc") ncs = std::atoi(next().c_str());
         else if (a == "--out") out = next();
     }
 
@@ -118,11 +128,37 @@ int main(int argc, char** argv) {
     rs.coneMaxDist = 96.0f;
     rs.giIntensity = gi;
     rs.coneAperture = ap;
+    rs.cascadeRays = k0;
+    rs.cascadeBase = l0;
+    rs.cascades = ncs;
+    rs.gi = (alg == 1)   ? render::RenderSettings::Gi::LightSampling
+            : (alg == 2) ? render::RenderSettings::Gi::ConeTrace
+            : (alg == 3) ? render::RenderSettings::Gi::RadianceCascades
+                         : render::RenderSettings::Gi::None;
     r->setSettings(rs);
 
     std::vector<RGBA8> px;
-    const int frames = 16;
+    const int frames = 256;
     for (int f = 0; f < frames; f++) r->render(px);
+    if (compare) {
+        // 用**反向光追（光源采样）**当参照物：两种算法都应收敛到同一张图
+        std::vector<RGBA8> ref;
+        rs.gi = render::RenderSettings::Gi::LightSampling;
+        rs.lightSamples = 16;
+        r->setSettings(rs);
+        for (int f = 0; f < 512; f++) r->render(ref);
+        double sum = 0, mx = 0; int nd = 0;
+        for (size_t i = 0; i < ref.size(); i++) {
+            const int a0 = ref[i].r, a1 = px[i].r;
+            const double d = std::abs(a0 - a1);
+            sum += d; if (d > mx) mx = d; if (d > 2) nd++;
+        }
+        printf("  vs 反向光追：平均差 %.2f  最大差 %.0f  明显不同 %d/%zu\\n",
+               sum / (double)ref.size(), mx, nd, ref.size());
+        Image ri(W, H);
+        for (int i = 0; i < W * H; i++) ri.data()[i] = ref[(size_t)i];
+        writePNG(out + "_ref.png", ri);
+    }
     printf("  锥追踪：跑了 %d 帧（逐帧旋转锥集合 + 帧间平均）\n", r->accumFrames());
 
     Image img(W, H);

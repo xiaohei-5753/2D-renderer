@@ -543,12 +543,16 @@ int main(int argc, char** argv) {
                     rs.skyColor[2] *= 1.25f;                 // 天光偏冷
                     rs.emitScale = a.vzEmitScale;
                     rs.shadows = a.vzShadows;
-                    rs.gi = (a.vzGiMode == 2)   ? render::RenderSettings::Gi::ConeTrace
+                    rs.gi = (a.vzGiMode == 3)   ? render::RenderSettings::Gi::RadianceCascades
+                            : (a.vzGiMode == 2) ? render::RenderSettings::Gi::ConeTrace
                             : (a.vzGiMode == 1) ? render::RenderSettings::Gi::LightSampling
                                                 : render::RenderSettings::Gi::None;
                     rs.cones = a.vzCones;
                     rs.coneMaxDist = a.vzConeDist;
                     rs.giMaxMip = a.vzMaxMip;
+                    rs.cascades = a.vzCascades;
+                    rs.cascadeRays = a.vzCascadeRays;
+                    rs.cascadeBase = a.vzCascadeBase;
                     rs.giIntensity = a.vzGiIntensity;
                     rs.emissiveIntensity = a.vzEmitIntensity;
                     rs.lightSamples = a.vzLightSamples;

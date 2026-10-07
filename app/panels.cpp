@@ -1149,9 +1149,10 @@ void drawLightingSection(App& a) {
             ImGui::SetTooltip("每个图层在 z 方向占几格。太小的话上层光源对下层是掠射、照不亮");
         ImGui::SeparatorText("全局光照");
         {
-            const char* items[] = {"关闭", "光源采样（有噪声，需累积）", "体素锥追踪 VCT（无噪声）"};
+            const char* items[] = {"关闭", "光源采样（有噪声，需累积）",
+                                   "体素锥追踪 VCT", "Radiance Cascades（角度随距离自适应）"};
             int m = a.vzGiMode;
-            if (ImGui::Combo("算法", &m, items, 3)) {
+            if (ImGui::Combo("算法", &m, items, 4)) {
                 a.vzGiMode = m;
                 a.vzDirty = true;
             }
@@ -1213,6 +1214,26 @@ void drawLightingSection(App& a) {
             ImGui::TextDisabled("蒙特卡洛：有噪声，靠累积收敛");
         } else if (a.vzGiMode == 2) {
             ImGui::TextDisabled("VCT 是确定性的：一帧就是最终结果，不需要累积");
+        } else if (a.vzGiMode == 3) {
+            int nc = a.vzCascades;
+            if (ui::labeledSliderInt("vzNcas", &nc, 2, 12, "cascade 层数")) {
+                a.vzCascades = nc;
+                a.vzDirty = true;
+            }
+            int kr = a.vzCascadeRays;
+            if (ui::labeledSliderInt("vzK0", &kr, 4, 128, "最细层射线数")) {
+                a.vzCascadeRays = kr;
+                a.vzDirty = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("判据：射线角宽要小于源的角尺寸 ->\\n"
+                                  "最细层射线数 >= 6.28 * 最细层距离^2");
+            float lb = a.vzCascadeBase;
+            if (ui::labeledSliderFloat("vzL0", &lb, 0.5f, 8.0f, "最细层距离", "%.1f")) {
+                a.vzCascadeBase = lb;
+                a.vzDirty = true;
+            }
+            ImGui::TextDisabled("角度分辨率随距离翻倍 -> 无采样空隙、无噪声");
         }        ImGui::TextDisabled("渲染 +z 法相面，光照走正统 3D 光追");
     } else if (a.pt) {        ImGui::SeparatorText("路径追踪");
         gfx::PathTraceSettings& s = a.pt->settings();

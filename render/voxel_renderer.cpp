@@ -92,6 +92,8 @@ public:
                 }
 
         buildMips();
+        cascades_.clear();            // 几何变了，cascade 要重建
+        cascadeL0_ = -1.0f;
         resetAccumulation();
         if (getenv("PB_VOXDBG"))
             fprintf(stderr, "[vox] 体素 %dx%dx%d  光源 %zu  总功率 %.1f  mip 层数 %zu\n", X, Y, Z,
@@ -112,6 +114,9 @@ public:
         if (diff) resetAccumulation();
         // emitScale 会进 mip 第 0 层，变了要重建
         if (s.emitScale != emitScaleUsed_) buildMips();
+        if (s.cascades != set_.cascades || s.cascadeBase != set_.cascadeBase ||
+            s.cascadeRays != set_.cascadeRays || s.emitScale != set_.emitScale)
+            cascades_.clear();
     }
 
     void resetAccumulation() override {
@@ -154,6 +159,8 @@ public:
         const bool useEm = set_.gi == RenderSettings::Gi::LightSampling &&
                            !lights_.empty() && totalPower_ > 0.0f;
         const bool useVct = set_.gi == RenderSettings::Gi::ConeTrace;
+        const bool useRc = set_.gi == RenderSettings::Gi::RadianceCascades;
+        if (useRc && cascades_.empty()) buildCascades();
         const uint32_t frameSeed = (uint32_t)(frames_ * 2654435761u + 12345u);
 
         // 锥方向：上半球斐波那契（cosθ = 1-(i+.5)/N ∈ (0,1]）
@@ -237,6 +244,13 @@ public:
                             const float w = d[2] * omega * set_.giIntensity;
                             for (int c = 0; c < 3; c++) lit[c] += acc[c] * w;
                         }
+                    }
+
+                    // ---- Radiance Cascades ----
+                    if (useRc) {
+                        float rc[3] = {0, 0, 0};
+                        mergeCascades(x, y, rc);
+                        for (int c = 0; c < 3; c++) lit[c] += rc[c] * set_.giIntensity;
                     }
 
                     // ---- 光源采样（对照）----
@@ -438,10 +452,180 @@ private:
         }
     }
 
+    // ================= Radiance Cascades =================
+    //
+    // 每个 cascade 只负责一段距离区间，且**角度分辨率随距离翻倍**：
+    //
+    //    cascade c：探测点间距 2^c 像素，射线数 K0·4^c，
+    //               负责区间 [L0·2^(c-1), L0·2^c)   （c=0 从 0 开始）
+    //
+    // 距离翻倍 -> 半球立体角翻 4 倍 -> 射线数也翻 4 倍，所以
+    // **每条射线覆盖的立体角恒定**，不会像 VCT 那样在远处出现空隙（光斑）。
+    // 而探测点数掉 4 倍正好抵消：每个 cascade 的射线总数都是 N·K0。
+    //
+    // 我们的表面法线处处是 +z，所以每个探测点可以把该 cascade 的方向贡献
+    // 预先合成一个 float3 存起来 —— 合并阶段就退化成"逐层双线性插值再相加"。
+
+    struct Cascade {
+        int spacing = 1;         // 探测点间距（像素）
+        int gw = 0, gh = 0;      // 探测点网格尺寸
+        int dirs = 1;            // 射线数
+        float r0 = 0, r1 = 0;    // 负责的距离区间
+        std::vector<float> val;  // gw*gh*3：每个探测点的辐照度贡献
+    };
+
+    void ensureCascades() {
+        const int want = std::clamp(set_.cascades, 1, 12);
+        const float L0 = std::max(0.5f, set_.cascadeBase);
+        const int K0 = std::max(1, set_.cascadeRays);
+        if ((int)cascades_.size() == want && cascadeL0_ == L0 && cascadeK0_ == K0) return;
+        cascadeL0_ = L0;
+        cascadeK0_ = K0;
+
+        const int X = vol_.X, Y = vol_.Y;
+        cascades_.clear();
+        cascades_.resize((size_t)want);
+        for (int c = 0; c < want; c++) {
+            Cascade& cc = cascades_[(size_t)c];
+            cc.spacing = 1 << c;
+            cc.dirs = K0 * (1 << (2 * c));                  // 4^c
+            cc.r0 = (c == 0) ? 0.0f : L0 * (float)(1 << (c - 1));
+            cc.r1 = L0 * (float)(1 << c);
+            cc.gw = (X + cc.spacing - 1) / cc.spacing;
+            cc.gh = (Y + cc.spacing - 1) / cc.spacing;
+            cc.val.assign((size_t)cc.gw * (size_t)cc.gh * 3u, 0.0f);
+        }
+    }
+
+    void buildCascades() {
+        ensureCascades();
+        const int limit = (vol_.X + vol_.Y + vol_.Z) * 2 + 8;
+        for (Cascade& cc : cascades_) {
+            const float dOmega = 2.0f * 3.14159265f / (float)cc.dirs;
+            // 方向集合：上半球斐波那契
+            std::vector<float> dirs((size_t)cc.dirs * 3u);
+            {
+                const float ga = 2.39996323f;
+                for (int i = 0; i < cc.dirs; i++) {
+                    const float cz = 1.0f - ((float)i + 0.5f) / (float)cc.dirs;
+                    const float sz = std::sqrt(std::max(0.0f, 1.0f - cz * cz));
+                    const float phi = (float)i * ga;
+                    dirs[(size_t)i * 3u + 0] = sz * std::cos(phi);
+                    dirs[(size_t)i * 3u + 1] = sz * std::sin(phi);
+                    dirs[(size_t)i * 3u + 2] = cz;
+                }
+            }
+            auto doProbe = [&](int pi) {
+                const int gx = pi % cc.gw, gy = pi / cc.gw;
+                const int x = gx * cc.spacing, y = gy * cc.spacing;
+                if (x >= vol_.X || y >= vol_.Y) return;
+                const int h = top_[(size_t)y * (size_t)vol_.X + (size_t)x];
+                if (h < 0) return;
+                const float p[3] = {(float)x + 0.5f, (float)y + 0.5f, (float)(h + 1)};
+                float acc[3] = {0, 0, 0};
+                for (int i = 0; i < cc.dirs; i++) {
+                    float r[3];
+                    traceCascadeRay(p, &dirs[(size_t)i * 3u], cc.r0, cc.r1, r, limit);
+                    const float w = dirs[(size_t)i * 3u + 2] * dOmega;   // cosθ · ΔΩ
+                    acc[0] += r[0] * w;
+                    acc[1] += r[1] * w;
+                    acc[2] += r[2] * w;
+                }
+                float* d = &cc.val[(size_t)pi * 3u];
+                d[0] = acc[0];
+                d[1] = acc[1];
+                d[2] = acc[2];
+            };
+
+            const int total = cc.gw * cc.gh;
+            const int hw = (int)std::thread::hardware_concurrency();
+            const int nt = std::max(1, std::min(hw > 0 ? hw : 4, total));
+            if (nt <= 1) {
+                for (int i = 0; i < total; i++) doProbe(i);
+            } else {
+                std::vector<std::thread> th;
+                const int chunk = (total + nt - 1) / nt;
+                for (int t = 0; t < nt; t++) {
+                    const int a = t * chunk, b = std::min(total, a + chunk);
+                    if (a >= b) break;
+                    th.emplace_back([&doProbe, a, b]() {
+                        for (int i = a; i < b; i++) doProbe(i);
+                    });
+                }
+                for (auto& t : th) t.join();
+            }
+        }
+    }
+
+    // 从 p 沿 d 走到 r1：全程累积透射率（遮挡要正确），
+    // 但**只在本 cascade 负责的区间 [r0, r1) 累积辐射**。
+    void traceCascadeRay(const float p[3], const float d[3], float r0, float r1, float out[3],
+                         int limit) const {
+        out[0] = out[1] = out[2] = 0.0f;
+        int x = (int)std::floor(p[0]);
+        int y = (int)std::floor(p[1]);
+        int z = (int)std::floor(p[2]);
+        const int sx = (d[0] > 0) ? 1 : (d[0] < 0 ? -1 : 0);
+        const int sy = (d[1] > 0) ? 1 : (d[1] < 0 ? -1 : 0);
+        const int sz = (d[2] > 0) ? 1 : (d[2] < 0 ? -1 : 0);
+        const float inf = 1e30f;
+        auto tDelta = [&](float dd) { return (dd != 0.0f) ? std::fabs(1.0f / dd) : inf; };
+        auto tMax = [&](float pp, int cell, int st, float dd) {
+            if (dd == 0.0f || st == 0) return inf;
+            const float bound = (st > 0) ? (float)(cell + 1) : (float)cell;
+            return (bound - pp) / dd;
+        };
+        float tMaxX = tMax(p[0], x, sx, d[0]);
+        float tMaxY = tMax(p[1], y, sy, d[1]);
+        float tMaxZ = tMax(p[2], z, sz, d[2]);
+        const float tDx = tDelta(d[0]), tDy = tDelta(d[1]), tDz = tDelta(d[2]);
+        float T = 1.0f;
+
+        for (int it = 0; it < limit; it++) {
+            float tHit;
+            if (tMaxX < tMaxY && tMaxX < tMaxZ) { tHit = tMaxX; x += sx; tMaxX += tDx; }
+            else if (tMaxY < tMaxZ) { tHit = tMaxY; y += sy; tMaxY += tDy; }
+            else { tHit = tMaxZ; z += sz; tMaxZ += tDz; }
+            if (tHit > r1) break;
+            if (!vol_.inBounds(x, y, z)) break;
+            const size_t ci = vol_.idx(x, y, z);
+            const float A = VoxelVolume::a01(vol_.color[ci]);
+            if (A > 0.0f) {
+                if (tHit >= r0) {
+                    const RGBA8 e = vol_.emission[ci];
+                    out[0] += T * u8f(e.r) * set_.emitScale * A;
+                    out[1] += T * u8f(e.g) * set_.emitScale * A;
+                    out[2] += T * u8f(e.b) * set_.emitScale * A;
+                }
+                T *= (1.0f - A);
+                if (T < 1e-3f) break;
+            }
+        }
+    }
+
+    // 合并：逐层双线性插值再相加
+    void mergeCascades(int x, int y, float lit[3]) const {
+        for (const Cascade& cc : cascades_) {
+            const float u = ((float)x + 0.5f) / (float)cc.spacing - 0.5f;
+            const float v = ((float)y + 0.5f) / (float)cc.spacing - 0.5f;
+            const int x0 = (int)std::floor(u), y0 = (int)std::floor(v);
+            const float tx = u - (float)x0, ty = v - (float)y0;
+            for (int dy = 0; dy <= 1; dy++)
+                for (int dx = 0; dx <= 1; dx++) {
+                    const int gx = std::clamp(x0 + dx, 0, cc.gw - 1);
+                    const int gy = std::clamp(y0 + dy, 0, cc.gh - 1);
+                    const float w = (dx ? tx : 1.0f - tx) * (dy ? ty : 1.0f - ty);
+                    const float* d = &cc.val[((size_t)gy * (size_t)cc.gw + (size_t)gx) * 3u];
+                    lit[0] += d[0] * w;
+                    lit[1] += d[1] * w;
+                    lit[2] += d[2] * w;
+                }
+        }
+    }
+
     // 阴影射线（Amanatides-Woo 3D DDA）
     bool traceShadow(const float p[3], const float d[3], float& tr, int limit,
-                     float maxT = 1e30f) const {
-        tr = 1.0f;
+                     float maxT = 1e30f) const {        tr = 1.0f;
         int x = (int)std::floor(p[0]);
         int y = (int)std::floor(p[1]);
         int z = (int)std::floor(p[2]);
@@ -498,6 +682,9 @@ private:
     std::vector<float> cdf_;
     float totalPower_ = 0.0f;
     std::vector<MipLevel> mips_;      // 体素锥追踪的金字塔
+    std::vector<Cascade> cascades_;   // Radiance Cascades
+    float cascadeL0_ = -1.0f;
+    int cascadeK0_ = -1;
     float emitScaleUsed_ = -1.0f;
     std::vector<float> accum_;
     int frames_ = 0;

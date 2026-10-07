@@ -35,7 +35,7 @@ struct RenderSettings {
     bool shadows = true;
 
     // --- 全局光照的求法 ---
-    enum class Gi { None, LightSampling, ConeTrace };
+    enum class Gi { None, LightSampling, ConeTrace, RadianceCascades };
     Gi gi = Gi::ConeTrace;        // 默认走体素锥追踪
 
     // 光源采样（Gi::LightSampling 用）
@@ -50,6 +50,19 @@ struct RenderSettings {
     float coneMaxDist = 96.0f;    // 锥的最远距离
     int giMaxMip = 3;             // 最大 mip 层级：粗层会把空间上分离的东西混在一起
                                   // （板子和板上方的光源落进同一个块 -> 光"穿过"板子）
+
+    // 体素锥追踪（Gi::RadianceCascades 用）
+    //
+    // cascade c：探测点间距 2^c 像素、射线数 K0·4^c、只负责距离区间 [L0·2^(c-1), L0·2^c)。
+    // 距离翻倍时射线数翻 4 倍（半球的立体角），于是**每条射线覆盖的立体角恒定**
+    // -> 不产生空隙（VCT 光斑的根源）。而探测点数掉 4 倍正好抵消，
+    // 每个 cascade 的总射线数都等于 N·K0。
+    int cascades = 7;             // cascade 层数
+    float cascadeBase = 2.0f;     // 最细一层的距离区间上限 L0
+    // 判据：射线角宽必须小于源的角尺寸 -> K0 >= 2*pi*L0^2。
+    // L0=2 时 K0>=25，实测 K0=4 完全打不中单个体素光源（min 恒为 0），
+    // K0=16/32 才对。
+    int cascadeRays = 32;         // 最细一层的射线数 K0
     float giIntensity = 1.0f;     // GI 整体强度
     int giBounces = 0;            // 0 = 只收自发光（单次）；>=1 追加反照率弹射
 

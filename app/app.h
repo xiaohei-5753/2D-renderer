@@ -99,6 +99,9 @@ struct App {
     float vzGiIntensity = 1.0f;    // VCT：GI 强度
     float vzConeDist = 96.0f;      // VCT：锥最远距离
     int vzMaxMip = 3;              // VCT：最大 mip 层级（太粗会漏过遮挡物）
+    int vzCascades = 7;            // RC：cascade 层数
+    int vzCascadeRays = 32;        // RC：最细一层射线数 K0
+    float vzCascadeBase = 2.0f;    // RC：最细一层距离区间 L0
     bool vzEmitLights = true;      // （旧）自发光体素当光源
     float vzEmitIntensity = 1.0f;
     int vzLightSamples = 8;        // 每像素每帧抽几个光源

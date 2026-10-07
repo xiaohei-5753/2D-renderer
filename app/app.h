@@ -21,7 +21,7 @@
 namespace pb::app {
 
 // 照明模式：实时扫描 GI / 渐进式逐像素光追（后者在 P2 实现）
-enum class LightMode { Sweep, PathTrace, Trace25D };
+enum class LightMode { Sweep, PathTrace };
 
 const char* lightModeName(LightMode m);
 
@@ -86,31 +86,6 @@ struct App {
     LightMode lightMode = LightMode::Sweep;
     bool lightDirty = true;
     float lightMs = 0.0f;
-    // --- 体素光追参数（渲染端设法的镜像，GUI 只负责摆控件）---
-    float vzSunAz = 135.0f;        // 太阳方位角（度）
-    float vzSunEl = 45.0f;         // 太阳仰角（度）
-    float vzSunIntensity = 1.0f;
-    float vzSky = 0.20f;           // 天空亮度
-    float vzEmitScale = 1.0f;
-    bool vzShadows = true;
-    int vzLayerStride = 4;         // 每个图层在 z 方向占几格（层间留空 -> 光才照得下来）
-    int vzGiMode = 2;              // 0=关 1=光源采样 2=体素锥追踪(VCT)
-    int vzCones = 32;              // VCT：半球上打几个锥
-    float vzGiIntensity = 1.0f;    // VCT：GI 强度
-    float vzConeDist = 96.0f;      // VCT：锥最远距离
-    int vzMaxMip = 3;              // VCT：最大 mip 层级（太粗会漏过遮挡物）
-    int vzCascades = 7;            // RC：cascade 层数
-    int vzCascadeRays = 32;        // RC：最细一层射线数 K0
-    float vzCascadeBase = 2.0f;    // RC：最细一层距离区间 L0
-    bool vzEmitLights = true;      // （旧）自发光体素当光源
-    float vzEmitIntensity = 1.0f;
-    int vzLightSamples = 8;        // 每像素每帧抽几个光源
-    int vzMaxFrames = 128;         // 累积多少帧
-    bool vzDirty = true;
-    // 只读：进度显示
-    int vzFrames = 0;
-    float vzMs = 0.0f;
-
     // --- 视图选项 ---
     bool showPixelGrid = false;
     // 首次拿到画布矩形后自动做一次整数倍缩放（像素画必须），之后不再干预用户

@@ -27,9 +27,7 @@
 #include "app/app.h"
 #include "app/input.h"
 #include "app/panels.h"
-#include "app/voxel_build.h"
 #include "core/image.h"
-#include "render/voxel_renderer.h"
 #include "core/composite.h"
 #include "gfx/layer_composite.h"
 #include "core/console.h"
@@ -244,11 +242,6 @@ int main(int argc, char** argv) {
     int framesToRun = 0;
     int paletteIndex = -1;
     app::LightMode startMode = app::LightMode::Sweep;
-    float startDzEl = 45.0f;       // --dz-el：太阳仰角
-    float startDzAz = 135.0f;      // --dz-az：太阳方位角
-    float startDzSunI = 1.0f;      // --dz-sun：阳光强度
-    bool startDzEmit = true;       // --dz-emit：自发光当光源
-    float startDzEmitI = 1.0f;     // --dz-ei：自发光强度
     std::string outFile;
     std::string forceOpen, forceClosed;
     std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
@@ -277,18 +270,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--mode" && i + 1 < argCount) {
             const std::string& m = args[(size_t)++i];
             if (m == "pathtrace" || m == "pt") startMode = app::LightMode::PathTrace;
-            else if (m == "25d" || m == "dz") startMode = app::LightMode::Trace25D;
             else startMode = app::LightMode::Sweep;
-        } else if (arg == "--dz-el" && i + 1 < argCount) {
-            startDzEl = (float)std::atof(args[(size_t)++i].c_str());
-        } else if (arg == "--dz-az" && i + 1 < argCount) {
-            startDzAz = (float)std::atof(args[(size_t)++i].c_str());
-        } else if (arg == "--dz-sun" && i + 1 < argCount) {
-            startDzSunI = (float)std::atof(args[(size_t)++i].c_str());
-        } else if (arg == "--dz-emit" && i + 1 < argCount) {
-            startDzEmit = (std::atoi(args[(size_t)++i].c_str()) != 0);
-        } else if (arg == "--dz-ei" && i + 1 < argCount) {
-            startDzEmitI = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--visible") {
             forceVisible = true;
         } else if (arg == "--hidden") {
@@ -327,11 +309,6 @@ int main(int argc, char** argv) {
     a.opts.color = a.palette.current();
     a.demo = demo;
     a.lightMode = startMode;
-    a.vzSunEl = startDzEl;
-    a.vzSunAz = startDzAz;
-    a.vzSunIntensity = startDzSunI;
-    a.vzEmitLights = startDzEmit;
-    a.vzEmitIntensity = startDzEmitI;
 
     // 自动化/回归用：直接切到某一套色板（例如 NES 55 色，验证色块网格的自动换行）
     if (paletteIndex >= 0) {
@@ -390,23 +367,6 @@ int main(int argc, char** argv) {
     pt.settings().ambient[1] = 0.12f;
     pt.settings().ambient[2] = 0.14f;
     a.pt = &pt;
-
-    // 体素光追：GUI 只通过 render/voxel_renderer.h 这个接口用它。
-    // 渲染端内部（加速结构、线程、GPU 资源）GUI 一概不知道。
-    // 优先 GPU 版（Radiance Cascades 在 GPU 上约 20 倍快）；建不起来就回退 CPU 版
-    auto voxRenderer = render::createVoxelGpuRenderer();
-    if (!voxRenderer) {
-        fprintf(stderr, "[体素光追] GPU 版不可用，回退 CPU 版\\n");
-        voxRenderer = render::createVoxelRenderer();
-    }
-    const GLuint voxTex = gfx::createTexture(GL_RGBA8, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE);
-    GLuint voxShown = voxTex;      // 实际显示用的纹理（GPU 版直接用渲染端的）
-    // GPU 版是"一次 dispatch 就出结果"，converged() 恒为 true。
-    // 所以不能只靠 !converged() 来决定要不要渲染，否则永远不渲染（画面全黑）。
-    bool voxNeedsFrame = true;
-    render::VoxelVolume voxVol;
-    std::vector<RGBA8> voxPx;
-    bool voxUploaded = false;
 
     gfx::Viewport vp;
     if (!vp.init()) {
@@ -520,89 +480,7 @@ int main(int argc, char** argv) {
         // 详见 app/lighting.cpp。
         app::syncLightDirty(a);
         if (a.lightOn && a.canvasVisible) {
-            if (a.lightMode == app::LightMode::Trace25D) {
-                // ---- 体素光追（+z 面）----
-                //
-                // GUI 只做两件事：把图层翻成体素空间、把参数摆好。
-                // 光线怎么走、怎么加速，全在渲染端里面。
-                const bool geomChanged = !voxUploaded || app::anyLayerDirty(a);
-                if (geomChanged) {
-                    app::buildVoxelVolume(a.doc, voxVol, a.vzLayerStride);
-                    voxRenderer->setVolume(voxVol);   // 内部会重置累积
-                    voxUploaded = true;
-                    a.vzDirty = true;
-                    // 消费掉"脏"状态。syncLightDirty() 每帧按图层签名重算，
-                    // 但 lightAllLayers 只有消费方会清（别的模式是 runLighting 清的）。
-                    // 不清的话 anyLayerDirty() 永远为真 -> 体素每帧重建 ->
-                    // 渐进累积被反复重置，永远收敛不了。
-                    a.lightAllLayers = false;
-                    for (auto& v : a.lightDirtyLayers) v = 0;
-                    voxNeedsFrame = true;      // 几何变了要重画一帧
-                }
-                if (a.vzDirty || geomChanged) {
-                    render::RenderSettings rs;
-                    // 方位角 / 仰角 -> 指向光源的单位向量（z 向上）
-                    const float az = a.vzSunAz * 3.14159265f / 180.0f;
-                    const float el = a.vzSunEl * 3.14159265f / 180.0f;
-                    const float ce = std::cos(el);
-                    rs.sunDir[0] = std::cos(az) * ce;
-                    rs.sunDir[1] = std::sin(az) * ce;
-                    rs.sunDir[2] = std::sin(el);
-                    rs.sunColor[0] = 1.0f; rs.sunColor[1] = 0.96f; rs.sunColor[2] = 0.88f;
-                    rs.sunIntensity = a.vzSunIntensity;
-                    rs.skyColor[0] = rs.skyColor[1] = rs.skyColor[2] = a.vzSky;
-                    rs.skyColor[2] *= 1.25f;                 // 天光偏冷
-                    rs.emitScale = a.vzEmitScale;
-                    rs.shadows = a.vzShadows;
-                    rs.gi = (a.vzGiMode == 3)   ? render::RenderSettings::Gi::RadianceCascades
-                            : (a.vzGiMode == 2) ? render::RenderSettings::Gi::ConeTrace
-                            : (a.vzGiMode == 1) ? render::RenderSettings::Gi::LightSampling
-                                                : render::RenderSettings::Gi::None;
-                    rs.cones = a.vzCones;
-                    rs.coneMaxDist = a.vzConeDist;
-                    rs.giMaxMip = a.vzMaxMip;
-                    rs.cascades = a.vzCascades;
-                    rs.cascadeRays = a.vzCascadeRays;
-                    rs.cascadeBase = a.vzCascadeBase;
-                    rs.giIntensity = a.vzGiIntensity;
-                    rs.emissiveIntensity = a.vzEmitIntensity;
-                    rs.lightSamples = a.vzLightSamples;
-                    rs.progressive = true;
-                    rs.maxAccumFrames = a.vzMaxFrames;
-                    voxRenderer->setSettings(rs);   // 参数变了自己会重置累积
-                    a.vzDirty = false;
-                    voxNeedsFrame = true;      // 参数变了要重画一帧
-                }
-                // 渐进累积：每帧推进一步，UI 不失响应；收敛后停手。
-                // voxNeedsFrame 兜住"一次就出结果"的 GPU 版。
-                if (voxNeedsFrame || !voxRenderer->converged()) {
-                    lightTimer.begin();
-                    voxRenderer->render(voxPx);
-                    lightTimer.end();
-                    // GPU 实现把结果留在显存里（resultTexture），直接用它，
-                    // 省掉一次上传；CPU 实现才需要把像素传上去。
-                    const GLuint rt = voxRenderer->resultTexture();
-                    if (rt) {
-                        voxShown = rt;
-                    } else {
-                        glBindTexture(GL_TEXTURE_2D, voxTex);
-                        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cw, ch, GL_RGBA,
-                                        GL_UNSIGNED_BYTE, voxPx.data());
-                        glBindTexture(GL_TEXTURE_2D, 0);
-                        voxShown = voxTex;
-                    }
-                    if (voxRenderer->converged()) voxNeedsFrame = false;
-                }
-                a.vzFrames = voxRenderer->accumFrames();
-                a.vzMs = (float)voxRenderer->lastMs();
-                if (getenv("PB_VOXDUMP") && voxRenderer->converged()) {
-                    Image di(cw, ch);
-                    for (int i = 0; i < cw * ch; i++) di.data()[i] = voxPx[(size_t)i];
-                    writePNG("out/vox_app_out.png", di);
-                    fprintf(stderr, "[app] 体素光追输出已写出 out/vox_app_out.png\\n");
-                }
-            } else {
+            {
                 // 画布一变，路径追踪的旧累积样本就和新几何对不上了（会拖影），必须重置累积
                 if (app::anyLayerDirty(a)) pt.resetAccumulation();
                 lightTimer.begin();
@@ -647,8 +525,7 @@ int main(int argc, char** argv) {
                 glMemoryBarrier(GL_ALL_BARRIER_BITS);
                 shown = albedoFlat;
             } else {
-                if (a.lightMode == app::LightMode::Trace25D) shown = voxShown;
-                else shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
+                shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
             }
             vp.draw(shown);
         }
@@ -691,7 +568,6 @@ int main(int argc, char** argv) {
     vp.shutdown();
     sweep.shutdown();
     pt.shutdown();
-    glDeleteTextures(1, &voxTex);
     lightTimer.shutdown();
     uiCtx.shutdown();
     ctx.destroy();

@@ -254,7 +254,6 @@ const char* lightModeName(LightMode m) {
     switch (m) {
         case LightMode::Sweep: return "扫描 GI";
         case LightMode::PathTrace: return "路径追踪";
-        case LightMode::Trace25D: return "2.5D 光追";
         default: return "?";
     }
 }
@@ -478,12 +477,6 @@ void drawMainMenuBar(App& a) {
                             a.lightMode == LightMode::PathTrace)) {
             a.lightMode = LightMode::PathTrace;
             a.lightDirty = true;
-        }
-        if (ImGui::MenuItem("2.5D 光追（柱顶曲面）", nullptr,
-                            a.lightMode == LightMode::Trace25D)) {
-            a.lightMode = LightMode::Trace25D;
-            a.lightDirty = true;
-            a.vzDirty = true;
         }
         ImGui::EndMenu();
     }
@@ -1034,7 +1027,6 @@ void drawLightingSection(App& a) {
                      0.5f;
     const bool isSweep = (a.lightMode == LightMode::Sweep);
     const bool isPt = (a.lightMode == LightMode::PathTrace);
-    const bool is25D = (a.lightMode == LightMode::Trace25D);
     if (ui::toolButton("modeSweep", "扫描 GI", isSweep, "每帧沿 N 个方向扫描，极快，无反射",
                        ImVec2(mw, a.ui(26.0f))))
         actSetLightMode(a, LightMode::Sweep);
@@ -1042,11 +1034,6 @@ void drawLightingSection(App& a) {
     if (ui::toolButton("modePt", "路径追踪", isPt,
                        "每条射线可反射/漫反射/折射，逐步累积收敛", ImVec2(mw, a.ui(26.0f))))
         actSetLightMode(a, LightMode::PathTrace);
-    if (ui::toolButton("mode25d", "2.5D 光追", is25D,
-                       "把图层当体素空间：只算柱顶曲面的上半球辐照度。"
-                       "上层的光会照亮下层，并投出光晕",
-                       ImVec2(-1.0f, a.ui(26.0f))))
-        actSetLightMode(a, LightMode::Trace25D);
 
     ImGui::Spacing();
     ImGui::Checkbox("开启光照", &a.lightOn);
@@ -1109,132 +1096,6 @@ void drawLightingSection(App& a) {
         if (ui::labeledSliderFloat("##cp", &s.propagate, 0.5f, 2.0f, "沿程增益")) {
             actLightSettingsChanged(a);
         }
-    } else if (is25D) {
-        // ---- 体素光追的参数 ----
-        // GUI 只摆控件、写进 App 的状态；怎么渲染是渲染端的事。
-        ImGui::SeparatorText("体素光追");
-        float el = a.vzSunEl;
-        if (ui::labeledSliderFloat("vzEl", &el, 5.0f, 89.0f, "太阳仰角", "%.0f")) {
-            a.vzSunEl = el;
-            a.vzDirty = true;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("越大越接近正上方顶光");
-        float az = a.vzSunAz;
-        if (ui::labeledSliderFloat("vzAz", &az, 0.0f, 360.0f, "太阳方位", "%.0f")) {
-            a.vzSunAz = az;
-            a.vzDirty = true;
-        }
-        float si = a.vzSunIntensity;
-        if (ui::labeledSliderFloat("vzSun", &si, 0.0f, 4.0f, "阳光强度")) {
-            a.vzSunIntensity = si;
-            a.vzDirty = true;
-        }
-        float sk = a.vzSky;
-        if (ui::labeledSliderFloat("vzSky", &sk, 0.0f, 1.0f, "天空亮度")) {
-            a.vzSky = sk;
-            a.vzDirty = true;
-        }
-        float es = a.vzEmitScale;
-        if (ui::labeledSliderFloat("vzEm", &es, 0.0f, 4.0f, "自发光倍率")) {
-            a.vzEmitScale = es;
-            a.vzDirty = true;
-        }
-        if (ImGui::Checkbox("阴影（3D 阴影射线）", &a.vzShadows)) a.vzDirty = true;
-        int st = a.vzLayerStride;
-        if (ui::labeledSliderInt("vzSt", &st, 1, 16, "图层厚度")) {
-            a.vzLayerStride = st;
-            a.vzDirty = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("每个图层在 z 方向占几格。太小的话上层光源对下层是掠射、照不亮");
-        ImGui::SeparatorText("全局光照");
-        {
-            const char* items[] = {"关闭", "光源采样（有噪声，需累积）",
-                                   "体素锥追踪 VCT", "Radiance Cascades（角度随距离自适应）"};
-            int m = a.vzGiMode;
-            if (ImGui::Combo("算法", &m, items, 4)) {
-                a.vzGiMode = m;
-                a.vzDirty = true;
-            }
-        }
-        if (a.vzGiMode == 2) {
-            int nc = a.vzCones;
-            if (ui::labeledSliderInt("vzNc", &nc, 8, 256, "锥数量")) {
-                a.vzCones = nc;
-                a.vzDirty = true;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(
-                    "上半球打几个锥。越多越平滑（实测等距圆环的不匀度：\n"
-                    "9 个锥 366，32 个 215，64 个 54，单位是千分比），单帧也越慢");
-            float gi = a.vzGiIntensity;
-            if (ui::labeledSliderFloat("vzGi", &gi, 0.0f, 8.0f, "GI 强度")) {
-                a.vzGiIntensity = gi;
-                a.vzDirty = true;
-            }
-            float cd = a.vzConeDist;
-            if (ui::labeledSliderFloat("vzCd", &cd, 8.0f, 320.0f, "锥最远距离", "%.0f")) {
-                a.vzConeDist = cd;
-                a.vzDirty = true;
-            }
-            int mm = a.vzMaxMip;
-            if (ui::labeledSliderInt("vzMm", &mm, 0, 7, "最大 mip 层级")) {
-                a.vzMaxMip = mm;
-                a.vzDirty = true;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("越粗越快，但太粗时一个块会同时包含遮挡物和它上方的光源，\n"
-                                  "光会从遮挡物里漏过去（分图层遮挡失效）。默认 3。");
-        }
-        if (a.vzGiMode == 1) {
-            // 光源采样：蒙特卡洛，需要累积
-            float ei = a.vzEmitIntensity;
-            if (ui::labeledSliderFloat("vzEi", &ei, 0.0f, 8.0f, "自发光强度")) {
-                a.vzEmitIntensity = ei;
-                a.vzDirty = true;
-            }
-            int ls = a.vzLightSamples;
-            if (ui::labeledSliderInt("vzLs", &ls, 1, 32, "每帧光源采样")) {
-                a.vzLightSamples = ls;
-                a.vzDirty = true;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("每像素每帧抽几个光源。越大单帧越慢、收敛越快");
-            int mf = a.vzMaxFrames;
-            if (ui::labeledSliderInt("vzMf", &mf, 8, 512, "累积帧数")) {
-                a.vzMaxFrames = mf;
-                a.vzDirty = true;
-            }
-            const float frac =
-                (a.vzMaxFrames > 0) ? (float)a.vzFrames / (float)a.vzMaxFrames : 0.0f;
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%d / %d 帧  %.1f ms", a.vzFrames, a.vzMaxFrames,
-                          a.vzMs);
-            ImGui::ProgressBar(std::min(1.0f, frac), ImVec2(-1.0f, a.ui(14.0f)), buf);
-            ImGui::TextDisabled("蒙特卡洛：有噪声，靠累积收敛");
-        } else if (a.vzGiMode == 2) {
-            ImGui::TextDisabled("VCT 是确定性的：一帧就是最终结果，不需要累积");
-        } else if (a.vzGiMode == 3) {
-            int nc = a.vzCascades;
-            if (ui::labeledSliderInt("vzNcas", &nc, 2, 12, "cascade 层数")) {
-                a.vzCascades = nc;
-                a.vzDirty = true;
-            }
-            int kr = a.vzCascadeRays;
-            if (ui::labeledSliderInt("vzK0", &kr, 4, 128, "最细层射线数")) {
-                a.vzCascadeRays = kr;
-                a.vzDirty = true;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("判据：射线角宽要小于源的角尺寸 ->\\n"
-                                  "最细层射线数 >= 6.28 * 最细层距离^2");
-            float lb = a.vzCascadeBase;
-            if (ui::labeledSliderFloat("vzL0", &lb, 0.5f, 8.0f, "最细层距离", "%.1f")) {
-                a.vzCascadeBase = lb;
-                a.vzDirty = true;
-            }
-            ImGui::TextDisabled("角度分辨率随距离翻倍 -> 无采样空隙、无噪声");
-        }        ImGui::TextDisabled("渲染 +z 法相面，光照走正统 3D 光追");
     } else if (a.pt) {        ImGui::SeparatorText("路径追踪");
         gfx::PathTraceSettings& s = a.pt->settings();
 

@@ -7,7 +7,6 @@
 #include <string>
 #include <vector>
 
-#include "core/canvas.h"
 #include "core/history.h"
 #include "core/layer.h"
 #include "core/palette.h"
@@ -40,14 +39,22 @@ struct App {
     // --- 文档与编辑 ---
     //
     // Document 是真正的文档（图层栈），tools / History 都作用在**当前图层**上。
-    // composite 是"所有图层压平后的结果"，唯一的作用是喂给光照与导出 ——
-    // 它由 core/composite.h 的 flattenDocument 写，永远不该被直接画。
+    //
+    // ⚠️ 逐层光照之后**不再需要一份"压平后的合成缓冲"**：光照是逐层做的，
+    // 最后由 GPU 的 LayerComposite 合成；CPU 侧的压平只在"关灯看原图"时用得上，
+    // 那条路现在也走 GPU（把各层 albedo 数组合成）。所以 App 里没有 composite 成员。
     Document doc;
-    Canvas composite;
     History history;
     Palette palette;
     ToolOptions opts;
     ToolSession session;
+
+    // 需要重新照亮哪些层（渲染层用）。空 = 本帧没有光照要做。
+    // 由 syncLightDirty() 每帧填好；只重算真正变了的那几层，这是"实时"的关键：
+    // 画一笔只会重算一笔所在的那一层，而不是整个图层栈。
+    std::vector<uint8_t> lightDirtyLayers;
+    // 文档结构/全局光照参数变了：所有层都要重算（层数变化、切模式、调参数）
+    bool lightAllLayers = true;
 
     // --- 渲染对象（由 main 填充，不持有所有权）---
     gfx::GLContext* ctx = nullptr;

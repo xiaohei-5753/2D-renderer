@@ -48,6 +48,27 @@ void notifyLayerPropertiesChanged(App& a);
 // 每帧在 drawUi 之后调用一次（它要访问 GL，所以不在面板函数里）。
 void uploadLayerThumbnails(App& a);
 
+// --- 逐层光照（app/lighting.cpp）---
+//
+// 模型 B 在应用侧的落地：对每个图层算好 occlAbove / emitFor 两张通道，
+// 逐层照亮，最后 GPU 合成。伪 3D 的效果就是从这三个步骤来的。
+//
+// 每帧的调用顺序：
+//   syncLightDirty(a)  -> 算出"哪几层变了"（只重算变了的层，这是实时的关键）
+//   runLighting(a)     -> 上传 + 逐层照亮 + 合成
+void syncLightDirty(App& a);
+// 逐层照亮 + 合成。返回"这一帧真的有光照要算"（供 GPU 计时判断，
+// 没有脏层时它就直接返回，计时器不该被触发）
+bool runLighting(App& a);
+
+// 文档结构 / 全局光照参数变了：所有层都要重算
+void markAllLayersForLight(App& a);
+// 文档被整个换掉（新建画布）时清掉缓存
+void resetLightingCache();
+bool anyLayerDirty(const App& a);
+float opacityOf(const App& a, int index);
+int lightingLayerCap();
+
 // --- 动作（菜单与工具栏共用）---
 void actUndo(App& a);
 void actRedo(App& a);

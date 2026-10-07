@@ -273,6 +273,9 @@ int main(int argc, char** argv) {
         }
         sweep.settings().rayRadius = opt.radius;
         sweep.settings().emitScale = opt.emit;
+        // 诊断开关（见 LightSettings::debugScan）。留一个环境变量入口，
+        // 是为了在排查光照问题时不必每次改代码重编。
+
         for (int i = 0; i < 3; i++) sweep.settings().ambient[i] = opt.ambient[i];
         sweep.uploadAll(canvas.image(), canvas.materialData());
 

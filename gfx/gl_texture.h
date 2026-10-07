@@ -27,4 +27,26 @@ void uploadSubImagePackedF(GLuint tex, int x0, int y0, int bw, int bh, const flo
 // 把纹理内容读回 CPU（离线渲染出图用）
 bool readbackTexture(GLuint tex, int w, int h, RGBA8* out);
 
+// ---------------------------------------------------------------------------
+// 2D 纹理数组（逐层光照用：每个图层一层）
+// ---------------------------------------------------------------------------
+//
+// 为什么用数组纹理而不是"每层一张纹理 + 着色器里按索引分支"：
+// 后者要么得写一堆 if，要么得把 N 张纹理绑定到 N 个 texture unit（上限只有 16+）。
+// 数组纹理让着色器用 texelFetch(sampler2DArray, ivec3(x,y,layer), 0) 直接取任意层，
+// 一次绑定搞定，而且层数变了只需重新分配。
+
+GLuint createTextureArray(GLenum internalFormat, int w, int h, int layers, GLenum format,
+                          GLenum type);
+
+// 上传数组纹理的**某一层**的整层内容（紧凑数据，w*h）
+void uploadArrayLayer(GLuint tex, int layer, int w, int h, const RGBA8* pixels);
+
+// 上传数组纹理某一层的某个子矩形（紧凑数据 bw*bh）
+void uploadArrayLayerSub(GLuint tex, int layer, int x0, int y0, int bw, int bh,
+                         const RGBA8* tight);
+
+// 把一组 float 值写进数组纹理（每层一个 float，存为 R32F）—— 图层不透明度用
+void uploadFloatArrayLayer(GLuint tex, int layer, int w, int h, float value);
+
 }  // namespace pb::gfx

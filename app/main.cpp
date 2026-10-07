@@ -28,6 +28,7 @@
 #include "app/input.h"
 #include "app/panels.h"
 #include "core/composite.h"
+#include "gfx/layer_composite.h"
 #include "core/console.h"
 #include "core/image.h"
 #include "gfx/gl_context.h"
@@ -121,24 +122,6 @@ std::vector<std::string> utf8Args() {
     }
 #endif
     return out;
-}
-
-// 把文档的脏区域压平进 composite（合成缓冲），并把这些区域的"脏"转记到 composite 上。
-//
-// 这是"编辑 -> 合成 -> 上传 GPU"这条链的中间那一步。放在 app 层而不是 core 层，
-// 是因为 core 层刻意不让 Layer 知道 Canvas 的存在：Layer 是绘制表面，
-// Canvas 只是压平结果的缓冲。
-void syncComposite(app::App& a) {
-    Document& d = a.doc;
-    if (d.empty()) return;
-    if (a.composite.width() != d.width() || a.composite.height() != d.height()) {
-        a.composite.resize(d.width(), d.height());
-        a.composite.clear(RGBA8{0, 0, 0, 0}, Material{});
-    }
-    const Rect dirty = d.takeDirtyUnion();
-    if (dirty.empty()) return;
-    flattenDocument(d, a.composite.image(), a.composite.materials(), dirty);
-    a.composite.markDirty(dirty);
 }
 
 // 演示/自动化模式：用工具管线画一张图，渲染若干帧后截图退出。
@@ -314,8 +297,6 @@ int main(int argc, char** argv) {
 
     app::App a;
     a.doc.resize(cw, ch);
-    a.composite.resize(cw, ch);
-    a.composite.clear(RGBA8{0, 0, 0, 0}, Material{});
     a.history.reset();
     a.opts.color = a.palette.current();
     a.demo = demo;
@@ -391,6 +372,12 @@ int main(int argc, char** argv) {
     gfx::GpuTimer lightTimer;
     lightTimer.init();
 
+    // 关灯看原图时用来把各层 albedo 叠起来
+    gfx::LayerComposite albedoComp;
+    albedoComp.init();
+    const GLuint albedoFlat =
+        gfx::createTexture(GL_RGBA8, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE);
+
     // 面板尺寸按 DPI 缩放：ImGui 坐标是物理像素，字体与 style 已经放大过
     a.uiScale = uiCtx.dpiScale();
     a.leftWidth = a.ui(236.0f);
@@ -432,38 +419,24 @@ int main(int argc, char** argv) {
             a.cameraInitialized = true;
         }
 
-        // --- 5. 合成（压平图层）+ 上传画布（只传脏矩形）+ 光照 ---
-        syncComposite(a);
-        const Rect dirty = a.composite.takeDirty();
-        if (!dirty.empty()) {
-            // 两个渲染器都保持同步：脏矩形通常很小，双份上传的代价可以忽略，
-            // 换来的好处是切换模式时无需重新上传整张画布。
-            sweep.upload(a.composite.image(), a.composite.materialData(), dirty);
-            pt.upload(a.composite.image(), a.composite.materialData(), dirty);
-            a.lightDirty = true;
-            // 画布一变，旧的累积样本就和新几何对不上了（会拖影），必须重置
-            pt.resetAccumulation();
-        }
-
+        // --- 5. 逐层光照 + 合成 ---
+        //
+        // 这里是模型 B 的落地：只重算**变了的那几层**（syncLightDirty 判定），
+        // 每层先算 occlAbove / emitFor 两张通道再照亮，最后由 GPU 把各层叠起来。
+        // 详见 app/lighting.cpp。
+        app::syncLightDirty(a);
         if (a.lightOn && a.canvasVisible) {
-            if (a.lightMode == app::LightMode::Sweep) {
-                if (a.lightDirty) {
-                    lightTimer.begin();
-                    sweep.render();
-                    lightTimer.end();
-                    a.lightDirty = false;
-                }
-            } else if (!pt.converged()) {
-                // 路径追踪每帧累积一个样本，直到收敛；收敛后不再浪费 GPU
-                lightTimer.begin();
-                pt.render();
-                lightTimer.end();
-            }
+            // 画布一变，路径追踪的旧累积样本就和新几何对不上了（会拖影），必须重置累积
+            if (app::anyLayerDirty(a)) pt.resetAccumulation();
+            lightTimer.begin();
+            const bool didWork = app::runLighting(a);
+            lightTimer.end();
+            if (!didWork) a.lightMs = 0.0f;   // 本帧没有光照要做，别显示上一帧的数字
         }
         // 计时器结果要下一帧才可用（不阻塞管线）
         {
             float ms = 0.0f;
-            if (lightTimer.poll(ms)) a.lightMs = ms;
+            if (lightTimer.poll(ms) && ms > 0.0f) a.lightMs = ms;
         }
 
         // --- 6. 画布（裸 GL，scissor 限制在中央矩形内）---
@@ -480,9 +453,22 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
         if (a.canvasVisible) {
             const bool ptMode = (a.lightMode == app::LightMode::PathTrace);
-            GLuint shown;
-            if (!a.lightOn) shown = ptMode ? pt.albedoTexture() : sweep.canvasTexture();
-            else shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
+            GLuint shown = 0;
+            if (!a.lightOn) {
+                // 关灯：把各层原始 albedo 按图层不透明度叠出来（数组纹理的 layer 0
+                // 只是最底层，直接显示它会漏掉上面的图层）。
+                gfx::LightSweep* ls = &sweep;
+                gfx::PathTrace* ptx = &pt;
+                GLuint layers = ptMode ? ptx->albedoTexture() : ls->canvasTexture();
+                GLuint opacity = ptMode ? ptx->opacityTexture() : ls->opacityTexture();
+                const int n = ptMode ? ptx->layerCount() : ls->layerCount();
+                // 关灯时用"覆盖率"语义：albedo 的 alpha 就是"这个像素有多不透明"
+                albedoComp.composite(layers, opacity, n, cw, ch, albedoFlat, false);
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+                shown = albedoFlat;
+            } else {
+                shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
+            }
             vp.draw(shown);
         }
 
@@ -519,6 +505,8 @@ int main(int argc, char** argv) {
         (void)frames;
     }
 
+    glDeleteTextures(1, &albedoFlat);
+    albedoComp.shutdown();
     vp.shutdown();
     sweep.shutdown();
     pt.shutdown();

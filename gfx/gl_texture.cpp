@@ -95,4 +95,55 @@ void uploadSubImagePackedF(GLuint tex, int x0, int y0, int bw, int bh, const flo
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+// ---------------------------------------------------------------------------
+// 2D 纹理数组
+// ---------------------------------------------------------------------------
+
+GLuint createTextureArray(GLenum internalFormat, int w, int h, int layers, GLenum format,
+                          GLenum type) {
+    if (w <= 0 || h <= 0 || layers <= 0) return 0;
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, internalFormat, w, h, layers, 0, format, type,
+                 nullptr);
+    // 与画布纹理保持同样的采样约定：NEAREST（像素画必须，否则缩放糊）
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+    return tex;
+}
+
+void uploadArrayLayer(GLuint tex, int layer, int w, int h, const RGBA8* pixels) {
+    if (!tex || !pixels || w <= 0 || h <= 0 || layer < 0) return;
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, w, h, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                    pixels);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+}
+
+void uploadArrayLayerSub(GLuint tex, int layer, int x0, int y0, int bw, int bh,
+                         const RGBA8* tight) {
+    if (!tex || !tight || bw <= 0 || bh <= 0 || layer < 0) return;
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x0, y0, layer, bw, bh, 1, GL_RGBA,
+                    GL_UNSIGNED_BYTE, tight);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+}
+
+void uploadFloatArrayLayer(GLuint tex, int layer, int w, int h, float value) {
+    if (!tex || w <= 0 || h <= 0 || layer < 0) return;
+    static std::vector<float> buf;
+    buf.assign((size_t)w * (size_t)h, value);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, w, h, 1, GL_RED, GL_FLOAT,
+                    buf.data());
+    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+}
+
 }  // namespace pb::gfx

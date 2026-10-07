@@ -29,6 +29,7 @@
 
 #include "app/app.h"
 #include "app/panels.h"
+#include "core/composite.h"
 #include "core/console.h"
 #include "core/image.h"
 #include "gfx/gl_texture.h"
@@ -247,14 +248,16 @@ void actNewCanvas(App& a, int w, int h) {
     if (w < 1 || h < 1) return;
     // Document::resize 会丢弃所有图层并重置为单个空层
     a.doc.resize(w, h);
-    a.composite.resize(w, h);
-    a.composite.clear(RGBA8{0, 0, 0, 0}, Material{});
     a.history.reset();
-    // LightSweep 的纹理和 SSBO 是按初始尺寸一次性分配的，改尺寸必须重新 init
+    // LightSweep / PathTrace 的纹理和 SSBO 都是按初始尺寸一次性分配的，
+    // 改尺寸必须重新 init（init 内部会 shutdown 再重建）
     if (a.sweep) a.sweep->init(w, h);
+    if (a.pt) a.pt->init(w, h);
     if (a.vp) a.vp->setCanvasSize(w, h);
     a.lightDirty = true;
     a.layerPanelDirty = true;
+    resetLightingCache();
+    markAllLayersForLight(a);
     a.lastAction = "新建画布";
     a.cameraInitialized = false;   // 新画布重新做一次整数倍适配
     printf("[画布] 新建 %dx%d\n", w, h);
@@ -270,9 +273,17 @@ void actSavePng(App& a, bool lit) {
     _mkdir("out");
 #endif
 
+    const int W = a.doc.width(), H = a.doc.height();
+    if (W <= 0 || H <= 0) return;
+
     if (!lit) {
-        // 导出的是**压平后的结果**：图层是编辑期的概念，导出的应该就是用户看到的那张图
-        if (writePNG(path, a.composite.image())) {
+        // 导出的是**压平后的结果**：图层是编辑期的概念，导出的应该就是用户看到的那张图。
+        // 这里的 alpha 也是覆盖率 —— 直接写出 albedo 会让半透明像素看起来"没画"，
+        // 所以用 core 的压平（它做的是标准 source-over）。
+        Image flat(W, H);
+        std::vector<Material> mats((size_t)W * (size_t)H);
+        flattenDocument(a.doc, flat, mats, Rect{0, 0, W - 1, H - 1});
+        if (writePNG(path, flat)) {
             a.lastAction = std::string("已保存 ") + path;
             printf("[保存] %s（压平后的画布）\n", path);
         }
@@ -280,16 +291,15 @@ void actSavePng(App& a, bool lit) {
     }
 
     if (!a.sweep) return;
-    Image litImg(a.composite.width(), a.composite.height());
-    if (!gfx::readbackTexture(a.sweep->resultTexture(), a.composite.width(),
-                              a.composite.height(), litImg.data())) {
+    Image litImg(W, H);
+    if (!gfx::readbackTexture(a.sweep->resultTexture(), W, H, litImg.data())) {
         a.lastAction = "受光图回读失败";
         return;
     }
     for (size_t i = 0; i < litImg.pixelCount(); i++) litImg.data()[i].a = 255;
     if (writePNG(path, litImg)) {
         a.lastAction = std::string("已保存 ") + path;
-        printf("[保存] %s（受光结果）\n", path);
+        printf("[保存] %s（逐层光照 + 合成后的结果）\n", path);
     }
 }
 

@@ -183,12 +183,26 @@ void handleShortcuts(App& a) {
     if (ctrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_Z)) { shift ? actRedo(a) : actUndo(a); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_Y)) { actRedo(a); return; }
-        if (ImGui::IsKeyPressed(ImGuiKey_S)) { actSavePng(a, shift); return; }
+        // 工程文件（作品 + 界面 + 工具 + 光照参数）
+        //
+        // 快捷键约定：**Ctrl+S = 保存工程**（业界惯例，用户按 Ctrl+S 的本意就是
+        // "保存作品"），导出 PNG 挪到 Ctrl+E（E = Export）。
+        // ⚠️ 下面 `shift && E` 是"向下合并"，所以 Ctrl+Shift+E 这个组合**不能**
+        // 再给导出用 —— 这类冲突光看代码很难发现，两边都得读一遍。
+        if (ImGui::IsKeyPressed(ImGuiKey_S)) {
+            if (shift || a.projectPath.empty()) a.requestProjectSaveDialog = true;  // 另存为
+            else actSaveProject(a, a.projectPath);
+            return;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_O)) { a.requestProjectOpenDialog = true; return; }
+        if (ImGui::IsKeyPressed(ImGuiKey_E)) { actSavePng(a, shift); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_N)) { requestNewCanvasDialog(); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_0)) { actResetCamera(a); return; }
-        // Ctrl+J = 新建图层（Photoshop 的惯例），Ctrl+Shift+E = 向下合并
+        // Ctrl+J = 新建图层（Photoshop 的惯例）
         if (ImGui::IsKeyPressed(ImGuiKey_J)) { actAddLayer(a); return; }
-        if (shift && ImGui::IsKeyPressed(ImGuiKey_E)) { actMergeDown(a); return; }
+        // Ctrl+M = 向下合并。原来是 Ctrl+Shift+E，但那个组合要留给
+        // "导出受光图"（Ctrl+E 的自然延伸），两者只能留一个。
+        if (ImGui::IsKeyPressed(ImGuiKey_M)) { actMergeDown(a); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_Equal)) { actZoomAtCursor(a, 1.0 / 1.25); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_Minus)) { actZoomAtCursor(a, 1.25); return; }
         return;

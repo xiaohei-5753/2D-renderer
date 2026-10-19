@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace pb::gfx {
@@ -82,7 +83,7 @@ void uploadSubImage(GLuint tex, const RGBA8* pixels, int w, int h, const Rect& d
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-bool readbackTexture(GLuint tex, int w, int h, RGBA8* out) {
+bool readbackTexture(GLuint tex, int w, int h, RGBA8* out, bool flipToTopDown) {
     if (!tex || w <= 0 || h <= 0 || !out) return false;
     glBindTexture(GL_TEXTURE_2D, tex);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -92,6 +93,29 @@ bool readbackTexture(GLuint tex, int w, int h, RGBA8* out) {
     if (e != GL_NO_ERROR) {
         fprintf(stderr, "[gl] readbackTexture failed: 0x%04X\n", e);
         return false;
+    }
+    if (!flipToTopDown) return true;
+
+    // ------------------------------------------------------------------
+    // 行序翻转：glGetTexImage 给的是 GL 行序（第 0 行 = 纹理底部），
+    // 而 Image / PNG 是文档朝向（第 0 行 = 顶部）。**必须翻**。
+    //
+    // 怎么确认的：上加一条"顶部白条 + 底部暗条"的场景（render_cli --scene orient）
+    // 导出 PNG，白条**跑到了底部** —— 一眼可见。这类错误在界面上看不出来
+    // （显示走 viewport 的 glReadPixels，那条路自带翻转），只有导出会颠倒。
+    //
+    // ⚠️ 我在这里被自己误导过一次：曾经在 scan_dump 里写了个"朝向自检"，
+    // 打出来的行号是 **GL 行号**，我把它当成了文档行号，于是得出"不需要翻"的
+    // 相反结论，还差点把正确的代码改错。教训：判断朝向的测试，**判据必须
+    // 是"图看起来对不对"**，不能只看行号 —— 行号的上/下取决于哪套坐标系。
+    // ------------------------------------------------------------------
+    std::vector<RGBA8> row((size_t)w);
+    for (int y = 0; y < h / 2; y++) {
+        RGBA8* a = out + (size_t)y * (size_t)w;
+        RGBA8* b = out + (size_t)(h - 1 - y) * (size_t)w;
+        std::memcpy(row.data(), a, (size_t)w * sizeof(RGBA8));
+        std::memcpy(a, b, (size_t)w * sizeof(RGBA8));
+        std::memcpy(b, row.data(), (size_t)w * sizeof(RGBA8));
     }
     return true;
 }
@@ -160,6 +184,15 @@ void uploadFloatArrayLayer(GLuint tex, int layer, int w, int h, float value) {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, w, h, 1, GL_RED, GL_FLOAT,
                     buf.data());
+    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+}
+
+void uploadMaterialArrayLayer(GLuint tex, int layer, int w, int h, const float* rgba) {
+    if (!tex || !rgba || w <= 0 || h <= 0 || layer < 0) return;
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, w, h, 1, GL_RGBA, GL_FLOAT,
+                    rgba);
     glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
 }
 

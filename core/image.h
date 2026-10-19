@@ -3,6 +3,7 @@
 // 不依赖 OpenGL。用于：文档像素存储、离屏渲染回读结果、导出成 PNG。
 #pragma once
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,37 @@ public:
         if (x < 0 || y < 0 || x >= w_ || y >= h_) return false;
         at(x, y) = c;
         return true;
+    }
+
+    // 上下翻转（原地）。
+    //
+    // ## 用途：把 GPU 回读出来、**自下而上**的图翻成 PNG 需要的**自上而下**
+    //
+    // ## 为什么做成具名函数，而不是在调用点写几行 memcpy
+    //
+    // 朝向这件事在本仓库反复出错过（用户报"导出上下颠倒"）。散落的 memcpy
+    // 看不出意图，而且**每个导出口都要记得翻** —— 迟早漏一个。
+    // 现在所有出图路径都调这一个函数，口径必然一致。
+    //
+    // ## 判据（重要）
+    //
+    // 判断朝向**不能看行号**：行号的"上/下"取决于用哪套坐标系，我在这上面
+    // 得出过完全相反的结论，还来回改了两次。唯一可靠的判据是"图看起来对不对"：
+    //
+    //   .\build\render_cli.exe --scene orient --size 320x180 --radius 32 --out t.png
+    //
+    // `orient` 场景 = 顶部白条 + 底部暗条。**白条必须在图的顶部**。
+    // 改动任何回读/导出代码后都跑一次这条命令。
+    void flipVertical() {
+        if (h_ < 2) return;
+        std::vector<RGBA8> row((size_t)w_);
+        for (int y = 0; y < h_ / 2; y++) {
+            RGBA8* a = px_.data() + (size_t)y * (size_t)w_;
+            RGBA8* b = px_.data() + (size_t)(h_ - 1 - y) * (size_t)w_;
+            std::memcpy(row.data(), a, (size_t)w_ * sizeof(RGBA8));
+            std::memcpy(a, b, (size_t)w_ * sizeof(RGBA8));
+            std::memcpy(b, row.data(), (size_t)w_ * sizeof(RGBA8));
+        }
     }
 
 private:

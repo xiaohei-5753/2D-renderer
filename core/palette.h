@@ -44,10 +44,25 @@ public:
         uint8_t eR = 0, eG = 0, eB = 0;      // 自发光（"亮度"，带颜色）
         uint8_t a = 255;                     // 透明度
     };
-    const Mat7& mat(int i) const {
-        static const Mat7 kDef{};
-        if (i < 0 || (size_t)i >= mats_.size()) return kDef;
-        return mats_[i];
+    // 返回值（不是引用）：因为 r/g/b 是**派生**的，始终以颜色表为准。
+    //
+    // 为什么不直接返回 mats_[i]：mats_ 是平行数组，可能被 addColor / setMat /
+    // setAll 各自扩展，里面的 r/g/b 副本很容易与颜色表脱节（loadPreset 不重置
+    // 材质时就会留下默认的白色 255）。实测踩到过：色板第 0 项是黑色，
+    // mat().r 却是 255 —— 工程文件存下来再读就"不一致"了。
+    //
+    // 与其在四处小心同步，不如让副本不参与结果：**单一真相来源**。
+    // eR/eG/eB/a 才是 mats_ 真正独有的信息。
+    Mat7 mat(int i) const {
+        Mat7 out{};
+        if (i < 0 || (size_t)i >= mats_.size()) return out;
+        out = mats_[(size_t)i];
+        if ((size_t)i < colors_.size()) {
+            out.r = colors_[(size_t)i].r;
+            out.g = colors_[(size_t)i].g;
+            out.b = colors_[(size_t)i].b;
+        }
+        return out;
     }
     void setMat(int i, const Mat7& m) {
         if (i < 0) return;
@@ -89,6 +104,14 @@ public:
     void setColorAt(int i, RGBA8 c);
     // 删除一个颜色（至少保留 1 个）。真的删掉了才返回 true。
     bool removeColor(int i);
+
+    // 整表替换：读取工程文件时用。
+    //
+    // 为什么不复用 removeColor 逐个清：它有"至少保留 1 个"的保护，逐个删会在
+    // 只剩 1 个时**死循环**（踩过）。而且"从磁盘恢复整份色板"本来就是另一个
+    // 语义 —— 它不归"至少留一个"这条规则管（空色板是合法的加载结果）。
+    // col 为空时结果就是空色板。
+    void setAll(const std::vector<RGBA8>& col, const std::vector<Mat7>& mats, int current);
 
     // 当前色板里是否已经存在这个颜色
     bool contains(RGBA8 c) const;

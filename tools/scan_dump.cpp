@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "common.h"
 #include "core/canvas.h"
 #include "core/image.h"
 #include "core/material.h"
@@ -23,6 +24,7 @@
 #include "gfx/light_sweep.h"
 
 using namespace pb;
+using namespace pb::tools;
 
 namespace {
 
@@ -48,14 +50,8 @@ void dumpTex(const char* tag, GLuint tex, int w, int h) {
         printf("  %-12s readback FAILED\n", tag);
         return;
     }
-    double sum = 0, mx = 0;
-    for (size_t i = 0; i < img.pixelCount(); i++) {
-        const RGBA8 p = img.data()[i];
-        const double l = 0.2126 * p.r + 0.7152 * p.g + 0.0722 * p.b;
-        sum += l;
-        if (l > mx) mx = l;
-    }
-    const double mean = img.pixelCount() ? sum / (double)img.pixelCount() : 0.0;
+    const LumaStats st = lumaStats(img);
+    const double mean = st.mean, mx = st.max;
     char path[512];
     snprintf(path, sizeof(path), "%s_%s.png", g_prefix.c_str(), tag);
     writePNG(path, img);
@@ -68,7 +64,9 @@ int main(int argc, char** argv) {
     int W = 320, H = 180, radius = 128;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
-            sscanf(argv[++i], "%dx%d", &W, &H);
+            // 与 render_cli 同一套 WxH 解析。返回值刻意不看：旧代码就是"格式不对
+            // 就保持原值"，parseSize 只是把同一行 sscanf 收到 common.h 里。
+            (void)parseSize(argv[++i], W, H);
         } else if (std::strcmp(argv[i], "--radius") == 0 && i + 1 < argc) {
             radius = atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
@@ -76,13 +74,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    gfx::ContextDesc desc;
-    desc.width = 64;
-    desc.height = 64;
-    desc.visible = false;
-    desc.title = "scan_dump";
     gfx::GLContext ctx;
-    if (!ctx.create(desc)) { fprintf(stderr, "no context\n"); return 1; }
+    if (!createOffscreenContext(ctx, 64, 64, "scan_dump")) {
+        fprintf(stderr, "no context\n");
+        return 1;
+    }
 
     Canvas c(W, H);
     buildScene(c, "neon");
@@ -113,6 +109,72 @@ int main(int argc, char** argv) {
     }
     dumpTex("scan", sweep.scanTexture(), W, H);
     dumpTex("result", sweep.resultTexture(), W, H);
+
+    // -----------------------------------------------------------------------
+    // 朝向自检
+    //
+    // 这个错**在界面上看不出来**：画布显示走 glReadPixels（那边有自己的翻转），
+    // 只有导出的 PNG 会颠倒 —— 所以它绕过一切目视检查，直到用户导出才发现。
+    //
+    // 做法：造一张只有左上角有记号的图，跑**完整管线**后逐级回读，
+    // 看记号落在哪一行。三张纹理都测，才能确定翻转该加在哪一级。
+    // -----------------------------------------------------------------------
+    {
+        printf("[朝向自检]\n");
+        const int TW = 16, TH = 16;
+        Canvas tiny(TW, TH);
+        tiny.image().fill(RGBA8{0, 0, 0, 255});
+        // 左上角 4x4 **强自发光**记号。
+        // 用自发光而不是普通白色：普通白色经光照后会被衰减到接近 0
+        // （第一版就是这么测的，scan/result 全黑、什么也判不出来）。
+        for (auto& m : tiny.materials()) m = Material{};
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++) {
+                Material em;
+                em.setEmissionFrom(255, 255, 255);
+                tiny.image().at(x, y) = RGBA8{255, 255, 255, 255};
+                tiny.materials()[(size_t)y * TW + x] = em;
+            }
+
+        gfx::LightSweep ts;
+        if (ts.init(TW, TH)) {
+            // 环境光拉满：记号必须够亮才能在扫描/合成后仍可辨认
+            ts.settings().ambient[0] = 1.0f;
+            ts.settings().ambient[1] = 1.0f;
+            ts.settings().ambient[2] = 1.0f;
+            ts.settings().rayRadius = 8;
+            ts.uploadAll(tiny.image(), tiny.materialData());
+            ts.render();   // 扫描 + 合成，走完整管线
+
+            // 只报告"最亮行在第几行"，**不判断是顶还是底**：
+            // 行号的上/下取决于坐标系，我之前就是在这一步把结论搞反的。
+            // 真正的判据是"导出的 PNG 看起来对不对"（见 render_cli --scene orient）。
+            auto markRow = [&](GLenum target, GLuint tex, const char* tag) -> int {
+                std::vector<RGBA8> v((size_t)TW * TH);
+                glBindTexture(target, tex);
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glGetTexImage(target, 0, GL_RGBA, GL_UNSIGNED_BYTE, v.data());
+                glBindTexture(target, 0);
+                int row = -1, best = -1, last = -1;
+                for (int y = 0; y < TH; y++) {
+                    const int lum = (int)v[(size_t)y * TW].r + v[(size_t)y * TW].g + v[(size_t)y * TW].b;
+                    if (lum > 100) last = y;
+                    if (lum > best) { best = lum; row = y; }
+                }
+                printf("  %-8s 亮像素行区间 首=%d 末=%d（行号仅作记录，不代表上下）\n",
+                       tag, row, last);
+                return row;
+            };
+            const int rc = markRow(GL_TEXTURE_2D_ARRAY, ts.canvasTexture(), "canvas");
+            const int rs = markRow(GL_TEXTURE_2D, ts.scanTexture(), "scan");
+            const int rr = markRow(GL_TEXTURE_2D, ts.resultTexture(), "result");
+            printf("  （三张纹理行号：canvas=%d scan=%d result=%d，三者相同即说明管线内部一致）\n",
+                   rc, rs, rr);
+            ts.shutdown();
+        } else {
+            printf("[朝向自检] tiny sweep init 失败，跳过\n");
+        }
+    }
 
     // canvas 数组纹理的 layer 0：用 glGetTexImage(GL_TEXTURE_2D_ARRAY) 直接量，
     // 不经过任何采样/合成，排除采样端的可能

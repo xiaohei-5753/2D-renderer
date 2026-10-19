@@ -342,7 +342,6 @@ void drawLayerSection(App& a) {
         a.lastAction = "重排图层";
         a.lightDirty = true;
         a.layerPanelDirty = true;
-        if (a.pt) a.pt->resetAccumulation();
     }
 
     ImGui::EndChild();

@@ -15,6 +15,12 @@
 #include <string>
 #include <vector>
 
+// 只借用 common.h 的亮度权重：这个工具的解码器（inflate + 逆滤波）是它自己
+// 独立实现的，与别的工具没有共用部分，所以照旧留在本文件里。
+#include "common.h"
+
+using namespace pb::tools;
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -277,13 +283,9 @@ bool loadPNG(const char* path, Image& out, std::string& err) {
 }
 
 double meanLuma(const Image& im) {
-    double s = 0.0;
-    const size_t n = (size_t)im.w * im.h;
-    for (size_t i = 0; i < n; i++) {
-        const uint8_t* p = &im.px[i * im.ch];
-        s += 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
-    }
-    return n ? s / (double)n : 0.0;
+    // 亮度公式（Rec.709 权重）在 common.h，和 scan_dump 用的是同一个
+    const size_t n = (size_t)im.w * (size_t)im.h;
+    return lumaStats(im.px.data(), n, im.ch).mean;
 }
 
 void histogram(const char* tag, const Image& im) {
@@ -291,7 +293,7 @@ void histogram(const char* tag, const Image& im) {
     const size_t n = (size_t)im.w * im.h;
     for (size_t i = 0; i < n; i++) {
         const uint8_t* p = &im.px[i * im.ch];
-        const int L = (int)(0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]);
+        const int L = (int)luma(p[0], p[1], p[2]);
         hist[std::min(7, L / 32)]++;
     }
     printf("%s 亮度直方图(0..255 分 8 档): ", tag);

@@ -6,12 +6,14 @@
 #include <cstdio>
 #include <vector>
 
+#include "common.h"
 #include "core/types.h"
 #include "gfx/gl_context.h"
 #include "gfx/gl_texture.h"
 #include "gfx/layer_composite.h"
 
 using namespace pb;
+using namespace pb::tools;
 
 namespace {
 
@@ -24,16 +26,24 @@ void expectPixel(const char* what, const RGBA8 got, int r, int g, int b) {
     if (!ok) g_fail++;
 }
 
+// 允许 ±1 的版本：覆盖率是 8 位量（128/255 = 0.502），透过率算完再回到 8 位
+// 必然有 ±1 的取整误差，写死等值会让断言在**正确**实现上偶发失败。
+void expectPixelNear(const char* what, const RGBA8 got, int r, int g, int b) {
+    auto near = [](int got, int want) { return got >= want - 1 && got <= want + 1; };
+    const bool ok = near(got.r, r) && near(got.g, g) && near(got.b, b);
+    printf("  %-46s 得到 (%3d,%3d,%3d)  期望约(%3d,%3d,%3d)  %s\n", what, got.r, got.g,
+           got.b, r, g, b, ok ? "OK" : "FAIL");
+    if (!ok) g_fail++;
+}
+
 }  // namespace
 
 int main() {
-    gfx::ContextDesc desc;
-    desc.width = 64;
-    desc.height = 64;
-    desc.visible = false;
-    desc.title = "comp_test";
     gfx::GLContext ctx;
-    if (!ctx.create(desc)) { fprintf(stderr, "no context\n"); return 1; }
+    if (!createOffscreenContext(ctx, 64, 64, "comp_test")) {
+        fprintf(stderr, "no context\n");
+        return 1;
+    }
 
     const int W = 2, H = 2;
     gfx::LayerComposite comp;
@@ -66,6 +76,15 @@ int main() {
     auto read = [&](RGBA8* dst) {
         glBindTexture(GL_TEXTURE_2D, out);
         glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, dst);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    };
+    // 每次 composite 前清一下输出：合成是"整张重写"，但读回时若有上一次的残留
+    // 会让断言看到假数据（下面有几次故意不传材质，输出不会被写满）。
+    auto clearOut = [&]() {
+        const RGBA8 zero{0, 0, 0, 0};
+        std::vector<RGBA8> z((size_t)W * H, zero);
+        glBindTexture(GL_TEXTURE_2D, out);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, z.data());
         glBindTexture(GL_TEXTURE_2D, 0);
     };
 
@@ -178,6 +197,97 @@ int main() {
         // 上层不透明蓝、图层不透明度 50% -> 与底层红各占一半
         expectPixel("上层蓝 op=50%% -> 红蓝各半", got[0], 127, 0, 127);
         glDeleteTextures(1, &arr);
+        glDeleteTextures(1, &opa);
+    }
+
+    // ---------------------------------------------------------------
+    // 5) 自发光的**垂直**传输：发光像素的亮度要透过上方各层到达相机
+    //    场景（2x2 的 4 个格子，每个格子测一种"上方遮挡"）：
+    //      L0（底）：不透明黑 + **自发光绿 200**  -> 发光像素
+    //      L1（上）：空气 / 实心 / 半透明(a=128) / 空气
+    //    期望（自发光是**光**，所以是加法叠在画面上、不参与覆盖混合）：
+    //      [0] 上方空气        -> 发光原样到相机 = 200
+    //      [1] 上方实心        -> 被挡住 = 0
+    //      [2] 上方半透明 128  -> 透过率 = 1-0.502，约 99
+    //      [3] 同上（空气）
+    //    注意底层的 albedo 是**黑**，所以结果里的绿只可能来自自发光 ——
+    //    这正好把"垂直光路"与"平面内光场"分开了。
+    // ---------------------------------------------------------------
+    printf("[5] 自发光的垂直传输：上层空气透过 / 实心挡住 / 半透明减半\n");
+    {
+        GLuint arr = gfx::createTextureArray(GL_RGBA8, W, H, 2, GL_RGBA, GL_UNSIGNED_BYTE);
+        auto upLit = [&](int layer, const Px* px) {
+            std::vector<RGBA8> d(4);
+            for (int i = 0; i < 4; i++)
+                d[(size_t)i] = RGBA8{px[i].r, px[i].g, px[i].b, px[i].cov};
+            gfx::uploadArrayLayer(arr, layer, W, H, d.data());
+        };
+        // 受光结果：底层黑（无平面内颜色），覆盖率 255（实心）
+        const Px litBot[4] = {{0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}};
+        // 上层：空气 / 实心 / 半透明 / 空气
+        const Px litTop[4] = {{0, 0, 0, 0}, {0, 0, 0, 255}, {0, 0, 0, 128}, {0, 0, 0, 0}};
+        upLit(0, litBot);
+        upLit(1, litTop);
+
+        // 未受光 albedo：覆盖率决定"上方各层透掉多少"，所以两层的 alpha 都用覆盖率
+        GLuint albArr = gfx::createTextureArray(GL_RGBA8, W, H, 2, GL_RGBA, GL_UNSIGNED_BYTE);
+        const Px albBot[4] = {{0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}};
+        const Px albTop[4] = {{0, 0, 0, 0}, {0, 0, 0, 255}, {0, 0, 0, 128}, {0, 0, 0, 0}};
+        auto upAlb = [&](int layer, const Px* px) {
+            std::vector<RGBA8> d(4);
+            for (int i = 0; i < 4; i++)
+                d[(size_t)i] = RGBA8{px[i].r, px[i].g, px[i].b, px[i].cov};
+            gfx::uploadArrayLayer(albArr, layer, W, H, d.data());
+        };
+        upAlb(0, albBot);
+        upAlb(1, albTop);
+
+        // 材质：底层 4 格都是自发光绿 200/255；上层无自发光
+        GLuint matArr = gfx::createTextureArray(GL_RGBA32F, W, H, 2, GL_RGBA, GL_FLOAT);
+        for (int layer = 0; layer < 2; layer++) {
+            std::vector<float> md(4 * 4, 0.0f);
+            if (layer == 0) {
+                for (int i = 0; i < 4; i++) {
+                    md[(size_t)i * 4 + 1] = 200.0f / 255.0f;   // emG
+                    md[(size_t)i * 4 + 3] = 1.0f;              // ior=1.0（不折射）
+                }
+            }
+            gfx::uploadMaterialArrayLayer(matArr, layer, W, H, md.data());
+        }
+
+        GLuint opa = gfx::createTextureArray(GL_R32F, W, H, 2, GL_RED, GL_FLOAT);
+        gfx::uploadFloatArrayLayer(opa, 0, W, H, 1.0f);
+        gfx::uploadFloatArrayLayer(opa, 1, W, H, 1.0f);
+
+        comp.composite(arr, opa, 2, W, H, out, false, nullptr, albArr, 1.0f,
+                       matArr, 1.0f);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        RGBA8 got[4];
+        read(got);
+        expectPixel("上方空气 -> 发光原样透过", got[0], 0, 200, 0);
+        expectPixel("上方实心 -> 发光被挡住", got[1], 0, 0, 0);
+        expectPixelNear("上方半透明(128) -> 发光透过约一半", got[2], 0, 99, 0);
+        expectPixel("上方空气 -> 发光原样透过(第二格)", got[3], 0, 200, 0);
+
+        // 同一份输入、但底层整层不透明度 50%：发光也要按不透明度打折
+        clearOut();
+        gfx::uploadFloatArrayLayer(opa, 0, W, H, 0.5f);
+        comp.composite(arr, opa, 2, W, H, out, false, nullptr, albArr, 1.0f,
+                       matArr, 1.0f);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        read(got);
+        expectPixel("底层 op=50% -> 发光减半", got[0], 0, 100, 0);
+
+        // 不传材质纹理时，这条垂直光路必须完全关闭
+        clearOut();
+        comp.composite(arr, opa, 2, W, H, out, false, nullptr, albArr, 1.0f);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        read(got);
+        expectPixel("不传材质 -> 无垂直光路", got[0], 0, 0, 0);
+
+        glDeleteTextures(1, &arr);
+        glDeleteTextures(1, &albArr);
+        glDeleteTextures(1, &matArr);
         glDeleteTextures(1, &opa);
     }
 

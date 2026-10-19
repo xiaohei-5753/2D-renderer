@@ -1,37 +1,43 @@
 // core/layer.h — 图层与文档
 //
-// ## 多图层的整体结构（决定：逐层光照 + 层间互相影响，即"模型 B / 2.5D"）
+// ## 多图层的整体结构（逐层照亮 + 光场合成）
 //
 // 管线是**先逐层照亮、再合成**，而不是先合成再照亮：
 //
-//     每个 Layer 各自做平面内光追   →  每层得到"受光后的颜色"
+//     每个 Layer 各自做一轮**独立**的平面内光追   →  每层得到"受光后的颜色"
+//                                                  + 这一层的"光场"
 //                                      ↓
-//              按 alpha 从下往上正常合成  →  最终画面
+//              上层的光场照亮下层，逐层乘上去      →  最终画面
 //
 // 这样图层排序 / 不透明度 / 隐藏这些行为仍然是普通 alpha 叠加、可预期的，
 // 层间影响**只发生在"照亮"那一步**，不会让图层语义变得诡异。
 //
-// ## 为什么"层间互相影响"必须用额外的机制（这是本项目的难点）
+// ## 为什么"层间互相影响"要绕这么一圈（这是本项目的难点）
 //
-// 光照目前是"光在画布平面（XY）内直线传播"，而图层是沿**视线方向（Z）**堆叠的。
+// 光照是"光在画布平面（XY）内直线传播"，而图层是沿**视线方向（Z）**堆叠的。
 // 一条反直觉但很重要的推论：**一个无限薄的层，不会挡住另一层平面内的光。**
 // 所以"上层给下层投影"这个直觉，物理上并不自然成立。
 //
-// 模型 B 的做法是显式补上这个垂直方向的关系（详见 core/composite.h 的说明）：
-//   * occlAbove[i]：第 i 层上方各层的累计遮盖 -> 给该层的平面内光线额外衰减（投影）
-//   * emitFor_i   ：其他层的光透过中间层到达第 i 层的量 -> 当作额外光源（层间照亮）
-// 它是**风格化**的（不是严格物理），但良定义、可预期，而且保留了现有的平面观感。
+// 现在的做法是**逐层光场**：每层先独立扫出自己"洒出来的光"（= 该层空气像素的
+// 颜色，纯光、不含原始像素），再把本层与上方各层的光场累加，**乘**到本层的
+// 原始颜色上 —— "彩色光打在彩色表面上"。实现见 gfx/layer_composite.cpp。
+//
+// 它是**风格化**的（不是严格物理），但良定义、可预期，而且保留了平面观感。
+// 早先试过另一条路（显式构造 occlAbove / emitFor 两张通道做层间耦合），
+// 因为"空图层也会拿到别的层的光、层数一多画面越来越亮"而被删除。
 //
 // 如果效果不好，备选是模型 A：把层堆当成 W x H x N 的 3D 体素网格做真 3D 光追
 // （成本与现在同量级，因为 3D DDA 一条线最多穿 W+H+N 个体素），
-// 但光照会变成 3D 的，现有霓虹在平面内传播的观感会改变。
+// 但光照会变成 3D 的，现有霓虹在平面内传播的观感会改变。这条路已归档，
+// 见 archive/README.md。
 //
 // ## 为什么 Layer 自己带绘制原语与脏矩形
 //
 // 改造前 `Canvas` 一个类同时扮演两个角色："可绘制的表面"和"送去光照的那张图"。
 // 有了图层之后这两个角色必须分开：
 //   * **可绘制的表面**是单个图层 —— 工具、洪水填充、History 全都只碰它
-//   * **送去光照的图**是所有图层压平的结果 —— 由 Canvas 扮演（见 composite.h）
+//   * **送去光照的图**现在也是逐层的（每层各自照亮），只有导出 PNG 时才需要
+//     一张压平结果 —— 由 flattenDocument 产生（见 core/composite.h）
 // 两边都保留同一套原语，是为了让工具代码不需要知道自己写的是图层还是别的什么；
 // 代价是一份有意的、受控的重复（两个类的语义不同，硬抽公共基类反而会绑死它们）。
 #pragma once
@@ -214,7 +220,20 @@ public:
         layers_.back().resize(w_, h_);
         layers_.back().name = "图层 1";
         active_ = 0;
+        bumpStructure();
     }
+
+    // 结构版本号：**只要"哪一层在第几个位置"变了就自增**（增删移并、换尺寸）。
+    //
+    // 为什么需要它：逐层光照的缓存键是"每层的内容版本 + 可见性 + 不透明度"，
+    // 这些量**不含图层身份**。把两层交换位置时，每个位置上的 revision 都不变，
+    // 缓存就会认为"什么都没变"，于是光照那一帧直接早退 —— 画面停在上一次的
+    // 图层顺序上，直到用户再画一笔才恢复。
+    //
+    // 所以只要这个号变了，光照侧就把所有图层重算一遍（见 app/lighting.cpp）。
+    // 它和 Layer::revision 的分工：revision 管"这一层的内容变没变"，
+    // 结构号管"层的排列变没变"。
+    uint32_t structureVersion() const { return structure_; }
 
     int width() const { return w_; }
     int height() const { return h_; }
@@ -256,6 +275,7 @@ public:
         const int at = std::clamp(active_ + 1, 0, layerCount());
         layers_.insert(layers_.begin() + at, std::move(l));
         active_ = at;
+        bumpStructure();
         return at;
     }
 
@@ -267,6 +287,7 @@ public:
         copy.markAllDirty();
         layers_.insert(layers_.begin() + i + 1, std::move(copy));
         active_ = i + 1;
+        bumpStructure();
         return active_;
     }
 
@@ -276,6 +297,7 @@ public:
         i = std::clamp(i, 0, layerCount() - 1);
         layers_.erase(layers_.begin() + i);
         active_ = std::clamp(active_, 0, layerCount() - 1);
+        bumpStructure();
         return true;
     }
 
@@ -288,6 +310,7 @@ public:
         layers_.erase(layers_.begin() + from);
         layers_.insert(layers_.begin() + to, std::move(l));
         active_ = to;
+        bumpStructure();
         return true;
     }
 
@@ -328,6 +351,7 @@ public:
         dst.markAllDirty();
         layers_.erase(layers_.begin() + i);
         active_ = std::clamp(i - 1, 0, layerCount() - 1);
+        bumpStructure();
         return true;
     }
 
@@ -349,9 +373,13 @@ private:
         return "图层 " + std::to_string(layerCount() + 1);
     }
 
+    // 只有"层的排列变了"才走这里（见 structureVersion 的说明）。
+    void bumpStructure() { structure_++; }
+
     int w_ = 0, h_ = 0;
     std::vector<Layer> layers_;
     int active_ = 0;
+    uint32_t structure_ = 1;
 };
 
 }  // namespace pb

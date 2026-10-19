@@ -116,7 +116,12 @@ void Palette::loadPreset(int index) {
     current_ = 0;
 }
 
-const char* Palette::presetName() const { return kPresets[preset_].name; }
+// preset_ 可能是 -1（= 从工程文件加载的自定义色板，不属于任何内置预设）。
+// 原来直接 kPresets[preset_] 索引，-1 会读到数组前面 —— 这里改成有边界检查。
+const char* Palette::presetName() const {
+    if (preset_ < 0 || preset_ >= kPresetCount) return "自定义";
+    return kPresets[preset_].name;
+}
 
 RGBA8 Palette::color(int i) const {
     if (colors_.empty()) return RGBA8{255, 255, 255, 255};
@@ -139,6 +144,20 @@ void Palette::step(int delta) {
 int Palette::addColor(RGBA8 c) {
     colors_.push_back(c);
     current_ = (int)colors_.size() - 1;
+
+    // ⚠️ 必须同时给这个新条目建一份材质。mats_ 与 colors_ 是**平行数组**，
+    // 而 mat() 在取不到时会退回默认值（白 + 不自发光），于是漏掉这一步会让
+    // "加入色板"之后：
+    //   * 选色拿到的是**白色**，不是刚加进去的颜色
+    //   * 自发光被清零
+    // 凡是动 colors_ 的地方都得同步动 mats_ —— loadPreset（配合 resetMats）、
+    // removeColor、setMat 都做了，这里曾经漏掉，是实打实踩过的 bug。
+    Mat7 m;
+    m.r = c.r;
+    m.g = c.g;
+    m.b = c.b;
+    m.a = 255;   // 色板条目约定为不透明：a 是笔刷的遮挡属性，不该混进色板
+    setMat(current_, m);   // setMat 内部负责把 mats_ 补齐
     return current_;
 }
 
@@ -147,11 +166,37 @@ void Palette::setColorAt(int i, RGBA8 c) {
     colors_[(size_t)i] = c;
 }
 
+void Palette::setAll(const std::vector<RGBA8>& col, const std::vector<Mat7>& mats, int current) {
+    colors_ = col;
+    // 材质表必须与颜色表对齐：短了补默认值，长了截掉。
+    // 不这么做的话 mat() 会退回默认值（白 + 不发光），加载后颜色会串。
+    mats_.assign(colors_.size(), Mat7{});
+    for (size_t i = 0; i < colors_.size() && i < mats.size(); i++) mats_[i] = mats[i];
+    // 文件里没给材质（或给短了）的条目：按"本项颜色 + 不发光 + 全不透明"补齐，
+    // 和 resetMats 的口径一致，免得加载出来的色板带着残留材质。
+    for (size_t i = 0; i < colors_.size(); i++) {
+        if (i < mats.size()) continue;
+        mats_[i].r = colors_[i].r;
+        mats_[i].g = colors_[i].g;
+        mats_[i].b = colors_[i].b;
+        mats_[i].a = 255;
+    }
+    current_ = colors_.empty() ? 0 : std::clamp(current, 0, (int)colors_.size() - 1);
+    preset_ = -1;   // 不再是任何内置预设（-1 = 自定义）
+}
 bool Palette::removeColor(int i) {
     // 不允许删空：画板总得有一个当前色
     if (colors_.size() <= 1) return false;
     if (i < 0 || i >= (int)colors_.size()) return false;
     colors_.erase(colors_.begin() + i);
+    // ⚠️ 材质表是**平行数组**，必须同步删。
+    //
+    // 上面 addColor 那段注释里写过"凡是动 colors_ 的地方都得同步动 mats_ ——
+    // loadPreset、removeColor、setMat 都做了"，但 removeColor 其实**没做**：
+    // 删掉第 i 项之后，颜色表左移、材质表不动，于是从第 i 项开始，每一项的
+    // 自发光 / 透明度都变成**前一项**的（mat() 的 r/g/b 取自颜色表、
+    // eR/eG/eB/a 取自材质表），表现为"删一个色块，后面所有色块的发光全错位"。
+    if ((size_t)i < mats_.size()) mats_.erase(mats_.begin() + i);
     if (current_ >= (int)colors_.size()) current_ = (int)colors_.size() - 1;
     return true;
 }

@@ -698,6 +698,63 @@ void testPalette() {
     CHECK(q.current() == custom);
     CHECK(q.contains(custom));
     CHECK(!q.contains(RGBA8{9, 9, 9, 255}));
+
+    // ⚠️ 加入色板后，这个新条目必须带上一份**自己的材质**，而不是落进
+    // "mats_ 比 colors_ 短"的空隙里退回默认值。漏掉的话选色会拿到白色、
+    // 自发光会被清零（选色 = 同时选材质，这里曾经断链）。
+    CHECK(q.mat(idx).r == 1);
+    CHECK(q.mat(idx).g == 2);
+    CHECK(q.mat(idx).b == 3);
+    CHECK(q.mat(idx).a == 255);        // 色板条目一律不透明
+    CHECK(q.mat(idx).eR == 0);         // 新条目默认不发光
+    CHECK(q.mat(idx).eG == 0);
+    CHECK(q.mat(idx).eB == 0);
+
+    // 再验证一次"平行数组没被写坏"：追加第二个自定义色，两个条目各归各的
+    const RGBA8 custom2{200, 100, 50, 255};
+    const int idx2 = q.addColor(custom2);
+    CHECK(idx2 == 17);
+    CHECK(q.mat(idx2).r == 200 && q.mat(idx2).g == 100 && q.mat(idx2).b == 50);
+    CHECK(q.mat(idx).r == 1);          // 前一个条目没被覆盖
+
+    // ------------------------------------------------------------------
+    // 删除色板项必须**同时**删除材质表里对应那一项
+    //
+    // mats_ 与 colors_ 是平行数组：mat(i) 的 r/g/b 取自颜色表、eR/eG/eB/a
+    // 取自材质表。只删颜色表的话，从被删位置起每一项的自发光/透明度都会
+    // 变成**前一项**的 —— 表现为"删一个色块，后面所有色块的发光全错位"。
+    // 这里给三个条目配三份可区分的材质，删中间那个，逐个核对。
+    // ------------------------------------------------------------------
+    {
+        Palette p2;
+        p2.loadPreset(0);
+        p2.addColor(RGBA8{10, 11, 12, 255});     // 16
+        p2.addColor(RGBA8{20, 21, 22, 255});     // 17
+        p2.addColor(RGBA8{30, 31, 32, 255});     // 18
+
+        Palette::Mat7 m16 = p2.mat(16);
+        m16.eR = 16; m16.a = 200;
+        p2.setMat(16, m16);
+        Palette::Mat7 m17 = p2.mat(17);
+        m17.eG = 17; m17.a = 150;
+        p2.setMat(17, m17);
+        Palette::Mat7 m18 = p2.mat(18);
+        m18.eB = 18; m18.a = 100;
+        p2.setMat(18, m18);
+
+        CHECK(p2.removeColor(17));
+        CHECK(p2.size() == 18);
+
+        // 前一项不动
+        CHECK(p2.mat(16).eR == 16 && p2.mat(16).eG == 0);
+        CHECK(p2.mat(16).a == 200);
+        // 原来的 18 挪到 17，材质必须**跟着颜色一起**挪过来
+        CHECK(p2.mat(17).r == 30 && p2.mat(17).g == 31 && p2.mat(17).b == 32);
+        CHECK(p2.mat(17).eB == 18);
+        CHECK(p2.mat(17).eG == 0);        // 不能残留被删项的 eG=17
+        CHECK(p2.mat(17).a == 100);       // 不能残留被删项的 a=150
+        CHECK(p2.currentIndex() <= 17);
+    }
 }
 
 void testMaterial() {
@@ -707,7 +764,6 @@ void testMaterial() {
     CHECK(m.emissionLevel() == 0);
     CHECK(!m.emissive());
     CHECK(m.ior == 0);
-    CHECK(!m.solid());
 
     m.setIorValue(1.5f);
     CHECK(m.ior == 50);
@@ -718,11 +774,6 @@ void testMaterial() {
 
     m.setIorValue(99.0f);  // 夹到 3.55
     CHECK(m.iorValue() > 3.54f && m.iorValue() < 3.56f);
-
-    m.setSolid(true);
-    CHECK(m.solid());
-    m.setSolid(false);
-    CHECK(!m.solid());
 
     // 材质参与撤销重做的比对。
     // 自发光故意设成 (10,200,30)，与 albedo（白色）**完全不同** ——
@@ -746,6 +797,39 @@ void testMaterial() {
     CHECK(h.redo(doc));
     CHECK(c.materialAt(1, 1).emG == 200);  // 重做后恢复
     CHECK(c.image().at(1, 1) == kWhite);
+
+    // ------------------------------------------------------------------
+    // setEmissionScaled：自发光 = 表面颜色 × 强度
+    //
+    // 这是材质预设的语义（"霓虹管是蓝的，它发的光就是蓝的"）。
+    // 重点是**保色相**：曾经把三通道都取成同一个值（如都用最大通道），
+    // 琥珀色会被压成灰色，彩色霓虹全部消失。
+    // ------------------------------------------------------------------
+    {
+        Material e;
+        // 琥珀色 (255,200,0)，强度 170（霓虹管那一档）
+        e.setEmissionScaled(255, 200, 0, 170);
+        CHECK(e.emR == 170);
+        CHECK(e.emG == 133);                    // 200*170/255
+        CHECK(e.emB == 0);
+        // 色相必须保住：R > G > B，而不是三者相等（那才是被压成灰）
+        CHECK(e.emR > e.emG);
+        CHECK(e.emG > e.emB);
+
+        // 强度 0 = 不发光（空气/半透明/彩色玻璃/实心墙都靠这一条，
+        // 不需要调用方加分支）
+        e.setEmissionScaled(255, 200, 0, 0);
+        CHECK(!e.emissive());
+        CHECK(e.emissionLevel() == 0);
+
+        // 强度 255 = 完全等于表面色（"跟随表面颜色"）
+        e.setEmissionScaled(41, 173, 255, 255);
+        CHECK(e.emR == 41 && e.emG == 173 && e.emB == 255);
+
+        // 黑色表面无论强度多大都不发光
+        e.setEmissionScaled(0, 0, 0, 255);
+        CHECK(!e.emissive());
+    }
 }
 
 void testHistoryExternalChange() {
@@ -865,6 +949,56 @@ void testDocument() {
     CHECK(doc.width() == 8 && doc.height() == 8);
 }
 
+// 结构版本号：**层的排列变了**必须能被光照侧看到
+//
+// 踩过的 bug：逐层光照的缓存键只有"每层的内容版本 + 可见性 + 不透明度"，
+// 不含图层身份。交换两层位置时，每个位置上的这三个量都没变，于是光照判定
+// "什么都没变"直接早退 —— 画面停在上一次的图层顺序上，直到用户再画一笔。
+// 所以 Document 维护一个"排列版本号"，排列一变它必变。
+void testDocumentStructureVersion() {
+    section("多图层 / 结构版本号（排列变化必须可见）");
+
+    Document doc(8, 8);
+    const uint32_t v0 = doc.structureVersion();
+    CHECK(v0 == doc.structureVersion());   // 只读不写：不该变
+
+    doc.addLayer("A");
+    const uint32_t v1 = doc.structureVersion();
+    CHECK(v1 != v0);
+
+    doc.addLayer("B");
+    const uint32_t v2 = doc.structureVersion();
+    CHECK(v2 != v1);
+
+    // 移动：层数不变、每层内容与元数据都不变 —— 只有结构号能反映这件事
+    CHECK(doc.moveLayer(2, 0));
+    const uint32_t v3 = doc.structureVersion();
+    CHECK(v3 != v2);
+
+    // 原地移动是空操作：不该让光照白算一遍
+    CHECK(!doc.moveLayer(1, 1));
+    CHECK(doc.structureVersion() == v3);
+
+    // 只剩一层时拒绝删除，也不该改版本号
+    CHECK(doc.removeLayer(0));
+    CHECK(doc.removeLayer(0));
+    const uint32_t v4 = doc.structureVersion();
+    CHECK(!doc.removeLayer(0));
+    CHECK(doc.structureVersion() == v4);
+
+    // 复制 / 合并 / 改尺寸都要变
+    doc.addLayer("C");
+    const uint32_t v5 = doc.structureVersion();
+    doc.duplicateLayer(0);
+    const uint32_t v6 = doc.structureVersion();
+    CHECK(v6 != v5);
+    CHECK(doc.mergeDown(1));
+    const uint32_t v7 = doc.structureVersion();
+    CHECK(v7 != v6);
+    doc.resize(4, 4);
+    CHECK(doc.structureVersion() != v7);
+}
+
 void testLayerMerge() {
     section("多图层 / 合并向下（source-over）");
 
@@ -941,53 +1075,6 @@ void testFlatten() {
     doc.layer(up).opacity = 0;
     flattenDocument(doc, flat, mats, Rect{0, 0, 3, 3});
     CHECK(flat.at(2, 2) == (RGBA8{200, 0, 0, 255}));
-}
-
-void testLayerLightingChannels() {
-    section("多图层 / 层间光照通道（occlAbove 与 emitFor）");
-
-    Document doc(4, 4);
-    // 层 0：一个自发光绿像素
-    doc.layer(0).albedo.fill(RGBA8{0, 0, 0, 0});
-    doc.layer(0).material.assign(16, Material{});
-    Material green;
-    green.setEmissionFrom(0, 200, 0);
-    doc.layer(0).materialAt(1, 1) = green;
-
-    // 层 1：一个半透明像素（覆盖率 128）
-    const int mid = doc.addLayer("中");
-    doc.layer(mid).albedo.fill(RGBA8{0, 0, 0, 0});
-    doc.layer(mid).material.assign(16, Material{});
-    doc.layer(mid).albedo.at(1, 1) = RGBA8{10, 10, 10, 128};
-
-    // 层 2：全透明
-    doc.addLayer("上");
-
-    const Rect all{0, 0, 3, 3};
-    std::vector<uint8_t> occl;
-    std::vector<RGBA8> emit;
-
-    // --- occlAbove：第 1 层上方只有全透明的层 2 -> 0 ---
-    buildOcclAbove(doc, mid, all, occl);
-    CHECK(occl[1 * 4 + 1] == 0);
-    // 第 0 层上方有半透明的层 1 -> 约 128
-    buildOcclAbove(doc, 0, all, occl);
-    CHECK(occl[1 * 4 + 1] > 120 && occl[1 * 4 + 1] < 136);
-    // 未被任何东西盖住的像素 -> 0
-    CHECK(occl[0] == 0);
-
-    // --- emitFor：层 2 应当看到层 0 的绿光，但被层 1 衰减一半左右 ---
-    buildEmitFor(doc, 2, all, emit);
-    CHECK(emit[1 * 4 + 1].g > 90 && emit[1 * 4 + 1].g < 110);   // 200 * (1-0.502)
-    CHECK(emit[1 * 4 + 1].r == 0);
-    // 层 1 与层 0 紧邻，中间没有东西 -> 不衰减
-    buildEmitFor(doc, mid, all, emit);
-    CHECK(emit[1 * 4 + 1].g == 200);
-    // 层 0 自己不该把自己的光算进"其他层"的来源
-    buildEmitFor(doc, 0, all, emit);
-    CHECK(emit[1 * 4 + 1].g == 0);
-    // 没有发光体的位置 -> 0
-    CHECK(emit[0].g == 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,9 +1228,9 @@ int main() {
     testCanvasDirtyRect();
     testResize();
     testDocument();
+    testDocumentStructureVersion();
     testLayerMerge();
     testFlatten();
-    testLayerLightingChannels();
     testHistoryLayers();
     testHistoryStructural();
     testHistoryStructuralNoChange();

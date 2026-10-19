@@ -29,7 +29,6 @@ void commitStructural(App& a, const std::string& label) {
     if (a.history.commit(a.doc, label)) a.lastAction = label;
     a.lightDirty = true;
     a.layerPanelDirty = true;
-    if (a.pt) a.pt->resetAccumulation();
 }
 
 }  // namespace
@@ -42,7 +41,6 @@ void notifyLayerPropertiesChanged(App& a) {
     for (int i = 0; i < a.doc.layerCount(); i++) a.doc.layer(i).markAllDirty();
     a.lightDirty = true;
     a.layerPanelDirty = true;
-    if (a.pt) a.pt->resetAccumulation();
 }
 
 void actAddLayer(App& a) {

@@ -28,8 +28,19 @@ void uploadSubImagePacked(GLuint tex, int x0, int y0, int bw, int bh, const RGBA
 // 同上，但数据是 4 个 float/像素（材质通道用，见 gfx/material_pack.h）
 void uploadSubImagePackedF(GLuint tex, int x0, int y0, int bw, int bh, const float* tight);
 
-// 把纹理内容读回 CPU（离线渲染出图用）
-bool readbackTexture(GLuint tex, int w, int h, RGBA8* out);
+// 把纹理内容读回 CPU（离线渲染出图用）。
+//
+// flipToTopDown（默认 **false**）：把 GL 行序翻成 Image 的文档行序。
+//
+// ⚠️ 默认是不翻 —— 这一点我判断错过两次，所以把结论写在这里：
+//   上传（LightSweep::uploadLayer）把文档第 y 行直接写进纹理第 y 行，没有翻；
+//   glGetTexImage 又按纹理第 0..h-1 行输出 —— 于是**这两个操作在行序上彼此
+//   抵消**，读回来的 buffer 已经和文档同向，再翻就颠倒了。
+//   实证：render_cli --scene orient（顶部白条 / 底部暗条）导出时白条在顶部；
+//   一旦翻转，白条就跑到**底部**。所以默认必须是不翻。
+//
+// 只有在明确需要"GL 原始行序"时才传 true。
+bool readbackTexture(GLuint tex, int w, int h, RGBA8* out, bool flipToTopDown = false);
 
 // ---------------------------------------------------------------------------
 // 2D 纹理数组（逐层光照用：每个图层一层）
@@ -52,5 +63,9 @@ void uploadArrayLayerSub(GLuint tex, int layer, int x0, int y0, int bw, int bh,
 
 // 把一组 float 值写进数组纹理（每层一个 float，存为 R32F）—— 图层不透明度用
 void uploadFloatArrayLayer(GLuint tex, int layer, int w, int h, float value);
+
+// 上传数组纹理某一层的整层 RGBA32F 数据（紧凑数据，w*h*4 个 float）。
+// 用于每层的**材质**：合成阶段要靠它拿自发光（见 gfx/material_pack.h 的打包规则）。
+void uploadMaterialArrayLayer(GLuint tex, int layer, int w, int h, const float* rgba);
 
 }  // namespace pb::gfx

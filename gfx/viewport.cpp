@@ -19,6 +19,10 @@ uniform sampler2D u_t;uniform vec2 u_cp;uniform vec2 u_uv;
 in vec2 vU;out vec4 oC;
 void main(){
   vec2 ab=u_uv*(vU-0.5)+u_cp;
+  // 画布以外的像素直接丢弃，露出 glClear 填的**纯黑**背景
+  // （缩得比面板小的时候，四周留边就是这块）。
+  // 不丢弃的话，纹理是 GL_REPEAT/CLAMP 采样，边缘会被拉伸成一圈假像素。
+  if(ab.x<0.0||ab.x>1.0||ab.y<0.0||ab.y>1.0) discard;
   oC=texture(u_t,ab);
 })";
 
@@ -173,7 +177,10 @@ void Viewport::draw(GLuint texture) {
     // 关键：scissor 保证画布不会溢出到 ImGui 面板上
     glEnable(GL_SCISSOR_TEST);
     glScissor(x0, glY, rw, rh);
-    glClearColor(0.031f, 0.031f, 0.039f, 1.0f);
+    // 画布以外的区域填**纯黑**（原来是偏蓝的界面灰 0.031/0.031/0.039）。
+    // 这里清出来的颜色正是 letterbox / 缩小时露出的背景；着色器里对画布外的
+    // 像素会 discard，于是露出的就是这个黑。
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     float du = 1.0f, dv = 1.0f;

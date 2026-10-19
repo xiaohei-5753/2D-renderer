@@ -129,8 +129,10 @@ if ($Config -eq 'release') { $linkFlags += '-s' }
 # any header change invalidates every object; the tree is small so this is a
 # cheap and always-correct rule. app/ and ui/ must be included too: changing
 # app/app.h (the shared state struct) otherwise leaves every dependent .o stale.
+# tools/ is on the list for the same reason: tools/common.h is shared by
+# several tools, so a change there must rebuild the tool objects too.
 $headers = @(Get-ChildItem -Path (Join-Path $root 'core'), (Join-Path $root 'gfx'),
-                (Join-Path $root 'ui'), (Join-Path $root 'app') `
+                (Join-Path $root 'ui'), (Join-Path $root 'app'), (Join-Path $root 'tools') `
                 -Recurse -Include '*.h', '*.hpp' -ErrorAction SilentlyContinue)
 $newestHeader = [datetime]::MinValue
 foreach ($h in $headers) { if ($h.LastWriteTime -gt $newestHeader) { $newestHeader = $h.LastWriteTime } }
@@ -197,10 +199,17 @@ function Invoke-Compile {
 $libSources = @()
 $libSources += @(Get-ChildItem -Path (Join-Path $root 'core') -Filter '*.cpp' | ForEach-Object { $_.FullName })
 $libSources += @(Get-ChildItem -Path (Join-Path $root 'gfx')  -Filter '*.cpp' | ForEach-Object { $_.FullName })
-$libSources += @(Get-ChildItem -Path (Join-Path $root 'render') -Filter '*.cpp' | ForEach-Object { $_.FullName })
 $libSources += @(Get-ChildItem -Path (Join-Path $root 'ui')   -Filter '*.cpp' | ForEach-Object { $_.FullName })
+# app/bench_scene.cpp only depends on Document (not on App), but TWO executables
+# need it: paintboard's --bench-scene, and tools/bench_view. So it belongs to the
+# shared library objects, not to the app-only objects -- otherwise bench_view
+# fails to link.
+$libSources += @(Join-Path $root 'app\bench_scene.cpp')
+# app/light_settings_io.cpp only depends on core/paths + gfx/light_sweep (not on
+# App), so it also goes into the shared objects -- tools that load lighting
+# settings (e.g. dir_probe) can use it without pulling in the whole app.
+$libSources += @(Join-Path $root 'app\light_settings_io.cpp')
 if ($libSources.Count -eq 0) { Write-Error "no library sources found"; exit 1 }
-
 # Dear ImGui is compiled as its own set of translation units with -w: it is
 # upstream code we do not modify, and its warnings would drown out ours.
 $imguiSources = @(
@@ -232,7 +241,13 @@ foreach ($s in $imguiSources) { $libObjs += (Invoke-Compile $s @('-w')) }
 
 if ($buildApp) {
     Write-Host "[2/3] building app"
+    # bench_scene.cpp and light_settings_io.cpp are already compiled via
+    # $libSources; exclude them here or the same TU gets linked twice and the
+    # link reports "multiple definition of ...".  (Adding light_settings_io.cpp
+    # to $libSources without updating this filter is exactly how that happened.)
     $appSources = @(Get-ChildItem -Path (Join-Path $root 'app') -Filter '*.cpp' |
+                    Where-Object { $_.Name -ne 'bench_scene.cpp' -and
+                                   $_.Name -ne 'light_settings_io.cpp' } |
                     Sort-Object Name | ForEach-Object { $_.FullName })
     $appObjs = @()
     foreach ($s in $appSources) { $appObjs += (Invoke-Compile $s) }
@@ -257,12 +272,17 @@ if ($buildCli) {
     $toolSources = @(Get-ChildItem -Path (Join-Path $root 'tools') -Filter '*.cpp' |
                      Sort-Object Name | ForEach-Object { $_.FullName })
     Write-Host "[3/3] building tools ($($toolSources.Count))"
+    # app\main.cpp defines its own main(), so it must NOT be linked into a tool
+    # that has its own main() -- the linker reports "multiple definition of main".
+    # (bench_view.cpp and render_cli.cpp both bring their own main.)
+    # Dropping app_main.o is safe: no tool references paintboard's entry point.
+    $toolLibs = @($libObjs | Where-Object { [System.IO.Path]::GetFileName($_) -ne 'app_main.o' })
     foreach ($t in $toolSources) {
         $obj = Invoke-Compile $t
         $name = [System.IO.Path]::GetFileNameWithoutExtension($t)
         $exe = Join-Path $buildDir ($name + '.exe')
         $linkArgs = @()
-        $linkArgs += $libObjs
+        $linkArgs += $toolLibs
         $linkArgs += $obj
         $linkArgs += @('-o', $exe)
         $linkArgs += $linkFlags
@@ -272,6 +292,31 @@ if ($buildCli) {
     }
 } else {
     Write-Host "[3/3] tools skipped"
+}
+
+# --- 把运行期资源复制到 build\ 旁边 ---
+#
+# 为什么必须做这一步：UI 字体是在**运行时**从磁盘读的（core/paths.cpp 的
+# findAsset 会依次找 当前目录 -> exe 目录 -> exe 的上一级）。在项目里跑能靠
+# "上一级就是仓库根"找到字体，但**一旦把 exe 拷到别的机器/别的目录，上一级
+# 就没有字体了**，界面中文会全变成 '?'。
+#
+# 所以资源要在构建时就放到 exe 同目录 —— 这样把 build\ 整个拷走就能直接用。
+$assetNames = @('unifont-17.0.04.otf')
+foreach ($an in $assetNames) {
+    $src = Join-Path $root $an
+    $dst = Join-Path $buildDir $an
+    if (Test-Path -LiteralPath $src) {
+        if ((Test-Path -LiteralPath $dst) -and
+            ((Get-Item -LiteralPath $dst).Length -eq (Get-Item -LiteralPath $src).Length)) {
+            Write-Host ("  asset " + $an + " (already beside exe)")
+        } else {
+            Copy-Item -LiteralPath $src -Destination $dst -Force
+            Write-Host ("  ASSET " + $an + " -> build\")
+        }
+    } else {
+        Write-Warning ("asset missing, UI CJK text will fall back to '?': " + $src)
+    }
 }
 
 $dt = (Get-Date) - $t0

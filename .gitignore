@@ -23,3 +23,9 @@
 paintboard_layout.ini
 imgui.ini
 human/
+
+# --- 编辑器/IDE 配置（本机绝对路径 + GBK 注释，不适合进版本库）---
+.vscode/
+
+# --- ��ʱ�ʼ� / �ݸ壨�����汾�⣩---
+others/

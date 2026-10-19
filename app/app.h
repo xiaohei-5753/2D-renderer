@@ -15,13 +15,13 @@
 #include "gfx/gl_common.h"
 #include "gfx/gl_context.h"
 #include "gfx/light_sweep.h"
-#include "gfx/path_trace.h"
 #include "gfx/viewport.h"
 
 namespace pb::app {
 
-// 照明模式：实时扫描 GI / 渐进式逐像素光追（后者在 P2 实现）
-enum class LightMode { Sweep, PathTrace };
+// 照明模式：只剩实时扫描 GI。
+// 渐进式逐像素路径追踪已于 2026-10-19 整体移除（专注扫描 GI）。
+enum class LightMode { Sweep };
 
 const char* lightModeName(LightMode m);
 
@@ -59,7 +59,6 @@ struct App {
     // --- 渲染对象（由 main 填充，不持有所有权）---
     gfx::GLContext* ctx = nullptr;
     gfx::LightSweep* sweep = nullptr;
-    gfx::PathTrace* pt = nullptr;
 
     gfx::Viewport* vp = nullptr;
 
@@ -90,6 +89,15 @@ struct App {
     float fieldStrength = 1.0f;
     bool lightDirty = true;
     float lightMs = 0.0f;
+    // --- 渐进哈希采样（扫描 GI 的可选路径）---
+    //
+    // 开：每帧每像素只采一个方向、跨帧累积（零原子、单帧便宜、第 D 帧精确）。
+    // 关：确定性扫描（每帧把所有方向扫一遍，单帧贵但无噪声）。
+    bool progressive = false;
+    // 渐进模式的去噪（à-trous 联合双边）。
+    bool denoise = false;
+    float denoiseStrength = 3.5f;
+    int denoiseIters = 3;
     // --- 视图选项 ---
     bool showPixelGrid = false;
     // 首次拿到画布矩形后自动做一次整数倍缩放（像素画必须），之后不再干预用户
@@ -114,6 +122,31 @@ struct App {
     // --- 统计 ---
     int saveCounter = 0;
     double fps = 0.0;
+
+    // --- 工程文件（.pbproj）---
+    //
+    // 一个工程文件装下"作品 + 界面 + 工具设置 + 光照参数"，见 core/project.h。
+    // projectPath 为空表示"还没存过"，此时保存会先弹出路径对话框。
+    std::string projectPath;
+    // 工程打开/保存对话框请求（由菜单与快捷键设置，对话框自己消费）
+    bool requestProjectSaveDialog = false;
+    bool requestProjectOpenDialog = false;
+    // 对话框当前是"打开"还是"保存"。必须在**弹窗存活期间**记住它：
+    // ImGui 的 BeginPopupModal 在 OpenPopup 那一帧返回 false（下一帧才真出现），
+    // 所以不能靠"请求标志还在不在"来判断模式 —— 请求标志会在第一次渲染时清掉。
+    bool projectDialogIsOpen = false;
+    // 弹窗当前是"打开"(true) 还是"保存"(false)。**锁存**下来的，
+    // 不是每帧从请求标志重算 —— 见 drawProjectDialogs 里的注释（踩过的坑）。
+    bool projectDialogModeOpen = false;
+    // 对话框里的路径输入缓冲
+    char projectPathBuf[512] = {0};
+
+    // --- 基准场景（--bench-scene）---
+    // benchFrame > 0 时每帧调用 app::bench::step() 驱动动画。
+    // 这些图层**每帧全都变**，所以光照的脏层优化不会生效 —— 量到的是
+    // "每帧把 N 层全部重算"的真实上限成本，这正是基准想要的最坏情况。
+    int benchFrame = 0;
+    bool hidePanels = false;   // --hide-ui：只画画布，把 UI 开销排除掉
 
     // --- 最近使用的颜色 ---
     // 调色板本身只存"某一套色板"，最近使用是跨色板的编辑历史，所以放在 App 里。

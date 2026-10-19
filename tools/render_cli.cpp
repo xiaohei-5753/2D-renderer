@@ -16,15 +16,16 @@
 #include <string>
 #include <vector>
 
+#include "common.h"
 #include "core/canvas.h"
 #include "core/console.h"
 #include "core/image.h"
 #include "gfx/gl_context.h"
 #include "gfx/gl_texture.h"
 #include "gfx/light_sweep.h"
-#include "gfx/path_trace.h"
 
 using namespace pb;
+using namespace pb::tools;
 
 namespace {
 
@@ -36,11 +37,15 @@ struct Options {
     float ambient[3] = {0.10f, 0.10f, 0.12f};
     std::string out = "out.png";
     std::string dumpCanvas;   // 非空则额外导出未受光的画布原图
-    std::string mode = "sweep";   // sweep | pathtrace
-    int samples = 64;             // pathtrace 的累积样本数
-    int bounces = 4;
-    int steps = 240;
-    float ptAmbient = 0.42f;
+    // 只剩扫描 GI。--mode 仍接受，但只有 "sweep" 合法（路径追踪已于 2026-10-19 移除）。
+    std::string mode = "sweep";
+    bool denoise = false;          // 渐进模式的去噪（à-trous 联合双边）
+    float denoiseStrength = 3.5f;  // σr = c·√(Var/N)，实测甜点 c≈3.5
+    // 渐进哈希采样（扫描 GI 的可选路径）：每帧每像素采一个方向，跨帧累积
+    bool progressive = false;
+    int progFrames = 184;          // 默认一个完整周期（R=32 时 D=184）
+    // 角度可压缩性实验：只用前 N 个方向渲染，然后按 K/N 放大以便与全量对比。
+    // 误差越小 -> 有效角度自由度越少 -> 低阶角度基/降方向数越有希望。
 };
 
 void usage() {
@@ -53,11 +58,10 @@ void usage() {
         "  --emit <F>       自发光倍率                              (默认 1.0)\n"
         "  --ambient <r,g,b>  环境光 0..1                           (默认 0.10,0.10,0.12)\n"
         "  --out <file.png> 输出文件                                (默认 out.png)\n"
+        "  --mode <m>       只有 sweep（路径追踪已移除）            (默认 sweep)\n"
+        "  --progressive [N] 渐进哈希采样：跨帧累积 N 帧            (默认 184)\n"
+        "  --denoise [强度]  渐进模式开启 à-trous 联合双边去噪（默认强度 3.5）\n"
         "  --dump-canvas <file.png>  额外导出未受光的画布原图\n");
-}
-
-bool parseSize(const char* s, int& w, int& h) {
-    return sscanf(s, "%dx%d", &w, &h) == 2 && w > 0 && h > 0;
 }
 
 bool parseArgs(int argc, char** argv, Options& o) {
@@ -94,12 +98,18 @@ bool parseArgs(int argc, char** argv, Options& o) {
             const char* v = next("--dump-canvas"); if (!v) return false; o.dumpCanvas = v;
         } else if (a == "--mode") {
             const char* v = next("--mode"); if (!v) return false; o.mode = v;
-        } else if (a == "--samples") {
-            const char* v = next("--samples"); if (!v) return false; o.samples = atoi(v);
-        } else if (a == "--bounces") {
-            const char* v = next("--bounces"); if (!v) return false; o.bounces = atoi(v);
-        } else if (a == "--steps") {
-            const char* v = next("--steps"); if (!v) return false; o.steps = atoi(v);
+            // 未知模式必须明确报错，不能静默回落到 sweep（那样脚本会以为跑的是 pt）
+            if (o.mode != "sweep") {
+                fprintf(stderr, "[cli] 未知模式 '%s'（只剩 sweep；路径追踪已移除）\n",
+                        o.mode.c_str());
+                return false;
+            }
+        } else if (a == "--denoise") {
+            o.denoise = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') o.denoiseStrength = (float)atof(argv[++i]);
+        } else if (a == "--progressive") {
+            o.progressive = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') o.progFrames = atoi(argv[++i]);
         } else {
             fprintf(stderr, "[cli] 未知参数: %s\n", a.c_str());
             usage();
@@ -187,8 +197,69 @@ void sceneChecker(Canvas& c) {
     c.markAllDirty();
 }
 
-// 专门用来验证"颜色与亮度是两个独立的量"：
-// 同一个色相在三档亮度下，**色相必须保持不变**，只有明暗变化。
+// 诊断"方向性伪影"的最小场景：**纯白实心底 + 上方一个小自发光块**。
+//
+// 为什么必须是"白底 + 上方发光"这个结构（而不是透明底上放发光点）：
+// 受光结果 lit 是**把收集到的光乘到 albedo 上**。底下没有东西可乘，
+// 画面就是黑的 —— 我最初用透明底测，什么都看不见，白白折腾了几轮。
+// 真实用法里最底下永远有一层实心底纸。
+void scenePoint(Canvas& c) {
+    const int W = c.width(), H = c.height();
+    // 纯白实心底：alpha=255 才是不透明
+    c.clear(RGBA8{255, 255, 255, 255});
+    Material m;
+    m.setEmissionFrom(255, 255, 255);
+    // 上方一个小而强的自发光块
+    const int cx = W / 2, cy = H / 2;
+    for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++)
+            c.setPixelRaw(cx + dx, cy + dy, rgb(255, 255, 255, 255), m);
+    c.markAllDirty();
+}
+
+
+// 最小对照：纯白不透明底，**完全不自发光**。
+// 用来确认"白底能不能正常显示" —— 如果这个都黑，问题就在合成/上传而不是光照。
+void sceneWhite(Canvas& c) {
+    c.clear(RGBA8{255, 255, 255, 255});
+    c.markAllDirty();
+}
+
+// 朝向测试场景：**上亮下暗**，一眼就能判出 PNG 有没有上下颠倒。
+//   * 顶部：一条满强度自发光的白条
+//   * 底部：一条纯黑（不发光的暗条）
+// 导出的图里白条必须在上方。若跑到下方 = 导出翻转了。
+//
+// 为什么需要它：这个错在界面上看不见（显示走另一条路径、自带翻转），
+// 只有导出的 PNG 会颠倒，所以必须有一个**朝向可判**的场景来固化验证。
+void sceneOrient(Canvas& c) {
+    const int W = c.width(), H = c.height();
+    c.clear(RGBA8{0, 0, 0, 255});
+    for (auto& m : c.materials()) m = Material{};
+    for (int y = 0; y < H / 6; y++)                    // 顶部白条（自发光）
+        for (int x = 0; x < W; x++) {
+            Material em;
+            em.setEmissionFrom(255, 255, 255);
+            c.image().at(x, y) = RGBA8{255, 255, 255, 255};
+            c.materials()[(size_t)y * W + x] = em;
+        }
+    for (int y = H - H / 6; y < H; y++)                // 底部暗条
+        for (int x = 0; x < W; x++)
+            c.image().at(x, y) = RGBA8{20, 20, 24, 255};
+    c.markAllDirty();
+}
+
+// 白底 + 中心自发光点（不出光也该看得见那个点本身）
+void sceneWhiteDot(Canvas& c) {
+    const int W = c.width(), H = c.height();
+    c.clear(RGBA8{255, 255, 255, 255});
+    Material m;
+    m.setEmissionFrom(255, 255, 255);
+    c.fillRect(W / 2 - 3, H / 2 - 3, W / 2 + 3, H / 2 + 3, rgb(255, 255, 255, 255), m);
+    c.markAllDirty();
+}
+
+
 // 如果亮度把颜色推向白（旧实现的错误行为），右列会变成白色 —— 这个场景一眼就能看出来。
 void sceneHue(Canvas& c) {
     c.clear(RGBA8{0, 0, 0, 0});
@@ -219,6 +290,10 @@ bool buildScene(const std::string& name, Canvas& c) {
     if (name == "empty") { c.clear(RGBA8{0, 0, 0, 0}); return true; }
     if (name == "neon") { sceneNeon(c); return true; }
     if (name == "cornell") { sceneCornell(c); return true; }
+    if (name == "point") { scenePoint(c); return true; }
+    if (name == "white") { sceneWhite(c); return true; }
+    if (name == "orient") { sceneOrient(c); return true; }
+    if (name == "whitedot") { sceneWhiteDot(c); return true; }
     if (name == "checker") { sceneChecker(c); return true; }
     if (name == "hue") { sceneHue(c); return true; }
     fprintf(stderr, "[cli] 未知场景: %s\n", name.c_str());
@@ -243,80 +318,67 @@ int main(int argc, char** argv) {
     }
 
     // --- 2. 建隐藏窗口的 GL 上下文 ---
-    gfx::ContextDesc desc;
-    desc.width = opt.w;
-    desc.height = opt.h;
-    desc.visible = false;
-    desc.title = "paintboard offline";
-
     gfx::GLContext ctx;
-    if (!ctx.create(desc)) {
+    if (!createOffscreenContext(ctx, opt.w, opt.h, "paintboard offline")) {
         fprintf(stderr, "[cli] 无法创建 OpenGL 上下文（离线渲染需要 GL 4.3）\n");
         return 1;
     }
 
-    // --- 3. 跑光照 ---
-    const bool usePt = (opt.mode == "pathtrace" || opt.mode == "pt");
-    if (!usePt && opt.mode != "sweep") {
-        fprintf(stderr, "[cli] 未知模式 '%s'（可用 sweep / pathtrace）\n", opt.mode.c_str());
-        return 2;
+    // 诊断：打印场景本身的内容（确认是场景还是渲染的问题）
+    {
+        const Image& im = canvas.image();
+        int nz = 0, maxA = 0, maxR = 0;
+        for (size_t i = 0; i < im.pixelCount(); i++) {
+            const RGBA8& p = im.data()[i];
+            if (p.r || p.g || p.b || p.a) nz++;
+            if (p.a > maxA) maxA = p.a;
+            if (p.r > maxR) maxR = p.r;
+        }
+        printf("[cli] 场景内容: 非空 %d/%zu  最大alpha %d  最大R %d\\n", nz,
+               im.pixelCount(), maxA, maxR);
     }
 
+    // --- 3. 跑光照 ---
+    // 只剩扫描 GI（路径追踪已于 2026-10-19 移除）；模式合法性在 parseArgs 里已校验。
     gfx::LightSweep sweep;
-    gfx::PathTrace pt;
-    GLuint srcTex = 0;
+    if (!sweep.init(opt.w, opt.h)) {
+        fprintf(stderr, "[cli] 扫描 GI 初始化失败\n");
+        return 1;
+    }
+    sweep.settings().rayRadius = opt.radius;
+    sweep.settings().emitScale = opt.emit;
+    // 诊断开关（见 LightSettings::debugScan）。留一个环境变量入口，
+    // 是为了在排查光照问题时不必每次改代码重编。
 
-    if (!usePt) {
-        if (!sweep.init(opt.w, opt.h)) {
-            fprintf(stderr, "[cli] 扫描 GI 初始化失败\n");
-            return 1;
+    for (int i = 0; i < 3; i++) sweep.settings().ambient[i] = opt.ambient[i];
+    sweep.uploadAll(canvas.image(), canvas.materialData());
+
+    if (opt.progressive) {
+        // 渐进哈希采样：逐帧累积，每帧每像素采一个方向
+        sweep.setProgressive(true);
+        sweep.setDenoise(opt.denoise, opt.denoiseStrength, 3);
+        const int nf = std::max(1, opt.progFrames);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int f = 0; f < nf; f++) {
+            sweep.beginFrame();
+            sweep.renderLayer(0);
+            sweep.endFrame();
         }
-        sweep.settings().rayRadius = opt.radius;
-        sweep.settings().emitScale = opt.emit;
-        // 诊断开关（见 LightSettings::debugScan）。留一个环境变量入口，
-        // 是为了在排查光照问题时不必每次改代码重编。
-
-        for (int i = 0; i < 3; i++) sweep.settings().ambient[i] = opt.ambient[i];
-        sweep.uploadAll(canvas.image(), canvas.materialData());
-
+        sweep.composite();
+        glFinish();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        printf("[cli] 渐进哈希采样：%d 帧共 %.2f ms（%.2f ms/帧，%d 个方向%s）\n", nf, ms,
+               ms / (double)nf, sweep.directionCount(), opt.denoise ? "，去噪开" : "");
+    } else {
         const auto t0 = std::chrono::steady_clock::now();
         sweep.render();
         glFinish();
         const auto t1 = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         printf("[cli] 扫描 GI 耗时 %.2f ms（%d 个方向）\n", ms, sweep.directionCount());
-        srcTex = sweep.resultTexture();
-    } else {
-        if (!pt.init(opt.w, opt.h)) {
-            fprintf(stderr, "[cli] 路径追踪初始化失败\n");
-            return 1;
-        }
-        pt.settings().maxBounces = opt.bounces;
-        pt.settings().maxSteps = opt.steps;
-        pt.settings().emitScale = opt.emit;
-        for (int i = 0; i < 3; i++) pt.settings().ambient[i] = opt.ptAmbient;
-        pt.uploadAll(canvas.image(), canvas.materialData());
-        pt.resetAccumulation();
-
-        // 每帧累积一个样本：先测单帧耗时（实时性），再累积到目标样本数（画质）
-        const auto t0 = std::chrono::steady_clock::now();
-        pt.render();
-        glFinish();
-        const auto t1 = std::chrono::steady_clock::now();
-        const double frameMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-        const int n = std::max(1, opt.samples);
-        const auto t2 = std::chrono::steady_clock::now();
-        for (int i = 1; i < n; i++) pt.render();
-        glFinish();
-        const auto t3 = std::chrono::steady_clock::now();
-        const double totalMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
-
-        printf("[cli] 路径追踪：单帧 %.2f ms（%.0f fps 实时性），%d 样本共 %.1f ms\n",
-               frameMs, frameMs > 0.0 ? 1000.0 / frameMs : 0.0, n, totalMs);
-        printf("[cli] 参数：弹射 %d，最大步长 %d\n", opt.bounces, opt.steps);
-        srcTex = pt.resultTexture();
     }
+    const GLuint srcTex = sweep.resultTexture();
 
     // --- 4. 回读并写 PNG ---
     Image result(opt.w, opt.h);
@@ -326,6 +388,22 @@ int main(int argc, char** argv) {
     }
     // 输出统一给不透明 alpha，方便直接查看
     for (size_t i = 0; i < result.pixelCount(); i++) result.data()[i].a = 255;
+    // 写 PNG 之前翻一次 —— 与画板导出口径一致（用户实测导出上下颠倒）
+    result.flipVertical();
+
+    if (opt.scene == "orient") {
+        auto rl = [&](int y) {
+            double s = 0.0;
+            for (int x = 0; x < opt.w; x++) {
+                const RGBA8 p = result.data()[(size_t)y * opt.w + x];
+                s += p.r + p.g + p.b;
+            }
+            return s / (3.0 * opt.w);
+        };
+        printf("[朝向] 导出图 首行 %.1f  末行 %.1f（已在导出前翻一次）\n", rl(0),
+               rl(opt.h - 1));
+    }
+
     if (!writePNG(opt.out, result)) return 1;
 
     printf("[cli] 已写出: %s\n", opt.out.c_str());

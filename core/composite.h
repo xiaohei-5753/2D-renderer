@@ -1,25 +1,29 @@
-// core/composite.h — 图层合成，以及"层间光照"需要的辅助通道
+// core/composite.h — 图层压平（把图层栈按 alpha 合成成一张图）
 //
-// 这一层是纯 CPU、可 headless 验证的，而且**两个光照方案都要它**：
-//   * 显示：无论如何都需要把图层按 alpha 压平成一张图
-//   * 模型 B：需要下面两张逐层通道（occlAbove / emitFor）
-//   * 模型 A：压平的结果就是"相机沿 -Z 看到的第一个不透明体素"，同样要用
+// 这一层是纯 CPU、可 headless 验证的。
 //
-// ## 为什么需要 occlAbove / emitFor（回顾一下难点）
+// ## 它在现在这套光照里的位置
 //
-// 光照在画布平面(XY)内传播，图层沿视线方向(Z)堆叠，
-// 而**无限薄的层不会挡住另一层平面内的光** —— 所以"上层给下层投影"不会自然发生。
-// 模型 B 显式补上这个垂直方向的关系：
+// 光照是**逐层**做的（每层各自照亮，再由 GPU 的 LayerComposite 用"光场"把各层
+// 合起来），所以 CPU 侧的压平与光照无关，只服务两件事：
+//   * 导出 PNG（"原始图"）：导出的应该就是用户看到的那张压平结果
+//   * 无 GPU 的单测：验证 source-over 的语义
 //
-//   occlAbove[i](x,y) = 1 - Π(k>i) (1 - cov_k(x,y))
-//       第 i 层**上方**所有层的累计遮盖。用它给该层的平面内光线额外衰减 = 投影。
+// ## 历史：曾经还有两条"层间光照通道"
 //
-//   emitFor_i(x,y)    = Σ(k≠i) em_k(x,y) · Π(中间层的 (1-cov))
-//       其他层的光透过**中间层**到达第 i 层的量。把它当作第 i 层的额外光源 = 层间照亮。
-//       这里的"中间层"是 i 与 k 之间真正夹着的那些层，所以下层的光能照上来、
-//       上层的光也能照下去，且都会被子透明层染色/衰减。
+// 早先试过一个叫模型 B 的方案，额外构造两张逐层通道：
 //
-// 这是**风格化**的模型（不是严格物理），但良定义、可预期，且保留了平面观感。
+//   occlAbove[i] = 1 - Π(k>i) (1 - cov_k)      第 i 层**上方**各层的累计遮盖
+//   emitFor_i    = Σ(k≠i) em_k · Π(中间层的 (1-cov))   其他层透过中间层照过来的光
+//
+// 用来表达"上层给下层投影"和"层间互相照亮"。**这条路已经删掉了**，原因：
+// 它会把"其他层透过来的光"塞进每一层的受光结果，于是**空图层也有值** ——
+// 层数一多，画面就越来越亮（这是实际出现过的 bug）。而现在的逐层光场模型
+// 本来就要求"每层做一轮独立的光照"，两者不能并存。详见 README 的「光照模型」。
+//
+// 更彻底的备选是模型 A：把层堆当成 W x H x N 的 3D 体素网格做真 3D 光追。
+// **这条路已经试过并归档**（见 archive/README.md）——它能拿到分图层的光线遮挡，
+// 但整体光效不如平面内光追，为此牺牲不划算。
 #pragma once
 
 #include <algorithm>
@@ -37,19 +41,7 @@ namespace pb {
 //
 // 材质合并规则：**最上层有覆盖的像素，其材质胜出**（简单、可预期）。
 // outAlbedo / outMaterial 必须已经是 doc 的尺寸；只重算 region 指定的区域。
-//
-// 调用方负责两件事：先取走 Document::takeDirtyUnion() 决定 region，
-// 再把这次压平的范围标到目标缓冲的脏矩形上（这样它才知道要往 GPU 传哪一块）。
-// 具体怎么串见 app/main.cpp 的 syncComposite()。
 void flattenDocument(const Document& doc, Image& outAlbedo,
                      std::vector<Material>& outMaterial, const Rect& region);
-
-// 第 i 层上方的累计遮盖（0 = 完全通透，255 = 完全被盖住）
-void buildOcclAbove(const Document& doc, int layerIndex, const Rect& region,
-                    std::vector<uint8_t>& out);
-
-// 其他层的光透过中间层到达第 i 层的量（逐通道 RGB）
-void buildEmitFor(const Document& doc, int layerIndex, const Rect& region,
-                  std::vector<RGBA8>& out);
 
 }  // namespace pb

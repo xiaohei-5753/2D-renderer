@@ -11,7 +11,10 @@
 //   8. swapBuffers
 #include <algorithm>
 #include <cmath>
+#include <array>
+#include <chrono>
 #include <cstdio>
+#include <numeric>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -25,7 +28,9 @@
 #endif
 
 #include "app/app.h"
+#include "app/bench_scene.h"
 #include "app/input.h"
+#include "app/light_settings_io.h"
 #include "app/panels.h"
 #include "core/image.h"
 #include "core/composite.h"
@@ -238,11 +243,35 @@ int main(int argc, char** argv) {
 
     int cw = 320, ch = 180;
     bool demo = false;
+    int benchLayers = 0;          // > 0 = 启用 --bench-scene，值为图层数
+bool benchLayersGiven = false; // 用户是否显式给了层数（未给则用场景推荐值）
+bool sceneGiven = false;       // 是否显式给了 --scene（决定要不要套用场景推荐值）
+std::string projectToOpen;     // --project FILE：启动时打开这个工程文件
+std::string projectToSave;     // --save-project FILE：退出前存到这个路径
+bool openProjectDialogAtStart = false;   // --project-dialog：启动即拉起工程对话框
+double zoomArg = 0.0;                    // --zoom F：覆盖自动适配的缩放（0 = 自动）
+// --bench-scene 用的场景（见 app/bench_scene.h）。默认 neon-city：
+// 它同时是最有诊断价值的（1px 霓虹管 = 锐度探针）和最好看的。
+bench::SceneId benchScene = bench::SceneId::NeonCity;
+    bool sizeGiven = false;       // 用户显式给了 --size，基准就不覆盖尺寸
+    int radiusArg = -1;           // --radius N：方向表半径（-1 = 未给，用场景推荐/默认 128）
+// 方向扩散（--diff / --diffw F / --diffk N）。给一次就锁定，防止预设档覆盖。
+bool sweepDiffOn = false;
+bool sweepDiffGiven = false;
+float sweepDiffW = 0.1f;
+int sweepDiffK = 8;
+    bool hideUi = false;          // --hide-ui：隐藏面板，只测画布与光照
     bool forceVisible = false, forceHidden = false;
     int framesToRun = 0;
     int paletteIndex = -1;
-    app::LightMode startMode = app::LightMode::Sweep;
-    float startField = 0.0f;      // --field：光场照亮下层的强度
+    // --field：光场照亮下层的强度。默认与 App::fieldStrength 一致（1.0，开着）；
+    // 0 是合成着色器里"关掉光场模型"的哨兵值，也就是旧的加法混合路径，
+    // 所以不要在不开参数时踩到它。
+    float startField = 1.0f;
+    // 渐进哈希采样的启动参数（原来只能在面板里点，自动化截图/回归时没法复现）
+    bool startDenoise = false;
+    float startDenoiseStrength = 3.5f;
+    bool startProgressive = false;
     std::string outFile;
     std::string forceOpen, forceClosed;
     std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
@@ -258,10 +287,65 @@ int main(int argc, char** argv) {
                 h > 0) {
                 cw = w;
                 ch = h;
+                sizeGiven = true;
             }
             i++;
+        } else if (arg == "--bench-scene") {
+            // 可选带图层数：--bench-scene 或 --bench-scene 8
+            benchLayers = 5;
+            benchLayersGiven = false;
+            if (i + 1 < argCount && args[(size_t)i + 1][0] != '-') {
+                benchLayers = std::atoi(args[(size_t)++i].c_str());
+                benchLayersGiven = true;
+            }
+            if (benchLayers <= 0) { benchLayers = 5; benchLayersGiven = false; }
+            // 基准默认 384x216。必须在**光照初始化之前**定下来：
+            // 光照的 GPU 纹理尺寸在 sweep.init(cw,ch) 时就固定了，
+            // 之后再改文档尺寸就会左右不一致（已踩过）。
+            if (!sizeGiven) { cw = 384; ch = 216; }
+        } else if (arg == "--scene") {
+            // 选 --bench-scene 用哪套场景（名字见 app/bench_scene.h 的 kScenes）
+            if (i + 1 < argCount) {
+                if (!bench::sceneByName(args[(size_t)++i], benchScene)) {
+                    std::fprintf(stderr, "未知场景；可用：");
+                    for (int k = 0; k < (int)bench::SceneId::Count; k++)
+                        std::fprintf(stderr, "%s%s", k ? ", " : "", bench::kScenes[k].name);
+                    std::fprintf(stderr, "\n");
+                    return 1;
+                }
+            }
+            // 场景的推荐值**不在这里套用** —— 参数顺序不定，命令行可能在
+            // --scene 之后才给 --radius/--diffw，那时"是否显式给过"还没置位。
+            // 统一挪到解析循环结束之后（见 sceneGiven 处理）。
+            sceneGiven = true;
+        } else if (arg == "--radius" && i + 1 < argCount) {
+            radiusArg = std::atoi(args[(size_t)++i].c_str());
+        } else if (arg == "--diff") {
+            sweepDiffOn = true; sweepDiffGiven = true;
+        } else if (arg == "--diffw" && i + 1 < argCount) {
+            sweepDiffW = (float)std::atof(args[(size_t)++i].c_str());
+            sweepDiffOn = true; sweepDiffGiven = true;
+        } else if (arg == "--diffk" && i + 1 < argCount) {
+            sweepDiffK = std::max(1, std::atoi(args[(size_t)++i].c_str()));
+            sweepDiffOn = true; sweepDiffGiven = true;
+        } else if (arg == "--zoom" && i + 1 < argCount) {
+            zoomArg = std::atof(args[(size_t)++i].c_str());
+        } else if (arg == "--project-dialog") {
+            // 自动化用：启动时就像点了菜单一样拉起工程对话框，
+            // 配合 --frames --out 可以截图验证"对话框真的画出来了"。
+            openProjectDialogAtStart = true;
+        } else if (arg == "--save-project" && i + 1 < argCount) {
+            // 退出前把当前状态（含 --project 载入的）存到这个路径。
+            // 给自动化验证用：没有它就没法在无人值守下测"存了再读"。
+            projectToSave = args[(size_t)++i];
+        } else if (arg == "--project" && i + 1 < argCount) {
+            // 启动时直接打开一个工程文件（双击 .pbproj / 脚本调用都走这条）
+            projectToOpen = args[(size_t)++i];
+        } else if (arg == "--hide-ui") {
+            hideUi = true;
         } else if (arg == "--demo") {
             demo = true;
+
         } else if (arg == "--frames" && i + 1 < argCount) {
             framesToRun = std::atoi(args[(size_t)++i].c_str());
         } else if (arg == "--out" && i + 1 < argCount) {
@@ -271,9 +355,21 @@ int main(int argc, char** argv) {
         } else if (arg == "--field" && i + 1 < argCount) {
             startField = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--mode" && i + 1 < argCount) {
+            // 只剩扫描 GI（路径追踪已于 2026-10-19 移除）。
+            // 未知模式明确报错，不再静默回落到 sweep。
             const std::string& m = args[(size_t)++i];
-            if (m == "pathtrace" || m == "pt") startMode = app::LightMode::PathTrace;
-            else startMode = app::LightMode::Sweep;
+            if (m != "sweep") {
+                std::fprintf(stderr, "未知光照模式 '%s'（只有 sweep）\n", m.c_str());
+                return 1;
+            }
+        } else if (arg == "--progressive") {
+            startProgressive = true;
+        } else if (arg == "--denoise") {
+            startDenoise = true;
+            // 可选强度：下一个参数不是选项才当强度吃
+            if (i + 1 < argCount && !args[(size_t)i + 1].empty() &&
+                args[(size_t)i + 1][0] != '-')
+                startDenoiseStrength = (float)std::atof(args[(size_t)++i].c_str());
         } else if (arg == "--visible") {
             forceVisible = true;
         } else if (arg == "--hidden") {
@@ -290,14 +386,54 @@ int main(int argc, char** argv) {
             printf(
                 "用法: paintboard [选项]\n"
                 "  --size WxH         画布尺寸（默认 320x180）\n"
+                "  --mode sweep       光照模式（只剩扫描 GI；路径追踪已移除）\n"
+                "  --progressive      扫描 GI 的渐进哈希采样（每帧每像素一个方向）\n"
+                "  --denoise [强度]   渐进模式去噪（à-trous 联合双边，默认强度 3.5）\n"
                 "  --demo             用工具管线画一张演示图（含两个图层）\n"
+                "  --bench-scene [N]  实时性能基准：N 层逐帧动画（默认 5），384x216\n"
+                "                     每帧改动所有图层，量的是最坏情况端到端帧率\n"
+                "  --hide-ui          配合 --bench-scene：隐藏面板，只测画布\n"
+                "  --radius N         方向表半径（默认 128 = 728 个方向；越小越快、光越硬）\n"
+                "  --scene NAME       基准场景：neon-city / lantern-fog / stained-glass /\n"
+                "                     chromatic / grid-lab / legacy / lowend\n"
+                "  --diff / --diffw F / --diffk N   方向扩散（抹掉放射状辐条）\n"
+                "                     低配档示例：--bench-scene --scene lowend\n"
+                "                     （单层 + R=32 + 扩散 w=0.1/K=8，集显可玩）\n"
+                "  --project FILE     启动时打开工程文件（.pbproj）\n"
+                "  --zoom F           覆盖自动适配的缩放（验证画布外背景时用）\n"
                 "  --frames N         渲染 N 帧后截图退出（配合 --out）\n"
+
                 "  --out FILE.png     截图输出路径\n"
                 "  --open NAME        强制展开右侧栏分区（名字子串，如「图层」）\n"
                 "  --close NAME       强制折叠右侧栏分区\n"
                 "  --hidden/--visible 强制窗口是否可见\n"
                 "  无 --frames 时进入正常交互模式。\n");
             return 0;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 参数解析**之后**才套用场景推荐值 / 预设档
+    // ------------------------------------------------------------------
+    //
+    // 为什么必须放在这里：命令行参数顺序不定。`--scene lowend --radius 64`
+    // 与 `--radius 64 --scene lowend` 必须得到同一结果，所以"用户是否显式
+    // 给过某个参数"要等整条命令行看完才知道。
+    // 规则：**显式参数永远优先**，没给过的才用场景推荐值。
+    if (sceneGiven || benchLayers > 0) {
+        const bench::SceneDesc& sd = bench::kScenes[(int)benchScene];
+        if (!benchLayersGiven) benchLayers = sd.layers;
+        if (radiusArg < 0) radiusArg = sd.radius;
+        if (!sweepDiffGiven) {
+            // 预设档（lowend）连扩散一起定；普通场景有自己的 recW
+            const bool useDiff = sd.preset ? true : (sd.recW > 0.0f);
+            sweepDiffOn = useDiff;
+            if (useDiff) { sweepDiffW = sd.recW; sweepDiffK = sd.recK; }
+        }
+        if (benchLayers > 0) {
+            printf("[bench] 档位 %s：%d 层  R=%d  扩散 %s\n", sd.name, benchLayers,
+                   (radiusArg > 0) ? radiusArg : 128,
+                   sweepDiffOn ? "开" : "关");
         }
     }
 
@@ -317,8 +453,10 @@ int main(int argc, char** argv) {
     a.history.reset();
     a.opts.color = a.palette.current();
     a.demo = demo;
-    a.lightMode = startMode;
     a.fieldStrength = startField;
+    a.progressive = startProgressive;
+    a.denoise = startDenoise;
+    a.denoiseStrength = startDenoiseStrength;
 
     // 自动化/回归用：直接切到某一套色板（例如 NES 55 色，验证色块网格的自动换行）
     if (paletteIndex >= 0) {
@@ -361,22 +499,35 @@ int main(int argc, char** argv) {
         return 1;
     }
     // 扫描 GI 默认环境光压得比较低（它靠方向累积出亮度）
-    sweep.settings().rayRadius = 128;
+    // 方向表半径默认 128（728 个方向）。可用 --radius 覆盖 —— 这是
+    // "画质 vs 性能"最有效的单一旋钮，实机测试不同档位时必用。
+    sweep.settings().rayRadius = (radiusArg > 0) ? radiusArg : 128;
     sweep.settings().ambient[0] = 0.08f;
     sweep.settings().ambient[1] = 0.08f;
     sweep.settings().ambient[2] = 0.10f;
+    // 方向扩散（--diff / --diffw / --diffk，或被预设档如 lowend 设置）
+    sweep.settings().diffusionOn = sweepDiffOn;
+    sweep.settings().diffusion = sweepDiffW;
+    sweep.settings().diffusionStep = sweepDiffK;
+    // 从 paintboard_light.ini 恢复用户上次调好的光照参数。
+    // ⚠️ 只在**没给命令行参数**时恢复，否则会出现"我明明传了 --radius 32
+    // 结果还是 128"这种极难查的问题（命令行意图永远优先）。
+    if (!sceneGiven && radiusArg < 0 && !sweepDiffGiven) {
+        app::loadLightSettings(sweep.settings());
+    }
     a.sweep = &sweep;
 
-    gfx::PathTrace pt;
-    if (!pt.init(cw, ch)) {
-        fprintf(stderr, "路径追踪初始化失败\n");
-        return 1;
+    // --project FILE：启动时打开工程。
+    // 放在这里是因为它要写 sweep.settings()，而 sweep 刚刚初始化好。
+    // ⚠️ 必须在光照纹理分配之后 —— 工程文件可能带来不同的画布尺寸，
+    // 但 sweep.init(cw,ch) 已经把纹理尺寸定死了，所以尺寸不符时
+    // loadProject 会明确拒绝（见 core/project.cpp 的尺寸校验），
+    // 而不是留下"文档和 GPU 纹理不一致"这种更糟的状态。
+    if (!projectToOpen.empty()) {
+        a.projectPath = projectToOpen;
+        actLoadProject(a, projectToOpen);
     }
-    // 路径追踪是"收集"式的：空白处的亮度就等于环境光，所以这一项决定背景明暗
-    pt.settings().ambient[0] = 0.12f;
-    pt.settings().ambient[1] = 0.12f;
-    pt.settings().ambient[2] = 0.14f;
-    a.pt = &pt;
+    if (openProjectDialogAtStart) a.requestProjectSaveDialog = true;
 
     gfx::Viewport vp;
     if (!vp.init()) {
@@ -406,6 +557,13 @@ int main(int argc, char** argv) {
         buildDemoScene(a);
         printf("[演示] 已用工具管线绘制，撤销栈 %zu 步\n", a.history.undoSteps());
     }
+    // 基准场景：图层在这里建好（光照的 GPU 侧图层数在 initLighting 时确定，
+    // 所以必须在它之前）。尺寸已在参数解析阶段定好，这里不再改。
+    if (benchLayers > 0) {
+        bench::buildDoc(a.doc, benchScene, benchLayers);
+        a.layerPanelDirty = true;
+    }
+    a.hidePanels = hideUi;
 
     printf("=== paintboard ===\n");
     printf("画布 %dx%d，界面 Dear ImGui %s\n", cw, ch, IMGUI_VERSION);
@@ -416,6 +574,15 @@ int main(int argc, char** argv) {
 
     while (!ctx.shouldClose() && !a.requestQuit) {
         ctx.pollEvents();
+
+        // --- 1.5 基准场景动画 ---
+        // 必须在光照之前：step() 会把**所有**图层的 revision 顶上去，
+        // 于是 lighting 里的脏层判断全部命中，每帧重算全部图层。
+        // 这正是基准要的最坏情况（也是它和"静止看画"帧率差很多的原因）。
+        if (benchLayers > 0) {
+            bench::stepDoc(a.doc, benchScene, a.benchFrame);
+            a.benchFrame++;
+        }
 
         // --- 2. ImGui 帧开始 ---
         uiCtx.beginFrame();
@@ -480,23 +647,34 @@ int main(int argc, char** argv) {
         // 否则 NEAREST 采样会让像素列宽不均，表现为竖条纹）。之后不再干预用户。
         if (!a.cameraInitialized && a.canvasVisible) {
             vp.fitIntegerZoom();
+            // --zoom F：压过自动适配。用来把画布缩到比面板小，
+            // 好看到"画布以外"那块背景（自动化截图验证用）。
+            if (zoomArg > 0.0) {
+                gfx::Camera& c = vp.camera();
+                c.zoom = std::clamp(zoomArg, 0.02, 64.0);
+                c.x = 0.5;
+                c.y = 0.5;
+            }
             a.cameraInitialized = true;
         }
 
         // --- 5. 逐层光照 + 合成 ---
         //
-        // 这里是模型 B 的落地：只重算**变了的那几层**（syncLightDirty 判定），
-        // 每层先算 occlAbove / emitFor 两张通道再照亮，最后由 GPU 把各层叠起来。
+        // 只重算**变了的那几层**（syncLightDirty 判定），每层各自跑一遍独立的
+        // 平面内光照并留下自己的光场，最后由 GPU 把各层的光场乘到下面各层上。
         // 详见 app/lighting.cpp。
         app::syncLightDirty(a);
         if (a.lightOn && a.canvasVisible) {
             {
-                // 画布一变，路径追踪的旧累积样本就和新几何对不上了（会拖影），必须重置累积
-                if (app::anyLayerDirty(a)) pt.resetAccumulation();
                 lightTimer.begin();
                 const bool didWork = app::runLighting(a);
                 lightTimer.end();
-                if (!didWork) a.lightMs = 0.0f;   // 本帧没有光照要做，别显示上一帧的数字
+                // 注意：这里**不能**在 !didWork 时把 lightMs 清 0。
+                // 基准场景里 UI 是在光照之前构建的（面板要先定画布矩形），
+                // 所以 HUD 读到的是这一帧稍后才会被写入的值 —— 每帧都清 0
+                // 会让读数永远停在 0.00 ms（已实测踩过）。
+                // 计时器结果本身也总是滞后一帧，不差这一次。
+                (void)didWork;
             }
         }
         // 计时器结果要下一帧才可用（不阻塞管线）
@@ -518,24 +696,25 @@ int main(int argc, char** argv) {
         glClearColor(0.031f, 0.031f, 0.039f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         if (a.canvasVisible) {
-            const bool ptMode = (a.lightMode == app::LightMode::PathTrace);
             GLuint shown = 0;
             if (!a.lightOn) {
                 // 关灯：把各层原始 albedo 按图层不透明度叠出来（数组纹理的 layer 0
                 // 只是最底层，直接显示它会漏掉上面的图层）。
-                gfx::LightSweep* ls = &sweep;
-                gfx::PathTrace* ptx = &pt;
-                GLuint layers = ptMode ? ptx->albedoTexture() : ls->canvasTexture();
-                GLuint opacity = ptMode ? ptx->opacityTexture() : ls->opacityTexture();
-                const int n = ptMode ? ptx->layerCount() : ls->layerCount();
+                GLuint layers = sweep.canvasTexture();
+                GLuint opacity = sweep.opacityTexture();
+                const int n = sweep.layerCount();
                 // 原始 albedo：alpha 是"有多不透明"，空气(0)要变成 mask=1（以完整
                 // 颜色显示），半透明像素也以**完整颜色**显示、只用 alpha 决定透出
                 // 下面多少。所以两个开关是 (false, true) —— 详见 layer_composite.h。
+                //
+                // 这里**刻意不传材质**：关灯是"看干净的原图"，而自发光属于光照结果。
+                // 传了的话发光像素就会在原图上留下一层光晕，取色和导出都会被污染 ——
+                // 那正是这条路径本来要避免的事。
                 albedoComp.composite(layers, opacity, n, cw, ch, albedoFlat, true);
                 glMemoryBarrier(GL_ALL_BARRIER_BITS);
                 shown = albedoFlat;
             } else {
-                shown = ptMode ? pt.resultTexture() : sweep.resultTexture();
+                shown = sweep.resultTexture();
             }
             vp.draw(shown);
         }
@@ -571,13 +750,34 @@ int main(int argc, char** argv) {
             a.fps = (a.fps > 1.0) ? (a.fps * 0.9 + inst * 0.1) : inst;
         }
         (void)frames;
+
+        // --- 基准场景的实机读数：每 120 帧往控制台打一行 ---
+        // 为什么要打控制台：实机测试时用户要**抄下数字**去比对，
+        // 而屏幕上的 HUD 截不了那么多次图。控制台一行就能直接复制。
+        if (benchLayers > 0 && a.benchFrame > 0 && a.benchFrame % 120 == 0) {
+            printf("[bench] 帧 %6d | %6.1f fps | 光照 %6.2f ms | %d 层 | %dx%d | %s | "
+                   "半径 %d / %d 方向\n",
+                   a.benchFrame, a.fps, (double)a.lightMs, a.doc.layerCount(), a.doc.width(),
+                   a.doc.height(), lightModeName(a.lightMode),
+                   a.sweep ? a.sweep->settings().rayRadius : 0,
+                   a.sweep ? a.sweep->directionCount() : 0);
+            fflush(stdout);
+        }
     }
+
+    // --save-project：退出前存一份完整工程（自动化验证"存了再读"用）
+    if (!projectToSave.empty()) {
+        actSaveProject(a, projectToSave);
+    }
+
+    // 退出前把光照参数存回去（下次启动直接恢复上次调好的档位）。
+    // 存的是交互后的最终状态 —— 面板里改的、快捷键改的都算。
+    app::saveLightSettings(sweep.settings());
 
     glDeleteTextures(1, &albedoFlat);
     albedoComp.shutdown();
     vp.shutdown();
     sweep.shutdown();
-    pt.shutdown();
     lightTimer.shutdown();
     uiCtx.shutdown();
     ctx.destroy();

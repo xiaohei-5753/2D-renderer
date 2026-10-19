@@ -1,14 +1,14 @@
 // app/lighting.cpp — 把"逐层照亮 + 合成"接到应用上
 //
-// 这是模型 B 在应用侧的落地，也是"伪 3D"实际发生的地方：
-//
 //   对每个图层 i：
-//     1. 用 core/composite.h 在 CPU 侧算好两张通道（纯函数、可 headless 测试）：
-//          occlAbove_i —— 第 i 层上方各层的累计遮盖（→ 上层给下层投影）
-//          emitFor_i   —— 其他层透过中间层照到第 i 层的光（→ 层间互相照亮）
-//     2. 把这一层的 albedo / 材质 / 两张通道传到 GPU
-//     3. 跑一遍平面内光照（sweep 或 path trace），结果写进结果数组纹理的第 i 层
-//   最后 LayerComposite 把各层按图层不透明度叠成最终画面。
+//     1. 把这一层的 albedo / 材质传到 GPU
+//     2. 跑一遍**独立的**平面内光照（扫描 GI），结果写进结果数组纹理的第 i 层，
+//        同时把这一层的光场留下来
+//   最后 LayerComposite 把各层的光场累加、乘到下面各层的颜色上，得到最终画面。
+//
+// 层与层之间没有耦合：每一层只看自己。所以"新建一个空图层"不会让画面变亮。
+//
+// （路径追踪分支已于 2026-10-19 移除，现在只有扫描 GI 一条路径。）
 //
 // ## 为什么只重算"脏层"
 //
@@ -19,7 +19,6 @@
 #include <vector>
 
 #include "app/app.h"
-#include "core/composite.h"
 
 namespace pb::app {
 
@@ -35,6 +34,8 @@ struct LayerSignature {
 
 std::vector<LayerSignature> g_last;
 bool g_hasLast = false;
+// 上一次认到的图层结构版本（见 Document::structureVersion）
+uint32_t g_lastStructure = 0;
 
 LayerSignature sigOf(const Layer& L) {
     LayerSignature s;
@@ -67,12 +68,34 @@ float opacityOf(const App& a, int index) {
 void resetLightingCache() {
     g_last.clear();
     g_hasLast = false;
+    g_lastStructure = 0;
 }
 
 void syncLightDirty(App& a) {
     const int n = a.doc.layerCount();
     const int nGpu = n < kMaxLayers ? n : kMaxLayers;
     a.lightDirtyLayers.assign((size_t)nGpu, 0);
+
+    // --- 两个"强制全部重算"的来源 ---
+    //
+    // 1) App::lightDirty：菜单 / 快捷键 / 面板在所有"影响合成但不弄脏像素"的地方
+    //    都会置它（切光照、改参数、图层增删移并…）。这个标志以前**只写不读**，
+    //    于是"图层上移/下移"这种不改内容、也不改层数的操作不会触发重新光照，
+    //    画面停在上一次的图层顺序上，直到用户再画一笔才恢复。现在在这里消费它。
+    if (a.lightDirty) {
+        a.lightDirty = false;
+        a.lightAllLayers = true;
+        g_hasLast = false;
+    }
+
+    // 2) 图层结构版本：下面的缓存键只有"每层的内容版本 + 可见性 + 不透明度"，
+    //    **不含图层身份**。交换两层位置时这三个量在各自的位置上都不变，
+    //    缓存会误判成"什么都没变"。所以排列一变就全部重算。
+    if (!g_hasLast || g_lastStructure != a.doc.structureVersion()) {
+        g_lastStructure = a.doc.structureVersion();
+        a.lightAllLayers = true;
+        g_hasLast = false;
+    }
 
     const bool structureChanged = !g_hasLast || (int)g_last.size() != nGpu;
     if (structureChanged) {
@@ -127,55 +150,38 @@ bool runLighting(App& a) {
     const int H = a.doc.height();
     const Rect all{0, 0, W - 1, H - 1};
 
-    // 至少要有东西要算。path trace 每帧都要累积，所以它另说（见下）。
+    // 至少要有东西要算。渐进模式每帧都要推进，所以它另说（见下）。
     const bool anyDirty = anyLayerDirty(a);
 
-    if (a.lightMode == LightMode::Sweep) {
-        if (!a.sweep) return false;
-        if (!anyDirty) return false;   // 没有变化就不重算，省 GPU
+    if (!a.sweep) return false;
+    // 渐进哈希采样：每帧都要推进（哪怕没有任何层"脏"），否则永远不收敛
+    a.sweep->setProgressive(a.progressive);
+    a.sweep->setDenoise(a.denoise, a.denoiseStrength, a.denoiseIters);
+    if (!anyDirty && !a.progressive) return false;   // 没有变化就不重算，省 GPU
 
-        a.sweep->setLayerCount(n);
-        for (int i = 0; i < n; i++) a.sweep->uploadLayerOpacity(i, opacityOf(a, i));
+    a.sweep->setLayerCount(n);
+    for (int i = 0; i < n; i++) a.sweep->uploadLayerOpacity(i, opacityOf(a, i));
 
-        // 两张逐层通道只在这些层要重算时才需要重算 —— 它们由所有层决定，
-        // 但只被"正在被照亮的那一层"使用，所以按需算即可。
-        static std::vector<uint8_t> occl;
-        static std::vector<RGBA8> emit;
-        for (int i = 0; i < n; i++) {
-            if (!a.lightDirtyLayers.empty() && !a.lightDirtyLayers[(size_t)i]) continue;
-            buildOcclAbove(a.doc, i, all, occl);
-            buildEmitFor(a.doc, i, all, emit);
-            a.sweep->uploadLayerChannels(i, occl.data(), emit.data(), all);
+    // 渐进模式下：内容一变就重开累积（否则旧样本会和新内容混在一起）
+    if (a.progressive && (anyDirty || a.lightAllLayers)) a.sweep->resetProgressive();
+    a.sweep->beginFrame();
+
+    // 只重算脏层：每层的光照是一次完整 pass，没变就没必要再跑。
+    // 但渐进模式下**每层每帧都要推进**（每帧给每层一个新方向样本）。
+    for (int i = 0; i < n; i++) {
+        const bool dirty =
+            a.lightAllLayers ||
+            (i < (int)a.lightDirtyLayers.size() && a.lightDirtyLayers[(size_t)i]);
+        if (!a.progressive && !a.lightDirtyLayers.empty() && !dirty) continue;
+        if (dirty) {
             a.sweep->uploadLayer(i, a.doc.layer(i).albedo, a.doc.layer(i).material.data(),
                                  all);
-            a.sweep->renderLayer(i);
         }
-        a.sweep->setFieldStrength(a.fieldStrength);
-    a.sweep->composite();
-    } else {
-        if (!a.pt) return false;
-        // 路径追踪是"每帧累积一个样本"，所以每一层每帧都要推进。
-        // 只有画布真的变了才重置累积（否则会拖影），重置后所有层从头来。
-        a.pt->setLayerCount(n);
-        for (int i = 0; i < n; i++) a.pt->uploadLayerOpacity(i, opacityOf(a, i));
-
-        static std::vector<uint8_t> occl;
-        static std::vector<RGBA8> emit;
-        for (int i = 0; i < n; i++) {
-            const bool needChannels =
-                a.lightAllLayers || (i < (int)a.lightDirtyLayers.size() &&
-                                     a.lightDirtyLayers[(size_t)i]);
-            if (needChannels) {
-                buildOcclAbove(a.doc, i, all, occl);
-                buildEmitFor(a.doc, i, all, emit);
-                a.pt->uploadLayerChannels(i, occl.data(), emit.data(), all);
-                a.pt->uploadLayer(i, a.doc.layer(i).albedo,
-                                  a.doc.layer(i).material.data(), all);
-            }
-            a.pt->renderLayer(i);
-        }
-        a.pt->composite();
+        a.sweep->renderLayer(i);
     }
+    a.sweep->endFrame();
+    a.sweep->setFieldStrength(a.fieldStrength);
+    a.sweep->composite();
 
     a.lightAllLayers = false;
     for (auto& v : a.lightDirtyLayers) v = 0;

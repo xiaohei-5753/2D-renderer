@@ -157,6 +157,11 @@ bool runLighting(App& a) {
     // 渐进哈希采样：每帧都要推进（哪怕没有任何层"脏"），否则永远不收敛
     a.sweep->setProgressive(a.progressive);
     a.sweep->setDenoise(a.denoise, a.denoiseStrength, a.denoiseIters);
+    // 扫描路径：**默认经典全局原子**（画板是创作工具，稳定性优先）。
+    // 分块合并扫描在"大面积纯色"上会出现带纹（行内核带边界的已知问题），
+    // 所以画板**关掉自动选路**：只有用户显式勾选时才走分块。
+    a.sweep->setAutotune(false);
+    a.sweep->setTiledScan(a.tiledScan);
     if (!anyDirty && !a.progressive) return false;   // 没有变化就不重算，省 GPU
 
     a.sweep->setLayerCount(n);

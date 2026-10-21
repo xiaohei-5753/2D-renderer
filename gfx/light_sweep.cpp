@@ -1463,7 +1463,9 @@ void LightSweep::loadTuneCache() {
     if (n != 8) return;
     const char* cur = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
     if (!cur || std::strcmp(cur, renderer) != 0 || tw != w_ || th != h_) return;
-    tiledScan_ = (tiled != 0);
+    // 缓存可能是旧版本（分块默认开启）写的：分块在修好之前不参与，直接压回经典。
+    const bool allowTiled = []() { const char* v = getenv("PB_TILED"); return v && v[0] == '1'; }();
+    tiledScan_ = (tiled != 0) && allowTiled;
     tileT_ = std::clamp(cT, 8, 32);
     dirGroup_ = std::clamp(cG, 8, 64);
     tileTRow_ = std::clamp(rT, 8, 32);
@@ -1531,7 +1533,15 @@ void LightSweep::autotune(int layer) {
     const double tClassic = timeOnce();
     const bool slowGpu = (tClassic > 12.0);
 
-    if (!slowGpu) {
+    // ⚠️ 分块路径目前**默认不参与**自动选择：它在"大面积纯色"上会出现横向带纹
+    // （行内核带边界），而且与经典路径的绝对值对不上（实测差 2.4×）。
+    // 在修好之前，自动选择只在经典路径上挑参数；分块仍可由调用方显式开启
+    // （setTiledScan(true)）或 setenv PB_TILED=1 参与候选。
+    const bool allowTiled = []() {
+        const char* v = getenv("PB_TILED");
+        return v && v[0] == '1';
+    }();
+    if (!slowGpu && allowTiled) {
         const int Ts[] = {8, 16, 32};
         const int Gs[] = {8, 16, 32};
         for (int T : Ts) {
@@ -1541,7 +1551,7 @@ void LightSweep::autotune(int layer) {
                 cands.push_back({true, T, G});
             }
         }
-    } else if (maxShared <= 0 || sharedFor(16) <= maxShared) {
+    } else if (allowTiled && (maxShared <= 0 || sharedFor(16) <= maxShared)) {
         // T=8 在两种卡上实测都最差，直接不试
         cands.push_back({true, 16, 8});
         cands.push_back({true, 16, 16});

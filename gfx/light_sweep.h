@@ -313,6 +313,11 @@ public:
                                  : FieldQuality::Coarse4);
     }
     int fieldScale() const { return fieldScale_; }
+    // 分块参数（诊断用：把行内核的带高/方向组单独拨动，定位带边界问题）
+    void setTileRow(int t) { tileTRow_ = (t > 0) ? t : tileTRow_; }
+    void setDirGroupY(int g) { dirGroupY_ = (g > 0) ? g : dirGroupY_; }
+    void setTileCol(int t) { tileT_ = (t > 0) ? t : tileT_; }
+    void setDirGroupX(int g) { dirGroup_ = (g > 0) ? g : dirGroup_; }
     // 诊断：回读掩码，打印每层"需要细化"的块占比（与 CPU 统计对齐用）
     void debugMaskStats(const char* tag = "");
     // 诊断：比较粗光场与细光场在"细化块"上的数值，定位细趟偏亮/偏暗

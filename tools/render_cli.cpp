@@ -47,6 +47,7 @@ struct Options {
     int pack = 0;                  // 每像素原子加次数：0=3 次 1=2 次 2=1 次
     int fieldScale = 1;            // 光场降采样倍率（1=关，2/3/4）
     bool tiled = false;            // 分块 + shared 合并（列波前）
+    bool classic = false;           // 强制经典全局原子路径（关掉 autotune 的分块选择）
     // 角度可压缩性实验：只用前 N 个方向渲染，然后按 K/N 放大以便与全量对比。
     // 误差越小 -> 有效角度自由度越少 -> 低阶角度基/降方向数越有希望。
 };
@@ -115,6 +116,8 @@ bool parseArgs(int argc, char** argv, Options& o) {
             if (i + 1 < argc && argv[i + 1][0] != '-') o.progFrames = atoi(argv[++i]);
         } else if (a == "--field-scale") {
             const char* v = next("--field-scale"); if (!v) return false; o.fieldScale = atoi(v);
+        } else if (a == "--classic") {
+            o.classic = true;
         } else if (a == "--tiled") {
             o.tiled = true;
         } else if (a == "--pack") {
@@ -357,7 +360,8 @@ int main(int argc, char** argv) {
     sweep.settings().rayRadius = opt.radius;
     sweep.setAtomicPack(opt.pack);
     sweep.setFieldScale(opt.fieldScale);
-    if (opt.tiled) sweep.setTiledScan(true);   // 不显式指定时让 autotune 自己选
+    if (opt.classic) { sweep.setAutotune(false); sweep.setTiledScan(false);   // 对照用：强制经典
+    } else if (opt.tiled) sweep.setTiledScan(true);
     sweep.settings().emitScale = opt.emit;
     // 诊断开关（见 LightSettings::debugScan）。留一个环境变量入口，
     // 是为了在排查光照问题时不必每次改代码重编。

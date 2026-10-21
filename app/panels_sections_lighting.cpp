@@ -106,20 +106,7 @@ void drawLightingSection(App& a) {
             s.rayRadius = r;
             actLightSettingsChanged(a);
         }
-        // 光场降采样：光照低频 -> 只在 1/s 分辨率上算光场，合成时双线性放大。
-        // albedo / 自发光保持全分辨率，所以 1px 霓虹不会被糊掉（实测最大差 7 级、
-        // 平均差 <0.1 级；5 层 R=64 的耗时 4.08 ms -> 0.53 ms）。
-        {
-            static const char* kFieldLabels[4] = {"光场降采样：关（1×）", "光场降采样：2×（约 2.5×）",
-                                                  "光场降采样：3×", "光场降采样：4×（约 7.7×）"};
-            int fs = std::clamp(a.fieldScale, 1, 4);
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::Combo("##fieldscale", &fs, kFieldLabels, 4)) {
-                a.fieldScale = fs;
-                actLightSettingsChanged(a);
-            }
-        }
-        if (ImGui::Checkbox("分块合并扫描（实验：x 主方向走 shared 合并）", &a.tiledScan))
+        if (ImGui::Checkbox("分块合并扫描（实验：大面积纯色可能出现带纹，默认关）", &a.tiledScan))
             actLightSettingsChanged(a);
         ImGui::TextDisabled("当前 %d 个方向（半径越大越平滑、越慢）",
                             a.sweep->directionCount());

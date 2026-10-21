@@ -94,6 +94,10 @@ struct App {
     // 开：每帧每像素只采一个方向、跨帧累积（零原子、单帧便宜、第 D 帧精确）。
     // 关：确定性扫描（每帧把所有方向扫一遍，单帧贵但无噪声）。
     bool progressive = false;
+    // 分块 + shared 合并的扫描（x 主方向走列波前；y 主方向仍走主内核）
+    bool tiledScan = false;
+    // 光场降采样倍率（1=关）。光照是低频信息，只降光场、不降 albedo/自发光。
+    int fieldScale = 1;
     // 渐进模式的去噪（à-trous 联合双边）。
     bool denoise = false;
     float denoiseStrength = 3.5f;

@@ -28,9 +28,9 @@
 #endif
 
 #include "app/app.h"
-#include "app/bench_scene.h"
+#include "scenes/bench_scene.h"
 #include "app/input.h"
-#include "app/light_settings_io.h"
+#include "gfx/light_settings_io.h"
 #include "app/panels.h"
 #include "core/image.h"
 #include "core/composite.h"
@@ -250,7 +250,7 @@ std::string projectToOpen;     // --project FILE：启动时打开这个工程�
 std::string projectToSave;     // --save-project FILE：退出前存到这个路径
 bool openProjectDialogAtStart = false;   // --project-dialog：启动即拉起工程对话框
 double zoomArg = 0.0;                    // --zoom F：覆盖自动适配的缩放（0 = 自动）
-// --bench-scene 用的场景（见 app/bench_scene.h）。默认 neon-city：
+// --bench-scene 用的场景（见 scenes/bench_scene.h）。默认 neon-city：
 // 它同时是最有诊断价值的（1px 霓虹管 = 锐度探针）和最好看的。
 bench::SceneId benchScene = bench::SceneId::NeonCity;
     bool sizeGiven = false;       // 用户显式给了 --size，基准就不覆盖尺寸
@@ -272,6 +272,7 @@ int sweepDiffK = 8;
     bool startDenoise = false;
     float startDenoiseStrength = 3.5f;
     bool startProgressive = false;
+    bool startTiled = false;
     std::string outFile;
     std::string forceOpen, forceClosed;
     std::string clickSection;   // --click-section NAME：自动点这个分区（验证折叠交互）
@@ -304,7 +305,7 @@ int sweepDiffK = 8;
             // 之后再改文档尺寸就会左右不一致（已踩过）。
             if (!sizeGiven) { cw = 384; ch = 216; }
         } else if (arg == "--scene") {
-            // 选 --bench-scene 用哪套场景（名字见 app/bench_scene.h 的 kScenes）
+            // 选 --bench-scene 用哪套场景（名字见 scenes/bench_scene.h 的 kScenes）
             if (i + 1 < argCount) {
                 if (!bench::sceneByName(args[(size_t)++i], benchScene)) {
                     std::fprintf(stderr, "未知场景；可用：");
@@ -362,6 +363,8 @@ int sweepDiffK = 8;
                 std::fprintf(stderr, "未知光照模式 '%s'（只有 sweep）\n", m.c_str());
                 return 1;
             }
+        } else if (arg == "--tiled") {
+            startTiled = true;
         } else if (arg == "--progressive") {
             startProgressive = true;
         } else if (arg == "--denoise") {
@@ -455,6 +458,7 @@ int sweepDiffK = 8;
     a.demo = demo;
     a.fieldStrength = startField;
     a.progressive = startProgressive;
+    a.tiledScan = startTiled;
     a.denoise = startDenoise;
     a.denoiseStrength = startDenoiseStrength;
 
@@ -716,7 +720,8 @@ int sweepDiffK = 8;
             } else {
                 shown = sweep.resultTexture();
             }
-            vp.draw(shown);
+            // 基准场景按 y=0 在顶部编写，本视口画布坐标 y 向上 —— 这里翻转以对齐 bench_view
+            vp.draw(shown, a.benchFrame > 0);
         }
 
         // --- 7. ImGui 渲染（盖在画布之上）---

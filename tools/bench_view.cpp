@@ -9,7 +9,7 @@
 // 所以这里做一个**只有一个画面 + 一块半透明读数**的窗口：
 // 一条命令就能起来，看着它跑，屏幕上直接读帧率。
 //
-// 场景代码与 paintboard **完全共用**（app/bench_scene.h 的 buildDoc/stepDoc），
+// 场景代码与 paintboard **完全共用**（scenes/bench_scene.h 的 buildDoc/stepDoc），
 // 所以两边负载一致，数字可以互相比。
 //
 // ## 操作
@@ -31,7 +31,7 @@
 #include <string>
 #include <vector>
 
-#include "app/bench_scene.h"
+#include "scenes/bench_scene.h"
 #include "core/console.h"
 #include "core/image.h"
 #include "core/layer.h"
@@ -55,6 +55,9 @@ namespace {
 
 int g_w = 384, g_h = 216;
 int g_layers = 5;
+int g_fieldScale = 1;   // 光场降采样倍率
+int g_quality = 0;   // 0=exact 1=coarse2 2=coarse3 3=coarse4 4=adaptive
+bool g_stats = false;   // --stats：打印降采样块统计
 int g_radius = 128;
 bool g_fullscreen = false;
 bool g_vsync = true;
@@ -204,6 +207,17 @@ bool parseArgs(int argc, char** argv) {
         auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : nullptr; };
         if (a == "--help" || a == "-h") { usage(); exit(0); }
         else if (a == "--layers") { const char* v = next(); if (!v) return false; g_layers = std::max(1, atoi(v)); g_layersGiven = true; }
+        else if (a == "--stats") { g_stats = true; }
+        else if (a == "--quality") {
+            const char* v = next(); if (!v) return false;
+            if (!std::strcmp(v, "exact")) g_quality = 0;
+            else if (!std::strcmp(v, "coarse2")) g_quality = 1;
+            else if (!std::strcmp(v, "coarse3")) g_quality = 2;
+            else if (!std::strcmp(v, "coarse4")) g_quality = 3;
+            else if (!std::strcmp(v, "adaptive")) g_quality = 4;
+            else return false;
+        }
+        else if (a == "--field-scale") { const char* v = next(); if (!v) return false; g_fieldScale = atoi(v); }
         else if (a == "--radius") { const char* v = next(); if (!v) return false; g_radius = std::max(4, atoi(v)); g_radiusGiven = true; }
         else if (a == "--size") {
             const char* v = next(); if (!v) return false;
@@ -289,6 +303,38 @@ bool captureFramebuffer(int fbW, int fbH, Image& out) {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// --stats：统计"含薄遮挡/光源的块"占比
+//
+// 这是判断**自适应细化值不值得**的关键数字：均匀降采样只在"块内没有遮挡边缘"
+// 时才等价于全分辨率；含边缘的块必须细化，否则薄墙会把光挡得太狠（实测暗 30%）。
+// 如果边缘块占比很低（<10%），细化划算；如果很高，说明内容本身"到处都是边"，
+// 那降采样就不该用。
+int printBlockStats(const Document& doc, int s) {
+    const int W = doc.width(), H = doc.height();
+    int blocks = 0, edge = 0, src = 0;
+    for (int li = 0; li < doc.layerCount(); li++) {
+        const Layer& L = doc.layer(li);
+        for (int by = 0; by < H; by += s)
+            for (int bx = 0; bx < W; bx += s) {
+                bool solid = false, air = false, emit = false;
+                for (int y = by; y < std::min(H, by + s); y++)
+                    for (int x = bx; x < std::min(W, bx + s); x++) {
+                        const RGBA8 c = L.albedo.at(x, y);
+                        if (c.a >= 128) solid = true; else air = true;
+                        const Material& m = L.material[(size_t)y * W + x];
+                        if (m.emissive()) emit = true;
+                    }
+                ++blocks;
+                if (solid && air) ++edge;
+                if (emit) ++src;
+            }
+    }
+    if (blocks == 0) return 0;
+    fprintf(stderr, "[stats] s=%d  块 %d  含边 %d(%.1f%%)  含光源 %d(%.1f%%)\n", s, blocks, edge,
+            100.0 * edge / blocks, src, 100.0 * src / blocks);
+    return edge;
+}
 int main(int argc, char** argv) {
     setupConsoleUtf8();
     if (!parseArgs(argc, argv)) return 2;
@@ -311,9 +357,14 @@ int main(int argc, char** argv) {
     // --- 文档与场景 ---
     Document doc;
     doc.resize(g_w, g_h);
-    // 场景代码与 paintboard 共用同一份（app/bench_scene.cpp），
+    // 场景代码与 paintboard 共用同一份（scenes/bench_scene.cpp），
     // 所以两边的画面与负载必然一致、数字可比。
     bench::buildDoc(doc, g_scene, g_layers);
+    if (g_stats) {
+        printBlockStats(doc, 2);
+        printBlockStats(doc, 4);
+        printBlockStats(doc, 8);
+    }
 
     // --- 光照管线 ---
     gfx::LightSweep sweep;
@@ -325,6 +376,16 @@ int main(int argc, char** argv) {
     sweep.settings().ambient[0] = 0.08f;
     sweep.settings().ambient[1] = 0.08f;
     sweep.settings().ambient[2] = 0.10f;
+    // 场景自带的"曝光包"：霓虹夜景需要更高的环境光和自发光倍率，
+    // 否则浅色墙面上的霓虹染色看不太出来（输出 ≈ albedo × 光场）。
+    sweep.setFieldQuality((gfx::LightSweep::FieldQuality)g_quality);
+    if (g_fieldScale > 1) sweep.setFieldScale(g_fieldScale);
+    if (std::strcmp(bench::sceneName(g_scene), "neon-rain") == 0) {
+        sweep.settings().ambient[0] = 0.16f;
+        sweep.settings().ambient[1] = 0.17f;
+        sweep.settings().ambient[2] = 0.21f;
+        sweep.settings().emitScale = 2.4f;
+    }
     // 方向扩散：参数放在 settings 里，renderLayer 每帧同步（见 light_sweep.h）
     sweep.settings().diffusionOn = g_diffOn;
     sweep.settings().diffusion = g_diffW;
@@ -363,10 +424,16 @@ int main(int argc, char** argv) {
         sweep.uploadLayer(i, doc.layer(i).albedo, doc.layer(i).material.data(), all);
         sweep.uploadLayerOpacity(i, 1.0f);
         sweep.renderLayer(i);
+        if (g_quality > 0 || g_fieldScale > 1) {
+            char tag[32];
+            std::snprintf(tag, sizeof(tag), "层%d", i);
+            sweep.debugFieldCompare(tag, i);
+        }
     }
     sweep.composite();
     printf("[bench] 方向数 %d（半径 %d）\n", sweep.directionCount(),
            sweep.settings().rayRadius);
+    if (g_quality > 0 || g_fieldScale > 1) { sweep.debugMaskStats("首帧"); sweep.debugFieldCompare("首帧"); }
 
     while (!ctx.shouldClose()) {
         ctx.pollEvents();

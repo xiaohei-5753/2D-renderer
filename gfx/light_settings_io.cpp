@@ -1,5 +1,5 @@
-// app/light_settings_io.cpp
-#include "app/light_settings_io.h"
+// gfx/light_settings_io.cpp
+#include "gfx/light_settings_io.h"
 
 #include <cstdio>
 #include <cstdlib>

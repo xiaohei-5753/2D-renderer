@@ -37,7 +37,7 @@
 #include <string>
 #include <vector>
 
-#include "app/bench_scene.h"
+#include "scenes/bench_scene.h"
 #include "core/composite.h"
 #include "core/console.h"
 #include "core/image.h"

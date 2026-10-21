@@ -231,6 +231,95 @@ public:
     void setContiguousFetch(bool on) { contiguousFetch_ = on; }
     bool contiguousFetch() const { return contiguousFetch_; }
 
+    // 诊断：**完全不写内存**（只走 DDA + 两次取样 + 递推，沉积值累在寄存器里）。
+    // 用途：把"扫描线的推进成本"和"原子加/写回成本"分开量。
+    // 打开后渲染结果是空的（SSBO 不被写），所以只能用于计时。
+    void setScanNoWrite(bool on) { scanNoWrite_ = on; }
+    bool scanNoWrite() const { return scanNoWrite_; }
+
+    // 每像素的**原子加次数**（优化"写的负担"的主旋钮）：
+    //   0 = 3 次：三个通道各一个平面（默认，16 位/通道，逐位精确）
+    //   1 = 2 次：R/G 打包进一个 u32（各 16 位）+ B 单独 → **与 0 逐位等价**
+    //   2 = 1 次：R/G/B 各 10 位打包（量化 1/1020，实测误差见 BENCHMARK）
+    //
+    // 实测（320x180、R=128、单层）：写回占总耗时 83%；
+    // 3 原子 1.93 ms → 2 原子约 1.4 → 1 原子约 0.9 → 不写 0.33。
+    void setAtomicPack(int pack) { atomicPack_ = std::clamp(pack, 0, 3); }
+    // 分块 + shared 合并的扫描（x 主方向走列波前，y 主方向仍走主内核）。
+    // 与主内核**逐位相同**（整数加法与顺序无关），只是把全局原子换成 shared 合并。
+    // 显式开启时不再自动探测；显式关闭时保留探测（下次仍会自己找最优）
+    void setTiledScan(bool on) { tiledScan_ = on; if (on) autotunePending_ = false; }
+    bool tiledScan() const { return tiledScan_; }
+    // 自动探测元参数：在真实内容上跑几组 (tiled?, T, G) 候选，选最快的，
+    // 并在第一次 renderLayer 时自动调用一次（约 10–30 ms 一次性开销）。
+    // 这样做的好处：Intel UHD / 核显 / 独显 的甜点完全不同，写死一组参数必然有一边吃亏。
+    void autotune(int layer);
+    // 调参结果缓存：按 GL_RENDERER + 画布尺寸匹配才复用，换机器/换尺寸会自动重测
+    void loadTuneCache();
+    void saveTuneCache() const;
+    void setAutotune(bool on) { autotunePending_ = on; }
+    // 光场降采样倍率：光照是低频信息，用 1/s 的分辨率算光场，合成时双线性放大。
+    // albedo / 自发光 / 最终合成**保持全分辨率**，所以 1px 霓虹不会被糊掉。
+    // ---------------------------------------------------------------------
+    // 画质档位（光场分辨率）
+    //
+    // Exact 是**原始路径**：光场按画布全分辨率算，与引入降采样之前位级一致。
+    // 其余档只降「光场」；albedo/自发光/合成仍是全分辨率，所以 1px 霓虹不糊。
+    // 高画质永远保留 —— 降档只是"针对场景/硬件选择性开启"。
+    // ---------------------------------------------------------------------
+    enum class FieldQuality {
+        Exact = 0,     // 1x：光场全分辨率（默认 = 原始行为）
+        Coarse2 = 1,   // 2x：实测约 2.5x 速度；平滑内容差 <=7 级
+        Coarse3 = 2,   // 3x
+        Coarse4 = 3,   // 4x：实测约 7.7x 速度（薄墙场景会偏暗，见 HANDOVER）
+        Adaptive = 4,  // 粗+细两趟（实验：细趟未收敛，暂不建议用）
+    };
+    void setFieldQuality(FieldQuality q) {
+        switch (q) {
+            case FieldQuality::Exact:   fieldScale_ = 1; refine_ = false; break;
+            case FieldQuality::Coarse2: fieldScale_ = 2; refine_ = false; break;
+            case FieldQuality::Coarse3: fieldScale_ = 3; refine_ = false; break;
+            case FieldQuality::Coarse4: fieldScale_ = 4; refine_ = false; break;
+            case FieldQuality::Adaptive:
+                // ⚠️ 细趟还没收敛（亮度偏低 44%，见 HANDOVER）：先回退到 Coarse4，
+                // 这样选了 Adaptive 也不会得到一个明显不对的画面。
+                fieldScale_ = 4;
+                refine_ = false;
+                fprintf(stderr, "[sweep] Adaptive 尚未收敛，已回退到 Coarse4（光场 1/4）\n");
+                break;
+        }
+        // 档位变了，光场副本要按新尺寸重建（置 0 让 ensureFieldTextures 重建）
+        fw_ = fh_ = 0;
+        if (fieldCanvas_) { glDeleteTextures(1, &fieldCanvas_); fieldCanvas_ = 0; }
+        if (fieldMat_) { glDeleteTextures(1, &fieldMat_); fieldMat_ = 0; }
+        if (fieldMask_) { glDeleteTextures(1, &fieldMask_); fieldMask_ = 0; }
+        if (fineField_) { glDeleteTextures(1, &fineField_); fineField_ = 0; }
+    }
+    FieldQuality fieldQuality() const {
+        if (refine_) return FieldQuality::Adaptive;
+        switch (fieldScale_) {
+            case 2: return FieldQuality::Coarse2;
+            case 3: return FieldQuality::Coarse3;
+            case 4: return FieldQuality::Coarse4;
+            default: return FieldQuality::Exact;
+        }
+    }
+    // 低层入口（旧工具用）：按倍率选档
+    void setFieldScale(int s) {
+        s = std::clamp(s, 1, 4);
+        setFieldQuality(s == 1 ? FieldQuality::Exact
+                        : s == 2 ? FieldQuality::Coarse2
+                        : s == 3 ? FieldQuality::Coarse3
+                                 : FieldQuality::Coarse4);
+    }
+    int fieldScale() const { return fieldScale_; }
+    // 诊断：回读掩码，打印每层"需要细化"的块占比（与 CPU 统计对齐用）
+    void debugMaskStats(const char* tag = "");
+    // 诊断：比较粗光场与细光场在"细化块"上的数值，定位细趟偏亮/偏暗
+    void debugFieldCompare(const char* tag = "", int layer = -1);
+    const std::string& autotuneInfo() const { return tuneInfo_; }
+    int atomicPack() const { return atomicPack_; }
+
     // --- 单层便捷入口 ---
     //
     // tools/render_cli 与"只有一个图层"的画布走的都是这条路。
@@ -270,6 +359,10 @@ private:
     void ensureDirectionTable();
     void blendLayer(int layer);              // scanTex_ -> litArray_ 的第 layer 层
     void renderLayerProgressive(int layer);  // 哈希采样路径
+    void renderLayerTiled(int layer);        // 分块 + shared 合并（列波前）
+    void downsampleField(int layer);         // 生成 (fw_,fh_) 的光场输入副本
+    void ensureFieldTextures();              // 按 fieldScale_ 懒分配光场副本
+    // 诊断：回读掩码，打印每层"需要细化"的块占比（与 CPU 统计对齐用）
     void clearAccumLayer(int layer);
 
     int w_ = 0, h_ = 0;
@@ -301,6 +394,41 @@ private:
     GLuint hashAccum_ = 0;           // RGBA16F 数组：RGB=E[lt]，A=E[luma²]
     GLuint hashDenoise_ = 0;         // RGBA16F 数组：去噪结果（独立纹理，不污染累积）
     GLuint hashProg_ = 0, clearAccumProg_ = 0, hashCopyProg_ = 0;
+    GLuint scanProgU64_ = 0, copyProgU64_ = 0;   // 64 位原子变体（可选）
+    // --- 分块扫描（列波前）---
+    GLuint tileProg_ = 0, colStateSSBO_ = 0, dirPassSSBO_ = 0;
+    GLuint rowProg_ = 0, rowPhaseSSBO_ = 0;   // y 主方向（行波前）
+    // 光场降采样：fieldCanvas_/fieldMat_ 是 (fw_,fh_) 的降采样副本，扫描只在它们上跑
+    GLuint fieldCanvas_ = 0, fieldMat_ = 0, fieldDownProg_ = 0;
+    GLuint fieldMask_ = 0;      // (fw_,fh_): 1 = 该块需要全分辨率细化
+    GLuint fineField_ = 0;      // 全分辨率细算结果（仅细化块内有效）
+    int fieldScale_ = 1;
+    bool refine_ = false;   // Adaptive：粗趟 + 细趟（实验）
+    int scanW_ = 0, scanH_ = 0;   // scanTex_ 当前的实际尺寸（必须等于光场尺寸）
+    int fieldLayers_ = 0;        // fieldCanvas_/fieldMat_ 的层数（层数变了要重建）
+    int fw_ = 0, fh_ = 0;
+    std::vector<GLint> dirsXPos_, dirsXNeg_;   // x 主方向按符号拆两趟
+    std::vector<GLint> dirsYPos_, dirsYNeg_;   // y 主方向按符号拆两趟（P2 用）
+    int dirCountY_ = 0;
+    int paddedRays_ = 0;
+    size_t colCap_ = 0;
+    bool tiledScan_ = false;
+    bool autotunePending_ = true;   // 第一次有内容时自动探测
+    std::string tuneInfo_;
+    int tileT_ = 16;                // 分块边长（由 autotune 决定）
+    int dirGroup_ = 16;             // 列内核：每个 workgroup 处理的方向数
+    int dirGroupY_ = 32;            // 行内核：同上（单独调，两者甜点不同）
+    int tileTRow_ = 16;             // 行内核的带高（单独调：行带数 = ceil(H/T)）
+    struct {
+        GLint cc = -1, mat = -1, cs = -1, ambient = -1, cp = -1, emitScale = -1;
+        GLint layer = -1, T = -1, col = -1, sign = -1, group = -1, dirCount = -1;
+        GLint rays = -1, invN = -1;
+    } uCol_;
+    struct {
+        GLint cc = -1, mat = -1, cs = -1, ambient = -1, cp = -1, emitScale = -1;
+        GLint layer = -1, T = -1, row = -1, sign = -1, group = -1, dirCount = -1;
+        GLint rays = -1, invN = -1;
+    } uRow_;
     Denoise dn_;
 
     // 各层合成用（一个 compute pass，见 layer_composite.h）
@@ -314,6 +442,11 @@ private:
         GLint ambient = -1, emitScale = -1, layer = -1;
         GLint band = -1, bandn = -1;   // 诊断：扇区过滤（见 setDirectionBand）
         GLint contig = -1;             // 诊断：连续取样（见 setContiguousFetch）
+        GLint noWrite = -1;            // 诊断：不写内存（见 setScanNoWrite）
+        GLint major = -1;              // 只跑 x/y 主方向（分块路径用）
+        GLint s = -1, fcs = -1;        // 光场粗格边长 / 粗格尺寸
+        GLint maskOn = -1, maskTex = -1, maskCS = -1;   // 细化掩码（细趟用）
+        GLint pack = -1;               // 每像素原子数（见 setAtomicPack）
         // --- 扩散版 program 的同一批 uniform（后缀 _d）---
         GLint cc_d = -1, mat_d = -1, cs_d = -1, ndirs_d = -1, cp_d = -1;
         GLint ambient_d = -1, emitScale_d = -1, layer_d = -1;
@@ -321,10 +454,11 @@ private:
         GLint diff = -1, diffstep = -1, diffdbg = -1;
     } uScan_;
     struct {
-        GLint cs = -1;
+        GLint cs = -1, pack = -1;
     } uCopy_;
     struct {
         GLint cc = -1, scan = -1, mat = -1, cs = -1, emitScale = -1, layer = -1;
+        GLint fine = -1, maskOn = -1, mask = -1, ms = -1;   // 细化：全分辨率结果 + 块掩码
     } uBlend_;
     struct {
         GLint cc = -1, mat = -1, cs = -1, ndirs = -1, frame = -1, ambient = -1, cp = -1,
@@ -355,6 +489,8 @@ private:
     int ss_ = 1;          // 角度超采样倍率（1=关，见 setAngularSS）
     int dirSS_ = 1;       // 方向表**建成时**用的 ss（用于判断是否需要重建）
     bool contiguousFetch_ = false; // 诊断：连续取样（见 setContiguousFetch）
+    bool scanNoWrite_ = false;     // 诊断：不写内存（见 setScanNoWrite）
+    int atomicPack_ = 0;           // 每像素原子加次数 0/1/2（见 setAtomicPack）
 };
 
 }  // namespace pb::gfx

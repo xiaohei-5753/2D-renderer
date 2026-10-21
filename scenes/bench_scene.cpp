@@ -1,4 +1,4 @@
-// app/bench_scene.cpp — 实时性能基准 / 渲染器视觉测试集
+// scenes/bench_scene.cpp — 实时性能基准 / 渲染器视觉测试集
 //
 // ## 每个场景都是"能测 + 好看"的
 //
@@ -29,7 +29,7 @@
 //
 // `Layer::setPixelRaw` **没有边界检查** —— 它直接算 `data()[y*w+x]` 就写。
 // 负坐标会写到上一行（甚至越界踩坏内存）。所有写像素一律走下面的 pset()。
-#include "app/bench_scene.h"
+#include "scenes/bench_scene.h"
 
 #include <cmath>
 #include <cstdint>
@@ -140,8 +140,457 @@ void hueToRgb(double h, uint8_t& r, uint8_t& g, uint8_t& b) {
 }
 
 // ===========================================================================
-// neon-city —— 1px 霓虹锐度 + 大面积泛光 + 垂直自发光传输
+// neon-rain —— 雨夜霓虹街景（长焦 / 平面构图 / 5 层 / 实时动画）
 // ===========================================================================
+//
+// ## 视觉参考与为什么这么画
+//
+// 参考方向（长焦平面构图 + 雨夜霓虹）：
+//   * Roger Deakins 在《银翼杀手 2049》里的雨夜：整幅画面是**几层平行的平面**
+//     （远景楼群 / 中景招牌 / 近景雨幕），长焦把前后压扁，竖直边缘一律保持竖直，
+//     没有透视汇聚点。
+//   * 城市夜雨的像素画传统：光源少而饱和（青 / 品红 / 琥珀），大面积近黑，
+//     湿路面用**竖直拉长的反光条**表达，雨用 1px 竖线，雾用低对比度的水平带。
+//     参考：<https://stockcake.com/i/neon-city-rain_4486204_1959779>、
+//     <https://www.summerengine.com/es/asset-store/rain-soaked-neon-street-level-7af10a85>
+//
+// ## 构图规则（这几条决定"像不像"，比调色更重要）
+//
+//  1. **三层平面**：远（L0 天空 + L1 远景楼，低对比）→ 中（L2 招牌立面，最高
+//     对比、最饱和）→ 近（L3 街面 + L4 雨幕，剪影 + 高光）。层与层之间靠**遮挡**
+//     而不是靠大小拉开距离 —— 长焦没有近大远小。
+//  2. **一条竖缝**：中景两栋楼之间留 8% 宽的空隙露出远景楼，depth 立刻出现。
+//  3. **地面占 28%**：湿街是唯一大面积"漫反射 + 镜面拉丝"的地方，压住画面底部。
+//  4. **只有两种斜线**：电线和雨。其余全是水平/竖直 —— 这是长焦的"平"。
+//  5. **最亮的是招牌，不是天空**：天空压到近黑（比中景招牌暗一个数量级），
+//     否则霓虹读不出来。
+//
+// ## 动画（全部是 f(frame)，确定性）
+//
+//  雨（4 层不同速度/长度）、招牌接触不良的闪烁、地面积水的波纹抖动、
+//  远处塔顶的航空障碍灯、横幅招牌的滚动高光。
+void buildNeonRain(Document& doc, int frame) {
+    const int W = doc.width(), H = doc.height();
+    prepare(doc, 5);
+    const int horizon = H * 70 / 100;
+    const int alleyX0 = W * 40 / 100, alleyX1 = W * 56 / 100;   // 竖缝：远景从这里透出来
+
+    // 调色板（饱和度集中在招牌上；环境色一律压暗，否则霓虹读不出来）
+    const RGBA8 mag{240, 72, 158, 255};
+    const RGBA8 cyn{72, 232, 240, 255};
+    const RGBA8 amb{250, 178, 84, 255};
+    const RGBA8 red{232, 64, 72, 255};
+
+    // ---- L0：天空（顶部深青 -> 地平线青灰，充当远景楼的背光）----
+    {
+        Layer& L = doc.layer(0);
+        for (int y = 0; y < H; y++) {
+            const float t = std::min(1.0f, (float)y / (float)std::max(1, horizon));
+            float r, g, b;
+            if (t < 0.55f) {
+                const float k = t / 0.55f;                 // 深青 -> 中青
+                r = 24 + 34 * k; g = 36 + 46 * k; b = 50 + 44 * k;
+            } else {
+                const float k = (t - 0.55f) / 0.45f;       // 中青 -> 地平线亮青灰
+                r = 58 + 30 * k; g = 82 + 44 * k; b = 94 + 40 * k;
+            }
+            const RGBA8 c{clamp255((int)r), clamp255((int)g), clamp255((int)b), 255};
+            for (int x = 0; x < W; x++) pset(L, x, y, c);
+        }
+        // 城市辉光：地平线上方一条更亮的带（雨雾把城市光散射到天上）
+        const int glowH = 22;
+        for (int i = 0; i < glowH; i++) {
+            const int y = horizon - glowH + i;
+            if (y < 0) continue;
+            const float k = 0.22f + 0.78f * (float)i / (float)glowH;
+            for (int x = 0; x < W; x++) {
+                const RGBA8 c{(uint8_t)(96 * k), (uint8_t)(150 * k), (uint8_t)(162 * k), 255};
+                pset(L, x, y, c);
+            }
+        }
+        L.markAllDirty();
+    }
+
+    // ---- L1：远景楼群（比天空暗 -> 剪影；稀疏窗格 + 塔顶航空灯）----
+    {
+        Layer& L = doc.layer(1);
+        for (int gx = 0; gx < W; gx += 9) {
+            const float hh = hash01(gx / 9, 1, 21);
+            const int bh = 46 + (int)(hh * 78.0f);          // 长焦：远景也顶到画面顶部
+            const int top = std::max(-10, horizon - bh);
+            const int wcol = 9 - (int)(hash01(gx / 9, 3, 25) * 3.0f);
+            const bool nearer = (hash01(gx / 9, 2, 23) > 0.45f);
+            const RGBA8 body = nearer ? RGBA8{52, 60, 72, 255} : RGBA8{40, 47, 57, 255};
+            for (int x = gx; x < gx + wcol && x < W; x++)
+                for (int y = top; y < horizon; y++) pset(L, x, y, body);
+            // 窗：极暗的暖色，只负责"有城市"的信息量
+            for (int wy = top + 6; wy < horizon - 4; wy += 6)
+                for (int wx = gx + 2; wx < gx + wcol - 1; wx += 4) {
+                    if (hash01(wx, wy, 31) > 0.78f) {
+                        const int warm = 104 + (int)(hash01(wx, wy, 33) * 46.0f);
+                        pset(L, wx, wy, RGBA8{(uint8_t)(warm + 30), (uint8_t)warm,
+                                              (uint8_t)(warm * 3 / 5), 255});
+                    }
+                }
+        }
+        if (((frame / 26) % 2) == 0) {
+            const int bx = W * 15 / 100;
+            for (int y = horizon - 88; y < horizon - 86; y++)
+                for (int x = bx; x < bx + 2; x++)
+                    pset(L, x, y, RGBA8{120, 30, 26, 255}, emitMat(180, 36, 28));
+        }
+        L.markAllDirty();
+    }
+
+    // ---- L2：中景立面 + 霓虹招牌（最高对比层）----
+    {
+        Layer& L = doc.layer(2);
+        // 墙是浅色混凝土：霓虹打上去才有颜色，没灯的地方自然暗 —— 这是"建模打光"的正常结果
+        const RGBA8 face{112, 120, 132, 255}, edge{146, 156, 170, 255};
+        for (int y = H * 6 / 100; y < horizon; y++)
+            for (int x = 0; x < alleyX0; x++)
+                pset(L, x, y, (x > alleyX0 - 4) ? edge : face);
+        for (int y = H * 2 / 100; y < horizon; y++)
+            for (int x = alleyX1; x < W; x++)
+                pset(L, x, y, (x < alleyX1 + 4) ? edge : face);
+
+        // 窗格：暖白 / 冷青，约 4 成亮；接触不良的偶尔灭
+        // 窗户：**不规则**才是城市。整层暗、相邻两扇并成一扇、少数只亮一半。
+        auto windows = [&](int x0, int x1, int y0) {
+            for (int fy = y0; fy < horizon - 10; fy += 7) {
+                if (hash01(fy, 1, 47) < 0.34f) continue;   // 整层不亮
+                bool prevLit = false;
+                for (int fx = x0; fx < x1 - 6; fx += 6) {
+                    const float r = hash01(fx, fy, 41);
+                    if (prevLit && r < 0.45f) { prevLit = false; continue; }  // 偶尔并窗
+                    if (r < 0.3f) { prevLit = false; continue; }
+                    if (hash01(fx, fy, 43) > 0.9f && ((frame / 6) % 4) == 0) continue;
+                    const bool cool = hash01(fx, fy, 45) > 0.86f;
+                    const int ww = (r > 0.9f) ? 4 : 3;
+                    const int hh = 4;
+                    // 亮度只在 40~105 之间变：窗是"被室内灯照亮的玻璃"，不是发光格
+                    const uint8_t dim = (uint8_t)(52 + hash01(fx, fy, 51) * 46.0f);
+                    const RGBA8 c = cool ? RGBA8{(uint8_t)(dim - 6), dim, (uint8_t)(dim + 18), 255}
+                                         : RGBA8{(uint8_t)(dim + 26), (uint8_t)(dim - 4),
+                                                 (uint8_t)(dim / 2 + 6), 255};
+                    for (int dy = 0; dy < hh; dy++)
+                        for (int dx = 0; dx < ww; dx++)
+                            pset(L, fx + dx, fy + dy, c);
+                    prevLit = true;
+                }
+            }
+        };
+        windows(8, alleyX0 - 6, H * 24 / 100);
+        windows(alleyX1 + 8, W - 8, H * 22 / 100);
+
+        // 闪烁：接触不良的霓虹灯（周期 + 偶发熄灭）
+        auto flick = [&](int id, double period) {
+            const float base = 0.78f + 0.22f * pulse(frame, period);
+            const float drop = (hash01(id, frame / 3, 61) > 0.955f) ? 0.45f : 1.0f;
+            return base * drop;
+        };
+
+        // 竖招牌：**填充暗色灯箱 + 亮边框 + 内部笔画**，这样在 1px 尺度下才读得出"招牌"
+        auto vSign = [&](int x0, int y0, int w, int h, RGBA8 neon, float k, int seed) {
+            const RGBA8 dim{(uint8_t)(neon.r * 0.52f), (uint8_t)(neon.g * 0.52f),
+                            (uint8_t)(neon.b * 0.52f), 255};
+            for (int y = y0; y < y0 + h; y++)
+                for (int x = x0; x < x0 + w; x++) {
+                    const bool border = (x == x0 || x == x0 + w - 1 || y == y0 ||
+                                         y == y0 + h - 1);
+                    if (border) {
+                        const RGBA8 c{(uint8_t)(neon.r * k), (uint8_t)(neon.g * k),
+                                      (uint8_t)(neon.b * k), 255};
+                        pset(L, x, y, c, emitMat(c.r, c.g, c.b));
+                    } else {
+                        pset(L, x, y, dim, emitMat((uint8_t)(neon.r * 0.26f * k),
+                                                   (uint8_t)(neon.g * 0.26f * k),
+                                                   (uint8_t)(neon.b * 0.26f * k)));
+                    }
+                }
+            // 招牌里的"字"：固定的 3x5 笔画表（像偏旁部首），比哈希噪声干净得多
+            static const uint8_t kGlyph[6][5] = {
+                {0b111, 0b001, 0b111, 0b100, 0b111},   // 目
+                {0b010, 0b111, 0b010, 0b010, 0b111},   // 十
+                {0b111, 0b100, 0b111, 0b001, 0b111},   // 匚
+                {0b101, 0b101, 0b111, 0b001, 0b001},   // 冂
+                {0b111, 0b010, 0b111, 0b010, 0b010},   // 王
+                {0b100, 0b111, 0b100, 0b101, 0b011},   // ヒ
+            };
+            const int gw = w - 6;
+            int gi = seed % 6;
+            for (int gy = y0 + 4; gy + 5 < y0 + h - 2; gy += 7) {
+                const uint8_t* gph = kGlyph[gi % 6];
+                ++gi;
+                for (int row = 0; row < 5; row++)
+                    for (int col = 0; col < 3 && col < gw; col++) {
+                        if ((gph[row] >> (2 - col)) & 1) {
+                            const RGBA8 c{(uint8_t)(neon.r * k), (uint8_t)(neon.g * k),
+                                          (uint8_t)(neon.b * k), 255};
+                            pset(L, x0 + 3 + col, gy + row, c, emitMat(c.r, c.g, c.b));
+                        }
+                    }
+            }
+        };
+        vSign(W * 3 / 100, H * 18 / 100, W * 5 / 100 + 8, H * 30 / 100, mag, flick(1, 41.0), 11);
+        vSign(alleyX1 + W * 2 / 100, H * 12 / 100, W * 4 / 100 + 6, H * 24 / 100, cyn,
+              flick(2, 57.0), 23);
+
+        // 横招牌：横跨竖缝（长焦压扁的经典构图），琥珀色，带滚动高光
+        {
+            const int y0 = H * 30 / 100, hgt = 7;
+            const int x0 = W * 62 / 100, x1 = W * 88 / 100;
+            const float k = flick(3, 73.0);
+            const RGBA8 dim{(uint8_t)(amb.r * 0.5f), (uint8_t)(amb.g * 0.5f),
+                            (uint8_t)(amb.b * 0.5f), 255};
+            for (int y = y0; y < y0 + hgt; y++)
+                for (int x = x0; x <= x1; x++) {
+                    const bool border = (y == y0 || y == y0 + hgt - 1 || x == x0 || x == x1);
+                    if (border) {
+                        const RGBA8 c{(uint8_t)(amb.r * k), (uint8_t)(amb.g * k),
+                                      (uint8_t)(amb.b * k), 255};
+                        pset(L, x, y, c, emitMat(c.r, c.g, c.b));
+                    } else {
+                        pset(L, x, y, dim, emitMat((uint8_t)(amb.r * 0.09f * k),
+                                                   (uint8_t)(amb.g * 0.09f * k),
+                                                   (uint8_t)(amb.b * 0.09f * k)));
+                    }
+                }
+            const int sweep = (int)((frame * 2) % (x1 - x0 + 40)) - 20;
+            for (int d = 0; d < 2; d++) {
+                const int sx = x0 + sweep + d;
+                if (sx > x0 && sx < x1)
+                    for (int y = y0 + 1; y < y0 + hgt - 1; y++)
+                        pset(L, sx, y, RGBA8{255, 236, 200, 255}, emitMat(255, 236, 200));
+            }
+        }
+        // 红色警示灯（小面积高饱和，压住右侧）
+        {
+            const int x0 = alleyX1 + W * 7 / 100, y0 = H * 36 / 100;
+            const float k = flick(4, 29.0);
+            for (int y = 0; y < 4; y++)
+                for (int x = 0; x < 4; x++) {
+                    const RGBA8 c{(uint8_t)(red.r * k), (uint8_t)(red.g * k),
+                                  (uint8_t)(red.b * k), 255};
+                    pset(L, x0 + x, y0 + y, c, emitMat(c.r, c.g, c.b));
+                }
+        }
+        // 店面灯带：贴着地平线上方的一条断续横光 —— 整幅画的主光源。
+        // 它照亮下方墙面与湿路面，是"建模打光"里那盏真正在地面上的灯。
+        for (int seg = 0; seg < 7; seg++) {
+            const int sx = W * (4 + seg * 13) / 100;
+            const int sw = W * (8 + (int)(hash01(seg, 3, 66) * 5.0f)) / 100;
+            if (sx + sw > alleyX0 && sx < alleyX1) continue;   // 竖缝里不放
+            const bool cool = (seg % 3) == 1;
+            const RGBA8 base = cool ? RGBA8{150, 220, 226, 255} : RGBA8{244, 208, 158, 255};
+            const float k = 0.8f + 0.2f * pulse(frame, 61.0 + seg * 7);
+            for (int x = sx; x < sx + sw && x < W; x++) {
+                for (int y = horizon - 5; y < horizon; y++) {
+                    const float fall = 1.0f - (float)(horizon - 1 - y) / 6.0f;
+                    const RGBA8 c{(uint8_t)(base.r * k * fall), (uint8_t)(base.g * k * fall),
+                                  (uint8_t)(base.b * k * fall), 255};
+                    pset(L, x, y, c, emitMat(c.r, c.g, c.b));
+                }
+            }
+        }
+        // 电线：画面里唯一允许的斜线（长焦的"平"靠它打破）
+        for (int i = 0; i < 3; i++) {
+            const int y0 = H * (12 + i * 5) / 100;
+            const int y1 = H * (24 + i * 5) / 100;
+            for (int x = 0; x < W; x++) {
+                const float tt = (float)x / (float)W;
+                const int y = (int)(y0 + (y1 - y0) * tt + 7.0f * tt * (1.0f - tt));
+                pset(L, x, y, RGBA8{4, 5, 8, 255});
+            }
+        }
+        L.markAllDirty();
+    }
+
+    // ---- L2b：竖缝里的远景（让缝读成"更远"，而不是一个黑洞）----
+    {
+        Layer& L = doc.layer(2);
+        for (int y = H * 18 / 100; y < horizon; y++) {
+            // 越往下越亮的远景雾（远处街口的光）
+            const float k = (float)(y - H * 18 / 100) / (float)std::max(1, horizon - H * 18 / 100);
+            const RGBA8 c{(uint8_t)(34 + 26 * k), (uint8_t)(50 + 34 * k), (uint8_t)(58 + 30 * k),
+                          255};
+            for (int x = alleyX0; x < alleyX1; x++) pset(L, x, y, c);
+        }
+        // 缝隙深处的两条细霓虹（远景招牌，只有几像素宽）
+        for (int i = 0; i < 2; i++) {
+            const int x = alleyX0 + 6 + i * (alleyX1 - alleyX0 - 12);
+            const RGBA8 c = (i == 0) ? RGBA8{236, 96, 170, 255} : RGBA8{96, 220, 232, 255};
+            for (int y = H * 34 / 100; y < H * 52 / 100; y++)
+                pset(L, x, y, c, emitMat((uint8_t)(c.r * .8f), (uint8_t)(c.g * .8f),
+                                         (uint8_t)(c.b * .8f)));
+        }
+        // 缝底部的店招（暖光从街上照进缝里）
+        {
+            const float k = 0.85f + 0.15f * pulse(frame, 47.0);
+            for (int x = alleyX0 + 2; x < alleyX1 - 2; x++)
+                for (int y = horizon - 4; y < horizon; y++) {
+                    const RGBA8 c{(uint8_t)(250 * k), (uint8_t)(196 * k), (uint8_t)(140 * k),
+                                  255};
+                    pset(L, x, y, c, emitMat(c.r, c.g, c.b));
+                }
+        }
+        L.markAllDirty();
+    }
+
+    // ---- L3：湿街（按列调制的竖直拉丝反光）+ 前景剪影 ----
+    {
+        Layer& L = doc.layer(3);
+        for (int y = horizon; y < H; y++) {
+            const float t = (float)(y - horizon) / (float)std::max(1, H - horizon);
+            const int v = (int)(62 - 26 * t);
+            for (int x = 0; x < W; x++)
+                pset(L, x, y, RGBA8{(uint8_t)(v + 1), (uint8_t)(v + 3), (uint8_t)(v + 7), 255});
+        }
+        // 拉丝反光：**逐列**调制（不是整块），越远越亮、越往下越散、带波纹抖动
+        auto smear = [&](int x0, int x1, RGBA8 c, int len, int seed) {
+            for (int x = x0; x < x1; x++) {
+                // 列缺口：真实水面反光是碎的，不是一整块色板
+                if (hash01(x, 1, seed + 17) < 0.18f) continue;
+                const float colK = 0.30f + 0.70f * hash01(x, 0, seed);
+                for (int y = horizon; y < std::min(H, horizon + len); y++) {
+                    const float t = (float)(y - horizon) / (float)std::max(1, len);
+                    const float fall = (1.0f - t) * (1.0f - t);
+                    // 波纹：随帧沿 y 抖动，制造"水面在动"
+                    const int wob = (int)(1.6f * std::sin((double)y * 0.5 + frame * 0.35));
+                    const int xx = x + wob;
+                    const float k = fall * colK;
+                    const RGBA8 cc{(uint8_t)(c.r * k), (uint8_t)(c.g * k), (uint8_t)(c.b * k),
+                                   255};
+                    pset(L, xx, y, cc, emitMat((uint8_t)(cc.r * 0.55f),
+                                               (uint8_t)(cc.g * 0.55f),
+                                               (uint8_t)(cc.b * 0.55f)));
+                }
+            }
+        };
+        smear(W * 3 / 100, W * 3 / 100 + W * 5 / 100 + 8, mag, (H - horizon) * 3 / 4, 3);
+        smear(alleyX1 + W * 2 / 100, alleyX1 + W * 6 / 100 + 6, cyn, (H - horizon) * 2 / 3, 7);
+        smear(W * 50 / 100, W * 92 / 100, amb, (H - horizon) * 2 / 5, 11);
+
+        // 积水高光：横向短亮条（雨夜湿地的镜面）
+        for (int i = 0; i < 7; i++) {
+            const int cx = (int)(hash01(i, 0, 71) * W);
+            const int cy = horizon + 6 + (int)(hash01(i, 1, 73) * (H - horizon - 10));
+            const int rw = 4 + (int)(hash01(i, 2, 75) * 14.0f);
+            for (int x = cx - rw; x <= cx + rw; x++) {
+                const int yy = cy + (int)(1.8f * std::sin((double)(x + frame) * 0.4));
+                const float k = 1.0f - std::fabs((float)(x - cx) / (float)(rw + 1));
+                const RGBA8 c{(uint8_t)(120 * k), (uint8_t)(150 * k), (uint8_t)(164 * k), 255};
+                pset(L, x, yy, c, emitMat(c.r, c.g, c.b));
+            }
+        }
+        // 雨点水花（每 4 帧换一批）
+        for (int i = 0; i < 30; i++) {
+            const int ph = frame / 4;
+            const int cx = (int)(hash01(i + ph * 37, 0, 81) * W);
+            const int cy = horizon + 3 + (int)(hash01(i + ph * 37, 1, 83) * (H - horizon - 5));
+            const int r = 1 + (int)(hash01(i, 2, 85) * 2.0f);
+            for (int k = -r; k <= r; k++)
+                pset(L, cx + k, cy, RGBA8{120, 148, 160, 255}, emitMat(40, 60, 70));
+            pset(L, cx, cy - 1, RGBA8{150, 178, 190, 255}, emitMat(60, 84, 94));
+        }
+
+        // 前景剪影：栏杆（左）+ 打伞的人（中右）+ 路灯 + 垃圾桶
+        const RGBA8 sil{20, 22, 28, 255};
+        // 栏杆：两根立柱 + 两道横栏
+        for (int x = 0; x < W * 30 / 100; x++) {
+            pset(L, x, H - 30, sil);
+            pset(L, x, H - 29, sil);
+            pset(L, x, H - 14, sil);
+        }
+        for (int i = 0; i < 4; i++) {
+            const int px = 2 + i * (W * 28 / 100) / 4;
+            for (int y = H - 32; y < H; y++)
+                for (int x = px; x < px + 3; x++) pset(L, x, y, sil);
+        }
+        // 打伞的人：伞弧 + 身体 + 腿，站在橙色反光前面（剪影最强的地方）
+        {
+            const int cx = W * 62 / 100, base = H - 1;
+            const int bob = (int)(std::sin((double)frame * 0.10) * 1.0);
+            const int uy = base - 38 + bob;
+            for (int dx = -11; dx <= 11; dx++) {
+                const int dy = (int)(10.0f * std::sqrt(std::max(0.0f, 1.0f -
+                                                                  (float)(dx * dx) / 121.0f)));
+                for (int x = cx + dx; x <= cx + dx + 1; x++) {
+                    pset(L, x, uy - dy, sil);
+                    pset(L, x, uy - dy + 1, sil);
+                    pset(L, x, uy - dy + 2, sil);
+                }
+            }
+            for (int y = uy; y < base - 6; y++)
+                for (int x = cx - 3; x <= cx + 3; x++) pset(L, x, y, sil);
+            for (int y = base - 6; y <= base; y++) {
+                pset(L, cx - 3, y, sil);
+                pset(L, cx - 2, y, sil);
+                pset(L, cx + 2, y, sil);
+                pset(L, cx + 3, y, sil);
+            }
+            for (int y = uy - 8; y < uy; y++) pset(L, cx, y, sil);   // 伞柄
+        }
+        // 路灯：唯一高位暖光
+        {
+            const int px = W * 82 / 100;
+            for (int y = H * 34 / 100; y < H; y++)
+                for (int x = px; x < px + 2; x++) pset(L, x, y, sil);
+            for (int x = px - 12; x < px + 2; x++) pset(L, x, H * 34 / 100, sil);
+            for (int y = H * 34 / 100 + 1; y < H * 34 / 100 + 3; y++)
+                for (int x = px - 14; x < px - 7; x++)
+                    pset(L, x, y, RGBA8{255, 210, 150, 255}, emitMat(255, 210, 150));
+        }
+        // 垃圾桶（右侧近景，给"街"一个尺度参照）
+        for (int y = H - 16; y < H; y++)
+            for (int x = W * 72 / 100; x < W * 72 / 100 + 7; x++) pset(L, x, y, sil);
+        L.markAllDirty();
+    }
+
+    // ---- L4：近景雨幕 + 焦外光斑 ----
+    {
+        Layer& L = doc.layer(4);
+        // 细雨：四档速度/长度，透明 40~110
+        for (int i = 0; i < 220; i++) {
+            const int speed = 6 + (int)(hash01(i, 1, 93) * 9.0f);
+            const int x = (int)(hash01(i, 0, 91) * W);
+            const int len = 5 + (int)(hash01(i, 2, 95) * 10.0f);
+            const int y = ((int)(hash01(i, 3, 97) * H) + frame * speed) % H;
+            const int a = 52 + (int)(hash01(i, 4, 99) * 82.0f);
+            const RGBA8 c{150, 192, 210, (uint8_t)a};
+            for (int k = 0; k < len; k++) pset(L, x, y + k, c);
+        }
+        // 粗雨：3 条长的，带一点倾斜（速度感）
+        for (int i = 0; i < 3; i++) {
+            const int speed = 18 + i * 6;
+            const int x = ((int)(hash01(i, 7, 103) * W) + frame * 2) % W;
+            const int y = (frame * speed + i * 80) % (H + 80) - 40;
+            for (int k = 0; k < 38; k++) {
+                const int xx = x - (k * 2) / 9;
+                pset(L, xx, y + k, RGBA8{196, 226, 240, 88});
+            }
+        }
+        // 焦外光斑：霓虹在长焦下的大光团（低透明、无锐边）
+        struct Bokeh { int x, y, r; uint8_t rr, gg, bb, aa; };
+        const Bokeh bok[5] = {{W * 10 / 100, H * 26 / 100, 11, 255, 120, 190, 30},
+                              {W * 90 / 100, H * 20 / 100, 8, 120, 240, 250, 24},
+                              {W * 26 / 100, H * 10 / 100, 7, 255, 180, 90, 20},
+                              {W * 58 / 100, H * 62 / 100, 9, 255, 96, 160, 22},
+                              {W * 74 / 100, H * 40 / 100, 6, 250, 220, 160, 18}};
+        for (const Bokeh& bk : bok)
+            for (int dy = -bk.r; dy <= bk.r; dy++)
+                for (int dx = -bk.r; dx <= bk.r; dx++) {
+                    const float d2 = (float)(dx * dx + dy * dy) / (float)(bk.r * bk.r);
+                    if (d2 > 1.0f) continue;
+                    const uint8_t a = (uint8_t)(bk.aa * (1.0f - d2 * 0.6f));
+                    pset(L, bk.x + dx, bk.y + dy, RGBA8{bk.rr, bk.gg, bk.bb, a});
+                }
+        L.markAllDirty();
+    }
+}
+
+
+
 //
 // ## 亮度关系是这幅画成立的关键（第一版就是在这里失败的）
 //
@@ -151,6 +600,7 @@ void hueToRgb(double h, uint8_t& r, uint8_t& g, uint8_t& b) {
 //   楼体：压到比天空更暗
 // 楼的边缘有对比之后剪影才读得出来。这是"构图"层面的修正，
 // 不是调一个参数能解决的。
+// ===========================================================================
 void buildNeonCity(Document& doc, int frame) {
     const int W = doc.width(), H = doc.height();
     const int n = prepare(doc, 4);
@@ -688,6 +1138,7 @@ const SceneDesc kScenes[(int)SceneId::Count] = {
     {"lantern-fog", "垂直光路：光要穿过上方多层半透明雾", 5, 32, 0.05f, 8, false, false},
     {"stained-glass", "半透明染色 + 硬阴影 + 彩色光互染", 3, 32, 0.05f, 8, false, false},
     {"chromatic", "自发光与 albedo 解耦（暗表面发绿光）", 3, 32, 0.10f, 8, false, false},
+    {"neon-rain", "雨夜霓虹街景：长焦平面构图 / 5 层 / 实时雨幕（性能 + 审美）", 5, 64, 0.08f, 8, false, false},
     {"grid-lab", "定量诊断：点/线/网格/方块（静止，供 dir_probe）", 2, 32, 0.10f, 8, false, false},
     {"legacy", "旧的 5 层动画基准（历史数字可复现）", 5, 128, 0.00f, 8, false, false},
     // 低配档。用途很具体：**验证集显能不能玩**。
@@ -737,6 +1188,9 @@ void buildDoc(Document& doc, SceneId id, int layers) {
         case SceneId::Chromatic:
             buildChromatic(doc, 0);
             break;
+        case SceneId::NeonRain:
+            buildNeonRain(doc, 0);
+            break;
         case SceneId::LowEnd:
         case SceneId::Legacy:
         default:
@@ -764,6 +1218,9 @@ void stepDoc(Document& doc, SceneId id, int frame) {
             break;
         case SceneId::Chromatic:
             buildChromatic(doc, frame);
+            break;
+        case SceneId::NeonRain:
+            buildNeonRain(doc, frame);
             break;
         case SceneId::LowEnd:
         case SceneId::Legacy:

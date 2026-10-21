@@ -1,5 +1,8 @@
 // gfx/shader.cpp
 #include "shader.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include <cstdio>
 
@@ -37,6 +40,18 @@ GLuint compileShader(GLenum type, const char* src, const char* label) {
 }
 
 GLuint createComputeProgram(const char* label, const char* src) {
+    // 诊断：PB_DUMP_SHADER=1 时把**实际编译的源码**写到 out/shader_<label>.glsl，
+    // 这样"我的修改到底有没有进到着色器里"可以一眼确认（比猜字符串匹配可靠）。
+    if (const char* d = getenv("PB_DUMP_SHADER")) {
+        if (d[0] == '1') {
+            char path[256];
+            snprintf(path, sizeof(path), "out/shader_%s.glsl", label);
+            if (FILE* f = fopen(path, "wb")) {
+                fwrite(src, 1, strlen(src), f);
+                fclose(f);
+            }
+        }
+    }
     const GLuint cs = compileShader(GL_COMPUTE_SHADER, src, label);
     if (!cs) return 0;
 

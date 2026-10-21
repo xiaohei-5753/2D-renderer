@@ -111,6 +111,10 @@ bool g_hd = false;
 int g_dirLimit = 0;   // 诊断：只跑前 N 个方向（0 = 全部）
 int g_band = 0;       // 诊断：0=全部 1=只轴向 2=只斜向
 bool g_contig = false; // 诊断：连续取样地址（模拟剪切布局）
+bool g_nowrite = false; // 诊断：不写内存（只量 DDA/取样/递推）
+int g_pack = 0;         // 每像素原子加次数：0=3 次 1=2 次 2=1 次（见 setAtomicPack）
+bool g_tiled = false;   // 分块 + shared 合并（列波前）
+int g_fieldScale = 1;   // 光场降采样倍率
 // 每个测点重复几轮、取最好的那一轮。
 //
 // 为什么必须重复：这台机器（4080 Laptop）在 83°C 上会降频，同一份代码连测三次
@@ -262,6 +266,8 @@ void usage() {
         "\n"
         "  --size <WxH>      画布尺寸            (默认 320x180)\n"
         "  --radius <N>      扫描方向表半径      (默认 128)\n"
+        "  --nowrite         诊断：扫描只推进不写内存（量 DDA 成本，结果为空）\n"
+        "  --pack <0|1|2>    每像素原子加次数：0=3 次(默认) 1=2 次 2=1 次(10/10/10)\n"
         "  --mode <m>        只有 sweep（路径追踪已移除） (默认 sweep)\n"
         "  --layers <a,b,..> 要测的层数列表      (默认 1,2,4,8,16)\n"
         "  --frames <N>      每个测点跑几帧采样    (默认 30)\n"
@@ -290,6 +296,10 @@ bool parseArgs(int argc, char** argv) {
         else if (a == "--dirlimit") { const char* v = next(); if (!v) return false; g_dirLimit = atoi(v); }
         else if (a == "--band") { const char* v = next(); if (!v) return false; g_band = atoi(v); }
         else if (a == "--contig") { g_contig = true; }
+        else if (a == "--nowrite") { g_nowrite = true; }
+        else if (a == "--pack") { const char* v = next(); if (!v) return false; g_pack = atoi(v); }
+        else if (a == "--tiled") { g_tiled = true; }
+        else if (a == "--field-scale") { const char* v = next(); if (!v) return false; g_fieldScale = atoi(v); }
         else if (a == "--repeat") { const char* v = next(); if (!v) return false; g_repeat = std::max(1, atoi(v)); }
         else if (a == "--layers") {
             const char* v = next(); if (!v) return false;
@@ -337,6 +347,10 @@ int main(int argc, char** argv) {
     if (g_dirLimit > 0) sweep.setDirectionLimit(g_dirLimit);
     sweep.setDirectionBand(g_band);
     sweep.setContiguousFetch(g_contig);
+sweep.setScanNoWrite(g_nowrite);
+    sweep.setAtomicPack(g_pack);
+    if (g_tiled) sweep.setTiledScan(true);   // 不指定时 autotune 会自己选
+    sweep.setFieldScale(g_fieldScale);
     // ⚠️ 方向表是**惰性**重建的：settings().rayRadius 只是记下参数，真正
     // rebuildDirectionTable() 要到第一次 renderLayer() 才发生。所以必须先跑一次
     // 再问 directionCount()，否则读到的是 init 时的默认值 128 —— 我就在这里

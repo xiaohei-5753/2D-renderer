@@ -1,4 +1,4 @@
-// app/light_settings_io.h — 光照参数的持久化
+// gfx/light_settings_io.h — 光照参数的持久化
 //
 // ## 为什么需要它
 //

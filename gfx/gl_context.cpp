@@ -6,6 +6,7 @@
 #include <GLFW/glfw3.h>
 
 #include <cstdio>
+#include <cstring>
 
 namespace pb::gfx {
 
@@ -70,6 +71,24 @@ bool GLContext::create(const ContextDesc& desc) {
 
     printf("[gl] version : %s\n", glVersion_.c_str());
     printf("[gl] renderer: %s\n", glRenderer_.c_str());
+
+    // 64 位整形 & 64 位原子（SSBO）。有的话，"每像素只做 1 次原子加"可以从
+    // 10/10/10（量化 ~4 级，见 setAtomicPack(2)）升级成 21/21/21（量化可忽略），
+    // 也就是把 1 原子的速度 + 3 原子的精度合起来。
+    // core profile 下 glGetString(GL_EXTENSIONS) 返回 NULL，必须 glGetStringi 枚举。
+    {
+        GLint nExt = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &nExt);
+        bool hasInt64 = false, hasAtomic64 = false;
+        for (GLint i = 0; i < nExt; i++) {
+            const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, (GLuint)i));
+            if (!e) continue;
+            if (std::strcmp(e, "GL_ARB_gpu_shader_int64") == 0) hasInt64 = true;
+            if (std::strcmp(e, "GL_NV_shader_atomic_int64") == 0) hasAtomic64 = true;
+        }
+        printf("[gl] int64: %s / atomic_int64: %s\n", hasInt64 ? "yes" : "no",
+               hasAtomic64 ? "yes" : "no");
+    }
     return true;
 }
 

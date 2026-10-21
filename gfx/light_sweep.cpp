@@ -19,7 +19,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "gl_texture.h"
@@ -121,6 +123,8 @@ void main(){
   if(ri>=((rc+255)/256)*256)return;
   int x,y;if(dx>=dy){x=(sx>0)?0:W-1;y=-H+ri;}else{x=-W+ri;y=(sy>0)?0:H-1;}
   vec3 lt=u_ambient;float invN=1.0/float(max(1,u_bandn));int er=dx-dy;
+  int lastKey=-1;
+  int lastBK=-1;
   int fidx=(dz*7919 + ri) % max(1,W*H);
   // ## 边走边混（用户方案的**正确**形式）
   //
@@ -201,7 +205,10 @@ void main(){
   }
 })";
 
-static const char* kScanComp = R"(#version 430 core
+// 扫描内核的**函数体**（不含 #version）：init 时会拼上版本行，并在支持
+// GL_NV_shader_atomic_int64 的机器上再拼一个 #define U64 的变体，
+// 用来做"每像素 1 次 64 位原子加（21/21/21 位打包）"。
+static const char* kScanBody = R"(
 layout(local_size_x=256)in;
 uniform sampler2DArray u_cc,u_mat;
 uniform ivec2 u_cs;
@@ -210,7 +217,30 @@ uniform int u_layer;
 uniform int u_band;       // 诊断：0=不过滤 1=只轴向 2=只斜向（见 setDirectionBand）
 uniform int u_bandn;      // 该扇区内实际参与的方向数（归一化用，保证与全量可比）
 uniform int u_contig;     // 诊断：1=取样地址按"行内连续"走（见 setContiguousFetch）
+uniform int u_no_write;   // 诊断：1=只走 DDA/取样/累加，**不写任何内存**（见 setScanNoWrite）
+// 每像素原子加的次数（见 setAtomicPack）：
+//   0 = 3 次：三个通道各一个平面（默认，16 位/通道）
+//   1 = 2 次：R 放高 16 位、G 放低 16 位（一次原子），B 单独一次
+//   2 = 1 次：R/G/B 各 10 位打包进一个 u32（量化 ~4 级，仅用于量时间）
+//   3 = 1 次：64 位原子，R/G/B 各 21 位（需要 GL_NV_shader_atomic_int64）
+uniform int u_pack;
+uniform int u_major;      // 0=全部 1=只 x 主方向 2=只 y 主方向（分块路径用）
+// 光场降采样：射线仍按**全分辨率**推进（薄墙的透射是逐像素精确的），
+// 但只在**进入新的粗格时**沉积一次 —— 原子加数量降 s^2 倍，画质几乎不变。
+uniform int u_s;          // 粗格边长（1 = 关）
+uniform ivec2 u_fcs;      // 光场（粗格）尺寸
+// 细趟：只算"需要细化"的块（块内有 1px 遮挡混合或自发光）。
+// 掩码为 0 的块直接跳过取样与沉积（DDA 仍然推进，保证相位正确）。
+uniform int u_maskOn;
+uniform sampler2DArray u_mask;
+uniform sampler2DArray u_ccd,u_matd;   // 降采样的 canvas/材质：平滑块按块平均传播
+uniform int u_bs;                      // 掩码块边长（= 光场降采样倍率）
+uniform int u_ms;
+#ifdef U64
+layout(std430,binding=0)buffer AccBuf{uint64_t d[];};
+#else
 layout(std430,binding=0)buffer AccBuf{uint d[];};
+#endif
 layout(std430,binding=1)readonly buffer DirBuf{ivec2 dirs[];};
 void main(){
   int ri=int(gl_GlobalInvocationID.x);
@@ -221,6 +251,9 @@ void main(){
   if(u_band==1&&!(ud.x==0||ud.y==0))return;
   if(u_band==2&&(ud.x==0||ud.y==0))return;
   int dx=abs(ud.x),dy=abs(ud.y);
+  // 只跑某一类方向（分块路径会用另一半；归一化仍按 D_total，见 u_bandn）
+  if(u_major==1&&dx<dy)return;
+  if(u_major==2&&dx>=dy)return;
   int sx=(ud.x>=0)?1:-1,sy=(ud.y>=0)?1:-1,W=u_cs.x,H=u_cs.y;
   int rc=(dx>=dy)?(2*H+1):(2*W+1);
   // 保持与旧版逐方向 dispatch 完全相同的线程集合 ceil(rc/256)*256：
@@ -229,12 +262,41 @@ void main(){
   if(ri>=((rc+255)/256)*256)return;
   int x,y;if(dx>=dy){x=(sx>0)?0:W-1;y=-H+ri;}else{x=-W+ri;y=(sy>0)?0:H-1;}
   vec3 lt=u_ambient;float invN=1.0/float(max(1,u_bandn));int er=dx-dy;
+  int lastKey=-1;
+  int lastBK=-1;
+  // 诊断用：不写内存时把沉积值累在寄存器里（下面那句"永不成立"的写保证
+  // 编译器不会把整条 DDA/取样链优化掉）。
+  vec3 accNW=vec3(0.0);
   // 诊断：把取样地址换成"行内连续"（等价于把纹理按射线的自然顺序打包，
   // 也就是剪切布局要做的事），而**沉积地址仍然按 DDA** —— 这样
   // "步数 / 取样次数 / 原子加次数"全都完全一致，唯一差异是取样地址的连续性。
   int fidx=(int(gl_GlobalInvocationID.z)*7919 + ri) % max(1,W*H);
   while(true){
     if(x>=0&&x<W&&y>=0&&y<H){
+      // 平滑块（掩码=0）：按**块平均**做一次等价传播，每块只做一次。
+      //
+      // ⚠️ 这里绝不能"跳过"：实心墙也落在平滑块里，跳过就等于墙变透明、光从
+      // 远处漏过来（实测整幅偏亮 37% 并出现块状接缝）。块内覆盖率是均匀的，
+      // 所以块级传播在这些块里是**精确**的，不损失质量。
+      bool coarse=false;
+      if(u_maskOn!=0){
+        ivec2 mb=ivec2(x/u_bs,y/u_bs);
+        coarse = texelFetch(u_mask,ivec3(mb,u_layer),0).r < 0.5;
+        if(coarse){
+          const int mw=(W+u_bs-1)/u_bs;
+          int bkey=mb.y*mw+mb.x;
+          if(bkey!=lastBK){
+            lastBK=bkey;
+            vec4 bc=texelFetch(u_ccd,ivec3(mb,u_layer),0);
+            vec4 bm=texelFetch(u_matd,ivec3(mb,u_layer),0);
+            float bcov=bc.a;
+            vec3 bem=bm.rgb*u_emit_scale;
+            lt=lt*mix(vec3(1.0),bc.rgb,bcov)*(1.0-bcov)+bem;
+            lt+=bem*(1.0-bcov)*u_cp;
+          }
+        }
+      }
+      if(!coarse){
       ivec3 sp;
       if(u_contig!=0){
         // 连续递增：模拟"剪切后逐行推进"的地址模式
@@ -268,27 +330,400 @@ void main(){
       // 不同方向命中同一像素地址的冲突）：实测 1 层 2.58→2.18、4 层 8.77→8.68，
       // 差异在噪声内 —— 说明**跨方向的同地址竞争不是瓶颈**，收益全来自
       // "同一个线程的 3 次原子加不要落在同一扇区"。所以别再加平面，白占内存。
-      int pi=y*W+x;int wh=W*H;
-      vec3 add=lt*invN;
-      atomicAdd(d[pi],uint(clamp(add.r,0.0,1.0)*65535.0));
-      atomicAdd(d[pi+wh],uint(clamp(add.g,0.0,1.0)*65535.0));
-      atomicAdd(d[pi+2*wh],uint(clamp(add.b,0.0,1.0)*65535.0));
+      // 粗格键：只有"进入新的一格"时才沉积。射线本身仍逐像素推进，
+      // 所以穿过 1px 薄墙时的衰减、自发光累加都是精确的（不会漏光/过暗）。
+      // 粗格键：只有"进入新的一格"时才沉积。射线本身仍逐像素推进，
+      // 所以穿过 1px 薄墙时的衰减、自发光累加都是精确的（不会漏光/过暗）。
+      int cw=u_fcs.x,ch=u_fcs.y;
+      int key=(y/u_s)*cw+(x/u_s);
+      if(key!=lastKey){
+        lastKey=key;
+        int pi=key;int wh=cw*ch;
+        vec3 add=lt*invN;
+        if(u_no_write!=0){
+          accNW+=add;   // 诊断：只累加，不落盘
+        }else if(u_pack==0){
+#ifndef U64
+          atomicAdd(d[pi],uint(clamp(add.r,0.0,1.0)*65535.0));
+          atomicAdd(d[pi+wh],uint(clamp(add.g,0.0,1.0)*65535.0));
+          atomicAdd(d[pi+2*wh],uint(clamp(add.b,0.0,1.0)*65535.0));
+#endif
+        }else if(u_pack==1){
+#ifndef U64
+          uint r=uint(clamp(add.r*0.0625,0.0,1.0)*65535.0);
+          uint g=uint(clamp(add.g*0.0625,0.0,1.0)*65535.0);
+          atomicAdd(d[pi],(r<<16)|g);
+          atomicAdd(d[pi+2*wh],uint(clamp(add.b,0.0,1.0)*65535.0));
+#endif
+        }else if(u_pack==2){
+#ifndef U64
+          uint r=uint(clamp(add.r*0.0625,0.0,1.0)*1020.0);
+          uint g=uint(clamp(add.g*0.0625,0.0,1.0)*1020.0);
+          uint b=uint(clamp(add.b*0.0625,0.0,1.0)*1020.0);
+          atomicAdd(d[pi],(r<<20)|(g<<10)|b);
+#endif
+        }else{
+#ifdef U64
+          uint64_t r=uint64_t(clamp(add.r*0.0625,0.0,1.0)*2097152.0);
+          uint64_t g=uint64_t(clamp(add.g*0.0625,0.0,1.0)*2097152.0);
+          uint64_t b=uint64_t(clamp(add.b*0.0625,0.0,1.0)*2097152.0);
+          atomicAdd(d[pi],(r<<42)|(g<<21)|b);
+#endif
+        }
+      }
+      }   // if(!coarse)
     }
     int e2=2*er;if(e2>-dy){er-=dy;x+=sx;}if(e2<dx){er+=dx;y+=sy;}
     if((sx>0&&x>=W)||(sx<0&&x<0)||(sy>0&&y>=H)||(sy<0&&y<0))break;
   }
+  // 防 DCE：这个条件永远不成立（accNW 恒为非负），但编译器无法证明，
+  // 所以整条 DDA/取样/累加链都会被保留。真正执行时**没有任何写操作**。
+  if(accNW.r<0.0)d[0]=uint(accNW.g);
 })";
 
-static const char* kCopyComp = R"(#version 430 core
+static const char* kCopyBody = R"(
 layout(local_size_x=8,local_size_y=8)in;
+#ifdef U64
+layout(std430,binding=0)buffer AccBuf{uint64_t d[];};
+#else
 layout(std430,binding=0)buffer AccBuf{uint d[];};
+#endif
 layout(rgba16f,binding=0)writeonly uniform image2D u_img;
 uniform ivec2 u_cs;
+uniform int u_pack;   // 与扫描内核一致
 void main(){
   ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(p.x>=u_cs.x||p.y>=u_cs.y)return;
-  // 与 kScanComp 的 SoA 布局对应：三个通道各占一个 W*H 平面
+  // 与 kScanBody 的布局对应：三个通道各占一个 W*H 平面（pack=0）
   int pi=p.y*u_cs.x+p.x;int wh=u_cs.x*u_cs.y;
-  imageStore(u_img,p,vec4(vec3(float(d[pi])/65535.0,float(d[pi+wh])/65535.0,float(d[pi+2*wh])/65535.0),0));
+#ifdef U64
+  uint64_t v=d[pi];
+#else
+  uint v=d[pi];
+#endif
+  vec3 w;
+#ifndef U64
+  if(u_pack==0){
+    w=vec3(float(d[pi])/65535.0,float(d[pi+wh])/65535.0,float(d[pi+2*wh])/65535.0);
+  }else if(u_pack==1){
+    // pack=1 的 R/G 是按 1/16 缩放存的（留动态范围余量），解码乘回 16
+    w=vec3(float(v>>16)/65535.0*16.0,float(v&0xFFFFu)/65535.0*16.0,
+           float(d[pi+2*wh])/65535.0);
+  }else if(u_pack==2){
+    w=vec3(float((v>>20)&1023u)/1020.0*16.0,float((v>>10)&1023u)/1020.0*16.0,
+           float(v&1023u)/1020.0*16.0);
+  }
+#else
+  // 21/21/21，1/16 缩放
+  {
+    const uint64_t mask=2097151u;
+    w=vec3(float((v>>42)&mask)/2097152.0*16.0,float((v>>21)&mask)/2097152.0*16.0,
+           float(v&mask)/2097152.0*16.0);
+  }
+#endif
+  imageStore(u_img,p,vec4(w,0));
+})";
+
+// ---------------------------------------------------------------------------
+// 光场降采样：把 canvas（albedo+覆盖率）与材质（自发光）按 s×s 盒式平均
+//
+// 为什么只降这两张而不降整个画面：扫描只在"光场"上跑，它输出的是**低频**的
+// 入射光；而 albedo 与自发光是**高频**的（1px 霓虹管、窗格）。所以：
+//   扫描 (s倍降)  ->  光场 (低分辨率)  ->  合成时双线性放大
+//   albedo / 自发光 / 最终 lit  ->  仍是全分辨率
+// 这样泛光变平滑、而霓虹边缘一点不糊 —— 这是"降采样不显著损画质"的关键。
+static const char* kFieldDownComp = R"(#version 430 core
+layout(local_size_x=8,local_size_y=8)in;
+uniform sampler2DArray u_cc,u_mat;
+uniform ivec2 u_fcs;     // 光场尺寸
+uniform ivec2 u_cs;      // 画布尺寸
+uniform int u_s;         // 降采样倍率
+uniform int u_layer;
+layout(rgba8,binding=0)writeonly uniform image2DArray u_outCC;
+layout(rgba8,binding=1)writeonly uniform image2DArray u_outMat;
+layout(r8,binding=2)writeonly uniform image2DArray u_outMask;
+void main(){
+  ivec2 f=ivec2(gl_GlobalInvocationID.xy);
+  if(f.x>=u_fcs.x||f.y>=u_fcs.y)return;
+  // ⚠️ 覆盖率必须取 **max**（保守），不能取平均：
+  // 1px 的墙在 4×4 块里平均后只剩 1/16 覆盖率，扫描就会"透光"，
+  // 光漏到墙后，整幅画变亮（实测平均亮度 19.6 -> 124）。
+  // 遮挡要保守，颜色才可以是平均（按覆盖率加权，空气不稀释墙色）。
+  // ⚠️ 覆盖率归一化：texelFetch 取 .a 是 0..1，但早先版本里累加的是 0..255 的
+  // 原始字节，导致 cov 远超 1 —— 内核按 (1-cov) 衰减就变成"负光"，
+  // 整幅画异常偏亮且出现块状台阶。这里统一按 0..1 处理。
+  float covMax=0.0, covSum=0.0;
+  vec3 colSum=vec3(0.0), emSum=vec3(0.0);
+  int n=0;
+  for(int dy=0;dy<u_s;dy++)
+    for(int dx=0;dx<u_s;dx++){
+      int x=f.x*u_s+dx,y=f.y*u_s+dy;
+      if(x>=u_cs.x||y>=u_cs.y)continue;
+      ivec3 sp=ivec3(x,y,u_layer);
+      vec4 cc=texelFetch(u_cc,sp,0);
+      vec4 mm=texelFetch(u_mat,sp,0);
+      float a=cc.a;
+      covMax=max(covMax,a);
+      covSum+=a;
+      colSum+=cc.rgb*a;             // 按覆盖率加权
+      emSum+=mm.rgb;                // 自发光是能量：直接求和
+      ++n;
+    }
+  if(n==0)return;
+  float meanCov=covSum/float(n);
+  vec3 albedo=(covSum>1e-4)?(colSum/covSum):vec3(0.0);
+  vec3 em=emSum/float(n);
+  // 遮挡取 max（保守）但完全用 max 会让 1px 缝隙全闭合、整体偏暗（实测暗 35%）。
+  // 折中：max 与 mean 各半 —— 既挡住 1px 墙，又保留半透明/缝隙的透光。
+  float cov=0.5*covMax+0.5*meanCov;
+  // 细化判据：**块内有"实心+空气"混合**（1px 墙/缝）或**块内有自发光**（1px 灯管）,
+  // 这两种块的场在块内变化剧烈，必须按全分辨率算。实测 neon-rain 只占 4.6%+3.6%。
+  bool mixed=(covMax>0.5&&meanCov<0.5);
+  bool hasEm=(em.x+em.y+em.z)>0.002;
+  imageStore(u_outMask,ivec3(f,u_layer),vec4((mixed||hasEm)?1.0:0.0,0,0,1));
+  imageStore(u_outCC,ivec3(f,u_layer),vec4(albedo,cov));
+  imageStore(u_outMat,ivec3(f,u_layer),vec4(em,1.0));
+})";
+// ---------------------------------------------------------------------------
+// 分块 + shared 合并的扫描（x 主方向，按列波前）
+//
+// 为什么这么写：全局原子占到扫描耗时的 83%（见 BENCHMARK.md）。分块的意义是
+// 把"同一块内多个方向的沉积"先在 **shared memory** 里合并，最后整块往全局写一次。
+//
+// 正确性靠三件事（缺一不可，任何一项错了都会在块边界出现台阶）：
+//   1. **DDA 相位必须和 kScanBody 逐位一致**：在列边界处直接解析算出
+//      k(t)=floor((t·dy + dx − dy)/dx)、er(t)=(dx−dy) − t·dy + k(t)·dx，
+//      等价于从画布边界一路走过来（见 gather 内核同样的推导）。
+//   2. **块内窗口要够高**：一列里一条射线最多走 T 步、y 最多变 T，
+//      所以按 ri 分块（每块 T 条）时，写入窗口取 3T 行一定够。
+//   3. **跨列状态**：每个 (方向, 射线) 的 lt 存在 st[] 里，第 0 列用 ambient。
+//
+// 归一化用 1/D_total（不是本 pass 的方向数），与主内核完全一致。
+// ---------------------------------------------------------------------------
+// 光场降采样：把 canvas（albedo+覆盖率）与材质（自发光）按 s×s 盒式平均
+//
+// 为什么只降这两张而不降整个画面：扫描只在"光场"上跑，它输出的是**低频**的
+// 入射光；而 albedo 与自发光是**高频**的（1px 霓虹管、窗格）。所以：
+//   扫描 (s倍降)  ->  光场 (低分辨率)  ->  合成时双线性放大
+//   albedo / 自发光 / 最终 lit  ->  仍是全分辨率
+// 这样泛光变平滑、而霓虹边缘一点不糊 —— 这是"降采样不显著损画质"的关键。
+// ---------------------------------------------------------------------------
+// 分块 + shared 合并的扫描（x 主方向，按列波前）
+//
+// 为什么这么写：全局原子占扫描耗时 83%（见 BENCHMARK.md）。分块的意义是把
+// "同一块内多个方向的沉积"先在 **shared memory** 里合并，最后整块往全局写一次。
+//
+// 正确性靠三件事（任何一项错了都会在块边界看到台阶/暗带）：
+//   1. **DDA 相位必须和 kScanBody 逐位一致**：直接解析算出
+//      k(t)=floor((t*dy + dx - dy)/dx)、er(t)=(dx-dy) - t*dy + k(t)*dx，
+//      等价于从画布边界一路走过来（和 gather 内核同一条推导）。
+//   2. **块窗口要够高**：一列里一条射线最多走 T 步、y 最多变 T，
+//      所以按"y_in 落在 [B*T, B*T+T)"分配射线、写入窗口取 3T 行，一定装得下。
+//   3. **跨列状态**：每个 (方向, 射线) 的 lt 存在 st[] 里；第 0 列用 ambient。
+//      没被处理过的射线状态保持初始化值 ambient —— 它们本来就还没进画布。
+//
+// 归一化用 1/D_total（不是本 pass 的方向数），与主内核完全一致 ⇒ 整数加法顺序
+// 无关 ⇒ 与旧内核**逐位相同**（验收标准就是 png_stat 0 像素差）。
+static const char* kScanColComp = R"(#version 430 core
+layout(local_size_x=256)in;
+uniform sampler2DArray u_cc,u_mat;
+uniform ivec2 u_cs;
+uniform vec3 u_ambient;uniform float u_cp,u_emit_scale;
+uniform int u_layer;
+uniform int u_T;          // 列宽 = 每块每方向的射线数
+uniform int u_colBase;    // 当前列
+uniform int u_sign;       // +1 左->右，-1 右->左
+uniform int u_group;      // 本 workgroup 处理的方向数
+uniform int u_dirCount;   // 本 pass 的方向总数
+uniform int u_rays;       // 每方向射线数（padded，与主内核一致）
+uniform float u_invN;     // 1/D_total
+layout(std430,binding=0)buffer AccBuf{uint d[];};
+layout(std430,binding=1)readonly buffer DirBuf{ivec2 dirs[];};
+layout(std430,binding=3)buffer StateBuf{vec4 st[];};
+shared uint acc[3*3*32*32];
+
+void main(){
+  int T=u_T;
+  int W=u_cs.x,H=u_cs.y,wh=W*H;
+  int by=int(gl_WorkGroupID.x);      // 0..nBlocks-1；块号 B = by-1
+  int gIx=int(gl_WorkGroupID.y);
+  int tid=int(gl_LocalInvocationID.x);
+  int B=by-1;
+  int rowWin=B*T-T;                  // 窗口 [B*T-T, B*T+2T)，共 3T 行
+  for(int i=tid;i<3*3*T*T;i+=256)acc[i]=0u;
+  barrier();
+
+  int rayIdx=tid%T;                  // y_in = B*T + rayIdx
+  int dirOff=tid/T;
+  int dirsPerPass=256/T;
+
+  for(int k=0;k<u_group;k+=dirsPerPass){
+    int di=gIx*u_group+k+dirOff;
+    if(di<u_dirCount){
+      ivec2 ud=dirs[di];
+      int dx=abs(ud.x),dy=abs(ud.y);
+      int sy=(ud.y>=0)?1:-1;
+      int t=u_colBase*T;
+      int kt=(t*dy+dx-dy)/dx;
+      int er=(dx-dy)-t*dy+kt*dx;
+      int yIn=B*T+rayIdx;
+      int ri=yIn+H-sy*kt;
+      if(ri>=0&&ri<u_rays){
+        int y=yIn;
+        int x=(u_sign>0)?t:(W-1-t);
+        vec3 lt=(u_colBase==0)?u_ambient:st[di*u_rays+ri].rgb;
+        for(int s=0;s<T;s++){
+          if(x>=0&&x<W&&y>=0&&y<H){
+            int ly=y-rowWin;
+            int lx=(u_sign>0)?(x-t):((W-1-x)-t);
+            if(ly>=0&&ly<3*T&&lx>=0&&lx<T){
+              ivec3 sp=ivec3(x,y,u_layer);
+              vec4 c=texelFetch(u_cc,sp,0);
+              vec4 mt=texelFetch(u_mat,sp,0);
+              float cov=c.a;
+              vec3 em=mt.rgb*u_emit_scale;
+              lt=lt*mix(vec3(1.0),c.rgb,cov)*(1.0-cov)+em;
+              lt+=em*(1.0-cov)*u_cp;
+              int pi=ly*T+lx;
+              vec3 add=lt*u_invN;
+              atomicAdd(acc[pi],uint(clamp(add.r,0.0,1.0)*65535.0));
+              atomicAdd(acc[pi+3*T*T],uint(clamp(add.g,0.0,1.0)*65535.0));
+              atomicAdd(acc[pi+2*3*T*T],uint(clamp(add.b,0.0,1.0)*65535.0));
+            }
+          }
+          int e2=2*er;if(e2>-dy){er-=dy;x+=u_sign;}if(e2<dx){er+=dx;y+=sy;}
+          if((u_sign>0&&x>=W)||(u_sign<0&&x<0)||(sy>0&&y>=H)||(sy<0&&y<0))break;
+        }
+        st[di*u_rays+ri]=vec4(lt,1.0);
+      }
+    }
+  }
+  barrier();
+
+  // 整块写回全局（不同方向组会写同一块 -> 仍需原子，但次数只剩 WH×组数）
+  int xBase=(u_sign>0)?(u_colBase*T):(W-1-u_colBase*T);
+  for(int i=tid;i<3*T*T;i+=256){
+    if(acc[i]==0u)continue;
+    int lx=i%T, ly=i/T;
+    int gx=(u_sign>0)?(xBase+lx):(xBase-lx);
+    int gy=rowWin+ly;
+    if(gx<0||gx>=W||gy<0||gy>=H)continue;
+    int gpi=gy*W+gx;
+    atomicAdd(d[gpi],acc[i]);
+    atomicAdd(d[gpi+wh],acc[i+3*T*T]);
+    atomicAdd(d[gpi+2*wh],acc[i+2*3*T*T]);
+  }
+})";
+
+// ---------------------------------------------------------------------------
+// 转置版：y 主方向（按行波前）
+//
+// 与列版本的唯一实质差异：**相位不用闭式公式，而是按方向携带 (k, er)**。
+//
+// 为什么：引擎的 DDA 循环在 x/y 上不对称（`if(2er>-dy)` 用 -dy、`if(2er<dx)` 用 dx），
+// 把 (dx,dy) 互换得到的闭式对 y 主方向不成立（CPU 穷举对拍：dx=1,dy=5 时真实
+// k(t)=0,0,1,1,1,1,1，互换公式给 k(1)=1）。而 DDA 是**平移不变**的：
+// 同一方向的所有射线共享同一个 er 序列、每 T 步共享同一个 Δk。所以只需要
+// 每方向携带 (k, er)，射线索引就能精确反推：ri = x_in + W - sx*k。
+//
+// 相位推进不看画布边界（它是整条直线的性质），由每组的锚点线程算一次写回。
+static const char* kScanRowComp = R"(#version 430 core
+layout(local_size_x=256)in;
+uniform sampler2DArray u_cc,u_mat;
+uniform ivec2 u_cs;
+uniform vec3 u_ambient;uniform float u_cp,u_emit_scale;
+uniform int u_layer;
+uniform int u_T;
+uniform int u_rowBase;
+uniform int u_sign;       // +1 上->下，-1 下->上
+uniform int u_group;
+uniform int u_dirCount;
+uniform int u_rays;
+uniform float u_invN;
+layout(std430,binding=0)buffer AccBuf{uint d[];};
+layout(std430,binding=1)readonly buffer DirBuf{ivec2 dirs[];};
+layout(std430,binding=3)buffer StateBuf{vec4 st[];};
+layout(std430,binding=5)buffer PhaseBuf{ivec2 ph[];};   // 每方向 (k, er)
+shared uint acc[3*3*16*16];
+
+void main(){
+  int T=u_T;
+  int W=u_cs.x,H=u_cs.y,wh=W*H;
+  int bx=int(gl_WorkGroupID.x);
+  int gIx=int(gl_WorkGroupID.y);
+  int tid=int(gl_LocalInvocationID.x);
+  int B=bx-1;
+  int colWin=B*T-T;
+  for(int i=tid;i<3*3*T*T;i+=256)acc[i]=0u;
+  barrier();
+
+  int rayIdx=tid%T;
+  int dirOff=tid/T;
+  int dirsPerPass=256/T;
+
+  for(int kk=0;kk<u_group;kk+=dirsPerPass){
+    int di=gIx*u_group+kk+dirOff;
+    if(di<u_dirCount){
+      ivec2 ud=dirs[di];
+      int dx=abs(ud.x),dy=abs(ud.y);
+      int sx=(ud.x>=0)?1:-1;
+      ivec2 ph0=(u_rowBase==0)?ivec2(0,dx-dy):ph[di];
+      int kNow=ph0.x, er0=ph0.y;
+      int xIn=B*T+rayIdx;
+      int ri=xIn+W-sx*kNow;
+      int y=(u_sign>0)?(u_rowBase*T):(H-1-u_rowBase*T);
+      if(ri>=0&&ri<u_rays){
+        int x=xIn;
+        int er=er0;
+        vec3 lt=(u_rowBase==0)?u_ambient:st[di*u_rays+ri].rgb;
+        for(int s=0;s<T;s++){
+          if(x>=0&&x<W&&y>=0&&y<H){
+            int lx=x-colWin;
+            int ly=(u_sign>0)?(y-u_rowBase*T):((H-1-y)-u_rowBase*T);
+            if(lx>=0&&lx<3*T&&ly>=0&&ly<T){
+              ivec3 sp=ivec3(x,y,u_layer);
+              vec4 c=texelFetch(u_cc,sp,0);
+              vec4 mt=texelFetch(u_mat,sp,0);
+              float cov=c.a;
+              vec3 em=mt.rgb*u_emit_scale;
+              lt=lt*mix(vec3(1.0),c.rgb,cov)*(1.0-cov)+em;
+              lt+=em*(1.0-cov)*u_cp;
+              int pi=ly*(3*T)+lx;
+              vec3 add=lt*u_invN;
+              atomicAdd(acc[pi],uint(clamp(add.r,0.0,1.0)*65535.0));
+              atomicAdd(acc[pi+3*T*T],uint(clamp(add.g,0.0,1.0)*65535.0));
+              atomicAdd(acc[pi+2*3*T*T],uint(clamp(add.b,0.0,1.0)*65535.0));
+            }
+          }
+          int e2=2*er;if(e2>-dy){er-=dy;x+=sx;}if(e2<dx){er+=dx;y+=u_sign;}
+          if((sx>0&&x>=W)||(sx<0&&x<0)||(u_sign>0&&y>=H)||(u_sign<0&&y<0))break;
+        }
+        st[di*u_rays+ri]=vec4(lt,1.0);
+        if(dirOff==0&&rayIdx==0){
+          int px=xIn,per=er0,pk=kNow;
+          for(int s=0;s<T;s++){
+            int e2=2*per;
+            if(e2>-dy){per-=dy;px+=sx;pk++;}
+            if(e2<dx){per+=dx;}
+          }
+          ph[di]=ivec2(pk,per);
+        }
+      }
+    }
+  }
+  barrier();
+
+  int yBase=(u_sign>0)?(u_rowBase*T):(H-1-u_rowBase*T);
+  for(int i=tid;i<3*T*T;i+=256){
+    if(acc[i]==0u)continue;
+    int lx=i%(3*T), ly=i/(3*T);
+    int gx=colWin+lx;
+    int gy=(u_sign>0)?(yBase+ly):(yBase-ly);
+    if(gx<0||gx>=W||gy<0||gy>=H)continue;
+    int gpi=gy*W+gx;
+    atomicAdd(d[gpi],acc[i]);
+    atomicAdd(d[gpi+wh],acc[i+3*T*T]);
+    atomicAdd(d[gpi+2*wh],acc[i+2*3*T*T]);
+  }
 })";
 
 // 合成**单层**的受光结果，写进结果数组纹理的第 u_layer 层。
@@ -307,6 +742,10 @@ static const char* kBlendComp = R"(#version 430 core
 layout(local_size_x=8,local_size_y=8)in;
 uniform sampler2DArray u_cc,u_mat;
 uniform sampler2D u_scan;
+uniform sampler2D u_fine;            // 细趟：只在细化块内有效
+uniform sampler2DArray u_mask;
+uniform int u_maskOn, u_ms;
+uniform int u_exact;   // 1 = 光场与画布同尺寸：直接用 texelFetch，保证与原始路径位级一致
 uniform ivec2 u_cs;
 uniform float u_emit_scale;
 uniform int u_layer;
@@ -319,11 +758,15 @@ void main(){
   // 材质是 RGB8 = 纯自发光；覆盖率取 canvas 的 alpha（见 gfx/material_pack.h）。
   float cov=c.a;
   vec3 e=mt.rgb*u_emit_scale;                 // 自发光：独立的 RGB
-  vec3 s=texelFetch(u_scan,p,0).rgb;          // 平面内扫描收集到的光
+  // 光场可能被降采样过：按归一化坐标双线性采样（覆盖同样的空间范围）。
+  vec3 s;
+  bool refined = u_maskOn!=0 && texelFetch(u_mask,ivec3(p/u_ms,u_layer),0).r>0.5;
+  if(u_exact!=0)   s=texelFetch(u_scan,p,0).rgb;              // Exact：与原始路径位级一致
+  else if(refined) s=texelFetch(u_fine,p,0).rgb;              // 细化块：全分辨率细算
+  else             s=texture(u_scan,(vec2(p)+0.5)/vec2(u_cs)).rgb;   // 其余：粗光场双线性放大
 
   // 实心像素：显示自身 albedo，并**加上**独立的彩色自发光与收集到的光。
   // 两者相加而不是互相混合，所以"暗表面发绿光"这类组合才表达得出来。
-  // 半透明像素：自身颜色按覆盖率淡化后叠上光 —— 透出去的部分留给下面的图层。
   vec3 r=(cov>=1.0)?(c.rgb+e+c.rgb*s*1.2):(c.rgb*cov+e+s*(1.0-cov));
   float pk=max(max(r.r,r.g),r.b);
   if(pk>1.0)r/=pk;
@@ -469,6 +912,15 @@ bool LightSweep::init(int w, int h) {
     // 合成结果与方向表与层数无关，先建好
     renderTex_ = createTexture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
     scanTex_ = createTexture(GL_RGBA16F, w, h, GL_RGBA, GL_HALF_FLOAT);
+    // 光场降采样时这张图会被放大采样，必须双线性，否则出现块状台阶
+    if (scanTex_) {
+        glBindTexture(GL_TEXTURE_2D, scanTex_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
 
     // 累积缓冲：3 个 u32 通道（定点，0..65535），三个通道各占一个 W*H 平面（SoA）
     glGenBuffers(1, &scanSSBO_);
@@ -482,18 +934,90 @@ bool LightSweep::init(int w, int h) {
     glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLint) * 2, nullptr, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
-    scanProg_ = createComputeProgram("sweep/scan", kScanComp);
+    const char* kScanVer = "#version 430 core\n";
+    const char* kScanVerU64 =
+        "#version 430 core\n"
+        "#extension GL_ARB_gpu_shader_int64 : require\n"
+        "#extension GL_NV_shader_atomic_int64 : require\n"
+        "#define U64 1\n";
+
+    scanProg_ = createComputeProgram("sweep/scan", (std::string(kScanVer) + kScanBody).c_str());
+
+    // 64 位原子变体：只有显卡/驱动支持 GL_NV_shader_atomic_int64 时才编。
+    // 它是"每像素 1 次原子加"里唯一还能保住精度的方案（21/21/21 位）。
+    {
+        GLint nExt = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &nExt);
+        bool hasAtomic64 = false;
+        for (GLint i = 0; i < nExt; i++) {
+            const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, (GLuint)i));
+            if (e && std::strcmp(e, "GL_NV_shader_atomic_int64") == 0) hasAtomic64 = true;
+        }
+        if (hasAtomic64) {
+            scanProgU64_ = createComputeProgram("sweep/scan_u64",
+                                                (std::string(kScanVerU64) + kScanBody).c_str());
+            copyProgU64_ = createComputeProgram("sweep/copy_u64",
+                                                (std::string(kScanVerU64) + kCopyBody).c_str());
+            if (!scanProgU64_ || !copyProgU64_) {
+                // 编译失败就当不支持，退回 32 位路径（不能让整个引擎起不来）
+                if (scanProgU64_) glDeleteProgram(scanProgU64_);
+    if (tileProg_) glDeleteProgram(tileProg_);
+    if (colStateSSBO_) glDeleteBuffers(1, &colStateSSBO_);
+    if (dirPassSSBO_) glDeleteBuffers(1, &dirPassSSBO_);
+                if (copyProgU64_) glDeleteProgram(copyProgU64_);
+                scanProgU64_ = copyProgU64_ = 0;
+    fieldDownProg_ = 0;
+    fieldCanvas_ = fieldMat_ = 0;
+    fw_ = fh_ = 0;
+    tileProg_ = 0;
+    colStateSSBO_ = dirPassSSBO_ = 0;
+    colCap_ = 0;
+                fprintf(stderr, "[sweep] 64 位原子着色器编译失败，pack=3 不可用\n");
+            } else {
+                // uniform 位置复用前提：两个变体的 active uniform 列表一致。
+                // 不假设"驱动一定给同样的位置"，这里显式验一遍；不一致就放弃 pack=3。
+                const char* names[] = {"u_pack", "u_cs", "u_cc", "u_no_write", "u_layer"};
+                bool same = true;
+                for (const char* nm : names) {
+                    if (glGetUniformLocation(scanProgU64_, nm) !=
+                        glGetUniformLocation(scanProg_, nm))
+                        same = false;
+                }
+                if (!same || glGetUniformLocation(copyProgU64_, "u_pack") !=
+                                 glGetUniformLocation(copyProg_, "u_pack")) {
+                    glDeleteProgram(scanProgU64_);
+                    glDeleteProgram(copyProgU64_);
+                    scanProgU64_ = copyProgU64_ = 0;
+    fieldDownProg_ = 0;
+    fieldCanvas_ = fieldMat_ = 0;
+    fw_ = fh_ = 0;
+    tileProg_ = 0;
+    colStateSSBO_ = dirPassSSBO_ = 0;
+    colCap_ = 0;
+                    fprintf(stderr, "[sweep] 64 位变体的 uniform 位置与 32 位不一致，pack=3 关闭\n");
+                } else {
+                    fprintf(stderr, "[sweep] 64 位原子变体就绪（pack=3：1 次原子，21/21/21 位）\n");
+                }
+            }
+        } else {
+            fprintf(stderr, "[sweep] 无 GL_NV_shader_atomic_int64，pack=3 不可用\n");
+        }
+    }
+
     // 扩散版扫描（B1/B2 实验用）：线程布局不同（一个 workgroup 一个方向），
     // 所以必须是独立 program，不能用同一个 dispatch。
     scanDiffProg_ = createComputeProgram("sweep/scan_diff", kScanDiffComp);
-    copyProg_ = createComputeProgram("sweep/copy", kCopyComp);
+    copyProg_ = createComputeProgram("sweep/copy", (std::string(kScanVer) + kCopyBody).c_str());
     blendProg_ = createComputeProgram("sweep/blend", kBlendComp);
     // 渐进哈希采样（可选路径）
     hashProg_ = createComputeProgram("sweep/hash", kHashGatherComp);
     clearAccumProg_ = createComputeProgram("sweep/clear_accum", kClearAccumComp);
     hashCopyProg_ = createComputeProgram("sweep/hash_copy", kHashCopyComp);
+    tileProg_ = createComputeProgram("sweep/scan_col", kScanColComp);
+    fieldDownProg_ = createComputeProgram("sweep/field_down", kFieldDownComp);
+    rowProg_ = createComputeProgram("sweep/scan_row", kScanRowComp);
     if (!scanProg_ || !scanDiffProg_ || !copyProg_ || !blendProg_ || !hashProg_ ||
-        !clearAccumProg_ || !hashCopyProg_ || !comp_.init()) {
+        !clearAccumProg_ || !hashCopyProg_ || !tileProg_ || !fieldDownProg_ || !comp_.init()) {
         fprintf(stderr, "[sweep] shader initialization failed\n");
         shutdown();
         return false;
@@ -512,6 +1036,11 @@ bool LightSweep::init(int w, int h) {
     uScan_.layer = glGetUniformLocation(scanProg_, "u_layer");
     uScan_.band = glGetUniformLocation(scanProg_, "u_band");
     uScan_.contig = glGetUniformLocation(scanProg_, "u_contig");
+    uScan_.noWrite = glGetUniformLocation(scanProg_, "u_no_write");
+    uScan_.pack = glGetUniformLocation(scanProg_, "u_pack");
+    uScan_.major = glGetUniformLocation(scanProg_, "u_major");
+    uScan_.s = glGetUniformLocation(scanProg_, "u_s");
+    uScan_.fcs = glGetUniformLocation(scanProg_, "u_fcs");
     uScan_.bandn = glGetUniformLocation(scanProg_, "u_bandn");
     uScan_.diff = glGetUniformLocation(scanDiffProg_, "u_diff");
     uScan_.diffstep = glGetUniformLocation(scanDiffProg_, "u_diffstep");
@@ -528,6 +1057,7 @@ bool LightSweep::init(int w, int h) {
     uScan_.bandn_d = glGetUniformLocation(scanDiffProg_, "u_bandn");
     uScan_.contig_d = glGetUniformLocation(scanDiffProg_, "u_contig");
     uCopy_.cs = glGetUniformLocation(copyProg_, "u_cs");
+    uCopy_.pack = glGetUniformLocation(copyProg_, "u_pack");
     uBlend_.cc = glGetUniformLocation(blendProg_, "u_cc");
     uBlend_.mat = glGetUniformLocation(blendProg_, "u_mat");
     uBlend_.scan = glGetUniformLocation(blendProg_, "u_scan");
@@ -549,9 +1079,38 @@ bool LightSweep::init(int w, int h) {
     uHashCopy_.cs = glGetUniformLocation(hashCopyProg_, "u_cs");
     uHashCopy_.layer = glGetUniformLocation(hashCopyProg_, "u_layer");
     uHashCopy_.src = glGetUniformLocation(hashCopyProg_, "u_src");
+    uCol_.cc = glGetUniformLocation(tileProg_, "u_cc");
+    uCol_.mat = glGetUniformLocation(tileProg_, "u_mat");
+    uCol_.cs = glGetUniformLocation(tileProg_, "u_cs");
+    uCol_.ambient = glGetUniformLocation(tileProg_, "u_ambient");
+    uCol_.cp = glGetUniformLocation(tileProg_, "u_cp");
+    uCol_.emitScale = glGetUniformLocation(tileProg_, "u_emit_scale");
+    uCol_.layer = glGetUniformLocation(tileProg_, "u_layer");
+    uCol_.T = glGetUniformLocation(tileProg_, "u_T");
+    uCol_.col = glGetUniformLocation(tileProg_, "u_colBase");
+    uCol_.sign = glGetUniformLocation(tileProg_, "u_sign");
+    uCol_.group = glGetUniformLocation(tileProg_, "u_group");
+    uCol_.dirCount = glGetUniformLocation(tileProg_, "u_dirCount");
+    uCol_.rays = glGetUniformLocation(tileProg_, "u_rays");
+    uCol_.invN = glGetUniformLocation(tileProg_, "u_invN");
+    uRow_.cc = glGetUniformLocation(rowProg_, "u_cc");
+    uRow_.mat = glGetUniformLocation(rowProg_, "u_mat");
+    uRow_.cs = glGetUniformLocation(rowProg_, "u_cs");
+    uRow_.ambient = glGetUniformLocation(rowProg_, "u_ambient");
+    uRow_.cp = glGetUniformLocation(rowProg_, "u_cp");
+    uRow_.emitScale = glGetUniformLocation(rowProg_, "u_emit_scale");
+    uRow_.layer = glGetUniformLocation(rowProg_, "u_layer");
+    uRow_.T = glGetUniformLocation(rowProg_, "u_T");
+    uRow_.row = glGetUniformLocation(rowProg_, "u_rowBase");
+    uRow_.sign = glGetUniformLocation(rowProg_, "u_sign");
+    uRow_.group = glGetUniformLocation(rowProg_, "u_group");
+    uRow_.dirCount = glGetUniformLocation(rowProg_, "u_dirCount");
+    uRow_.rays = glGetUniformLocation(rowProg_, "u_rays");
+    uRow_.invN = glGetUniformLocation(rowProg_, "u_invN");
 
     setLayerCount(1);
     rebuildDirectionTable();
+    loadTuneCache();   // 同一台机器（GL_RENDERER + 尺寸相同）就不必每次重测
     return !checkGLError("sweep/init");
 }
 
@@ -568,11 +1127,23 @@ void LightSweep::shutdown() {
     if (blendProg_) glDeleteProgram(blendProg_);
     if (hashProg_) glDeleteProgram(hashProg_);
     if (clearAccumProg_) glDeleteProgram(clearAccumProg_);
+    if (scanProgU64_) glDeleteProgram(scanProgU64_);
+    if (tileProg_) glDeleteProgram(tileProg_);
+    if (colStateSSBO_) glDeleteBuffers(1, &colStateSSBO_);
+    if (dirPassSSBO_) glDeleteBuffers(1, &dirPassSSBO_);
+    if (copyProgU64_) glDeleteProgram(copyProgU64_);
     dn_.shutdown();
     renderTex_ = scanTex_ = 0;
     scanSSBO_ = dirSSBO_ = 0;
     scanProg_ = scanDiffProg_ = copyProg_ = blendProg_ = 0;
     hashProg_ = clearAccumProg_ = 0;
+    scanProgU64_ = copyProgU64_ = 0;
+    fieldDownProg_ = 0;
+    fieldCanvas_ = fieldMat_ = 0;
+    fw_ = fh_ = 0;
+    tileProg_ = 0;
+    colStateSSBO_ = dirPassSSBO_ = 0;
+    colCap_ = 0;
     if (carrySSBO_) { glDeleteBuffers(1, &carrySSBO_); carrySSBO_ = 0; carryCap_ = 0; }
     w_ = h_ = 0;
     layers_ = 0;
@@ -611,6 +1182,13 @@ void LightSweep::setLayerCount(int n) {
     opacityArray_ =
         createTextureArray(GL_R32F, w_, h_, layers_, GL_RED, GL_FLOAT);
     // 渐进哈希采样用的累积与去噪目标（RGB=E[lt]，A=E[luma²]）
+    // 光场降采样副本（扫描只在这两张上跑）
+    fw_ = (w_ + fieldScale_ - 1) / fieldScale_;
+    fh_ = (h_ + fieldScale_ - 1) / fieldScale_;
+    if (fieldCanvas_) glDeleteTextures(1, &fieldCanvas_);
+    if (fieldMat_) glDeleteTextures(1, &fieldMat_);
+    fieldCanvas_ = createTextureArray(GL_RGBA8, fw_, fh_, layers_, GL_RGBA, GL_UNSIGNED_BYTE);
+    fieldMat_ = createTextureArray(GL_RGBA8, fw_, fh_, layers_, GL_RGBA, GL_UNSIGNED_BYTE);
     hashAccum_ = createTextureArray(GL_RGBA32F, w_, h_, layers_, GL_RGBA, GL_FLOAT);
     hashDenoise_ = createTextureArray(GL_RGBA16F, w_, h_, layers_, GL_RGBA, GL_HALF_FLOAT);
     hashFrame_ = 0;
@@ -730,10 +1308,49 @@ void LightSweep::rebuildDirectionTable() {
     dirCount_ = (int)(dirs.size() / 2);
     dirRadius_ = st_.rayRadius;
 
+    // 分块路径要用的两半：x 主方向按符号拆两趟（波前方向不同），
+    // y 主方向也按 sy 符号拆两趟（按行波前）。
+    dirsXPos_.clear();
+    dirsXNeg_.clear();
+    dirsYPos_.clear();
+    dirsYNeg_.clear();
+    for (int i = 0; i < dirCount_; i++) {
+        const GLint dx = dirs[(size_t)i * 2], dy = dirs[(size_t)i * 2 + 1];
+        std::vector<GLint>* dst = nullptr;
+        if (std::abs((int)dx) >= std::abs((int)dy))
+            dst = (dx > 0) ? &dirsXPos_ : &dirsXNeg_;
+        else
+            dst = (dy > 0) ? &dirsYPos_ : &dirsYNeg_;
+        dst->push_back(dx);
+        dst->push_back(dy);
+    }
+    dirCountY_ = dirCount_ - (int)((dirsXPos_.size() + dirsXNeg_.size()) / 2);
+
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, dirSSBO_);
     glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(dirs.size() * sizeof(GLint)),
                  dirs.data(), GL_STATIC_DRAW);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    // 分块路径的状态缓冲：[方向][射线] 各一个 vec4（lt + 1）。
+    // 只初始化一次为 ambient；第 0 列显式用 ambient，所以不必每帧清。
+    paddedRays_ = ((2 * h_ + 1 + 255) / 256) * 256;
+    const size_t need = (size_t)paddedRays_ * (size_t)std::max(1, dirCount_);
+    if (colCap_ < need) {
+        if (colStateSSBO_) glDeleteBuffers(1, &colStateSSBO_);
+        glGenBuffers(1, &colStateSSBO_);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, colStateSSBO_);
+        std::vector<float> init(need * 4, 0.0f);
+        for (size_t i = 0; i < need; i++) {
+            init[i * 4 + 0] = st_.ambient[0];
+            init[i * 4 + 1] = st_.ambient[1];
+            init[i * 4 + 2] = st_.ambient[2];
+            init[i * 4 + 3] = 1.0f;
+        }
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(need * 4 * sizeof(float)),
+                     init.data(), GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        colCap_ = need;
+    }
 }
 
 void LightSweep::ensureDirectionTable() {
@@ -806,14 +1423,502 @@ void LightSweep::uploadLayerOpacity(int layer, float opacity) {
 // 渲染
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 分块扫描：x 主方向按列波前（shared 合并），y 主方向仍走主内核
+//
+// 两段写的是同一套 16 位定点整数，所以最终结果与主内核**逐位相同**
+// （整数加法与顺序无关）。验收就是 png_stat 0 像素差。
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 自动探测元参数：经典全局原子 vs 分块（几组 T/G），在**真实内容**上取最快
+//
+// 为什么必须自动：分块的收益强烈依赖硬件（L2 大小、原子吞吐、SM 数），
+// 而且"每列并行度 = 行块数 × 方向组数"在弱 GPU 上会先撞到并行度不足。
+// 4080 上 T=16/G=16 最好，Intel UHD 上很可能是 T=8 甚至经典路径更快。
+//
+// 代价：一次性 ~10–30 ms（每组跑 2 帧）。只在第一次有内容时执行。
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 调参缓存：按 (GL_RENDERER, 画布尺寸) 匹配才复用。
+// 为什么值得做：自动探测要 30–60 ms，而玩家的 GPU/分辨率在同一台机器上是不变的，
+// 只有换显卡或改画布尺寸才需要重测。
+// 关掉：环境变量 PB_NO_TUNE_CACHE=1（回归测试时用，保证结果不受缓存影响）。
+// ---------------------------------------------------------------------------
+static const char* kTuneFile = "paintboard_tune.ini";
+
+void LightSweep::loadTuneCache() {
+    if (getenv("PB_NO_TUNE_CACHE")) return;
+    if (!tileProg_ || !colStateSSBO_) return;
+    // 注意用二进制模式：文本模式下 \n 会变成 \r\n，%[^\n] 就会把 \r 也读进 renderer，
+    // 后面 strcmp 永远不相等 —— 缓存看起来"写了但永远用不上"。
+    FILE* f = fopen(kTuneFile, "rb");
+    if (!f) return;
+    char renderer[256] = {0};
+    int tw = 0, th = 0, tiled = 0, cT = 16, cG = 16, rT = 16, rG = 32;
+    const int n = fscanf(f,
+                         "renderer=%255[^\n]\nsize=%dx%d\ntiled=%d\ncolT=%d\ncolG=%d\nrowT=%d\n"
+                         "rowG=%d\n",
+                         renderer, &tw, &th, &tiled, &cT, &cG, &rT, &rG);
+    fclose(f);
+    if (n != 8) return;
+    const char* cur = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    if (!cur || std::strcmp(cur, renderer) != 0 || tw != w_ || th != h_) return;
+    tiledScan_ = (tiled != 0);
+    tileT_ = std::clamp(cT, 8, 32);
+    dirGroup_ = std::clamp(cG, 8, 64);
+    tileTRow_ = std::clamp(rT, 8, 32);
+    dirGroupY_ = std::clamp(rG, 8, 64);
+    autotunePending_ = false;
+    tuneInfo_ = "cached";
+    fprintf(stderr, "[sweep] 调参缓存命中：%s 列(T=%d G=%d) 行(T=%d G=%d)\n",
+            tiledScan_ ? "tiled" : "classic", tileT_, dirGroup_, tileTRow_, dirGroupY_);
+}
+
+void LightSweep::saveTuneCache() const {
+    const char* cur = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    FILE* f = fopen(kTuneFile, "wb");
+    if (!f) return;
+    fprintf(f, "renderer=%s\nsize=%dx%d\ntiled=%d\ncolT=%d\ncolG=%d\nrowT=%d\nrowG=%d\n",
+            cur ? cur : "?", w_, h_, tiledScan_ ? 1 : 0, tileT_, dirGroup_, tileTRow_,
+            dirGroupY_);
+    fclose(f);
+}
+void LightSweep::autotune(int layer) {
+    if (!autotunePending_) return;
+    autotunePending_ = false;
+    if (!valid() || dirCount_ <= 0 || !tileProg_ || !colStateSSBO_) return;
+
+    GLint maxShared = 0, maxWg = 1024;
+    glGetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &maxShared);
+    // GL_MAX_COMPUTE_WORK_GROUP_SIZE 是带下标的，必须 glGetIntegeri_v；
+    // 用 glGetIntegerv 查它会留下 GL_INVALID_ENUM，后面回读纹理就会莫名失败。
+    glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &maxWg);
+    auto sharedFor = [](int T) { return 3 * 3 * T * T * 4; };   // 3T×T×3 平面
+
+    auto timeOnce = [&]() {
+        glFinish();
+        const auto t0 = std::chrono::steady_clock::now();
+        renderLayer(layer);
+        glFinish();
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
+
+    const auto tStart = std::chrono::steady_clock::now();
+    auto elapsed = [&]() {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                         tStart)
+            .count();
+    };
+    // 时间预算。慢 GPU（比如 Intel UHD）单层就要 30–70 ms，12 个候选 × 4 次渲染
+    // 会变成 3–5 秒的启动卡顿。所以先量一次经典路径当"标尺"：
+    //   快卡 -> 全候选 + 多次计时取最小；
+    //   慢卡 -> 只试 3 个最可能的配置 + 每档单次计时，总时长压到 ~0.3 秒级。
+    const double kBudgetMs = 700.0;
+
+    struct Cand {
+        bool tiled;
+        int T;
+        int G;
+    };
+    std::vector<Cand> cands;
+    cands.push_back({false, 16, 16});   // 占位：第 0 项 = 经典路径（下面单独量）
+
+    bool savedTiled = tiledScan_;
+    const int savedT = tileT_, savedG = dirGroup_;
+    tiledScan_ = false;
+    timeOnce();   // 预热
+    const double tClassic = timeOnce();
+    const bool slowGpu = (tClassic > 12.0);
+
+    if (!slowGpu) {
+        const int Ts[] = {8, 16, 32};
+        const int Gs[] = {8, 16, 32};
+        for (int T : Ts) {
+            if (maxShared > 0 && sharedFor(T) > maxShared) continue;
+            for (int G : Gs) {
+                if (G > maxWg) continue;
+                cands.push_back({true, T, G});
+            }
+        }
+    } else if (maxShared <= 0 || sharedFor(16) <= maxShared) {
+        // T=8 在两种卡上实测都最差，直接不试
+        cands.push_back({true, 16, 8});
+        cands.push_back({true, 16, 16});
+        cands.push_back({true, 16, 32});
+    }
+
+    char buf[256];
+    std::string detail;
+    double best = tClassic;
+    Cand bestCand{false, 16, 16};
+    std::snprintf(buf, sizeof(buf), "classic: %.2fms%s", tClassic,
+                  slowGpu ? "（慢卡：精简候选）" : "");
+    detail += buf;
+
+    for (size_t i = 1; i < cands.size(); i++) {
+        if (elapsed() > kBudgetMs) {
+            detail += "; …(时间预算用尽)";
+            break;
+        }
+        const Cand& c = cands[i];
+        tiledScan_ = c.tiled;
+        tileT_ = c.T;
+        dirGroup_ = c.G;
+        timeOnce();   // 预热
+        double ms = timeOnce();
+        if (!slowGpu) ms = std::min(ms, timeOnce());
+        std::snprintf(buf, sizeof(buf), "; tile T=%d G=%d: %.2fms", c.T, c.G, ms);
+        detail += buf;
+        if (ms < best) {
+            best = ms;
+            bestCand = c;
+        }
+    }
+
+    tiledScan_ = bestCand.tiled;
+    if (bestCand.tiled) {
+        tileT_ = bestCand.T;
+        dirGroup_ = bestCand.G;
+    } else {
+        tileT_ = savedT;
+        dirGroup_ = savedG;
+    }
+
+    // 阶段 B：行内核参数（同样受预算约束）
+    double bestRow = 1e30;
+    if (tiledScan_) {
+        tileTRow_ = 16;
+        dirGroupY_ = 16;
+        timeOnce();
+        bestRow = timeOnce();
+        const int TRs[] = {8, 32};
+        const int GYs[] = {8, 32, 64};
+        int bestTR = tileTRow_, bestGY = dirGroupY_;
+        for (int tr : TRs) {
+            if (maxShared > 0 && sharedFor(tr) > maxShared) continue;
+            for (int gy : GYs) {
+                if (gy > maxWg) continue;
+                if (elapsed() > kBudgetMs * 2.0) break;
+                tileTRow_ = tr;
+                dirGroupY_ = gy;
+                timeOnce();
+                double ms = timeOnce();
+                if (!slowGpu) ms = std::min(ms, timeOnce());
+                std::snprintf(buf, sizeof(buf), "; row T=%d G=%d: %.2fms", tr, gy, ms);
+                detail += buf;
+                if (ms < bestRow) {
+                    bestRow = ms;
+                    bestTR = tr;
+                    bestGY = gy;
+                }
+            }
+        }
+        tileTRow_ = bestTR;
+        dirGroupY_ = bestGY;
+    }
+
+    std::snprintf(buf, sizeof(buf),
+                  "autotune -> %s 列(T=%d G=%d) 行(T=%d G=%d)；单层 %s %.2f ms；候选: %s",
+                  tiledScan_ ? "tiled" : "classic", tileT_, dirGroup_, tileTRow_, dirGroupY_,
+                  tiledScan_ ? "tiled" : "classic", tiledScan_ ? bestRow : best, detail.c_str());
+    tuneInfo_ = buf;
+    saveTuneCache();
+    fprintf(stderr, "[sweep] %s\n", tuneInfo_.c_str());
+    (void)savedTiled;
+}
+// 按当前 fieldScale_ 保证 (fw_,fh_) 的光场副本存在。懒执行：setFieldScale 可能在
+// init 之后才被调用（CLI/面板），所以不能只在 setLayerCount 里分配。
+void LightSweep::ensureFieldTextures() {
+    const int s = std::clamp(fieldScale_, 1, 4);
+    const int fw = (w_ + s - 1) / s;
+    const int fh = (h_ + s - 1) / s;
+
+    // ⚠️ scanTex_ 的**像素尺寸必须等于光场尺寸**：blend 用归一化 UV 采样它，
+    // 尺寸不一致时会采到没写过的区域（实测 s=4 时整幅画变亮、最大差 248 级）。
+    if (!scanTex_ || fw != scanW_ || fh != scanH_) {
+        if (scanTex_) glDeleteTextures(1, &scanTex_);
+        scanTex_ = createTexture(GL_RGBA16F, fw, fh, GL_RGBA, GL_HALF_FLOAT);
+        glBindTexture(GL_TEXTURE_2D, scanTex_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        scanW_ = fw;
+        scanH_ = fh;
+    }
+
+    if (s == 1) return;
+    // 层数变了也必须重建：数组纹理只有 fieldLayers_ 层，写第 5 层会越界（表现为整片噪点）。
+    if (fieldCanvas_ && fw == fw_ && fh == fh_ && fieldLayers_ == layers_) return;
+    if (fieldCanvas_) glDeleteTextures(1, &fieldCanvas_);
+    if (fieldMat_) glDeleteTextures(1, &fieldMat_);
+    fw_ = fw;
+    fh_ = fh;
+    fieldCanvas_ = createTextureArray(GL_RGBA8, fw_, fh_, layers_, GL_RGBA, GL_UNSIGNED_BYTE);
+    fieldMat_ = createTextureArray(GL_RGBA8, fw_, fh_, layers_, GL_RGBA, GL_UNSIGNED_BYTE);
+    fieldMask_ = createTextureArray(GL_R8, fw_, fh_, layers_, GL_RED, GL_UNSIGNED_BYTE);
+    fineField_ = createTexture(GL_RGBA16F, w_, h_, GL_RGBA, GL_HALF_FLOAT);
+    fieldLayers_ = layers_;
+    // fineField_ 可能被 setFieldQuality 删掉了（它不在 fw_/fh_ 的比较里），这里补建
+    if (!fineField_) {
+        fineField_ = createTexture(GL_RGBA16F, w_, h_, GL_RGBA, GL_HALF_FLOAT);
+        glBindTexture(GL_TEXTURE_2D, fineField_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+}
+// 诊断：把 fieldMask_ 读回来，统计每层细化块占比。
+// 这不是"可有可无的调试代码"——掩码错了和细趟错了症状很像（都表现为整幅偏亮），
+// 只有这个数字能一眼分辨。
+void LightSweep::debugMaskStats(const char* tag) {
+    if (!fieldMask_ || fw_ <= 0 || fh_ <= 0) {
+        fprintf(stderr, "[mask] %s: 没有掩码（fieldScale=%d）\n", tag, fieldScale_);
+        return;
+    }
+    const size_t n = (size_t)fw_ * (size_t)fh_ * (size_t)layers_;
+    std::vector<uint8_t> buf(n, 0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, fieldMask_);
+    glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RED, GL_UNSIGNED_BYTE, buf.data());
+    const size_t per = (size_t)fw_ * (size_t)fh_;
+    for (int l = 0; l < layers_; l++) {
+        size_t cnt = 0;
+        for (size_t i = 0; i < per; i++)
+            if (buf[l * per + i] > 127) ++cnt;
+        fprintf(stderr, "[mask] %s 层%d: %zu/%zu 块需要细化（%.1f%%）\n", tag, l, cnt, per,
+                100.0 * (double)cnt / (double)per);
+    }
+}
+void LightSweep::debugFieldCompare(const char* tag, int layer) {
+    if (!fieldMask_ || !fineField_ || !scanTex_ || fw_ <= 0) return;
+    std::vector<uint8_t> mask((size_t)fw_ * fh_ * layers_);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, fieldMask_);
+    glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RED, GL_UNSIGNED_BYTE, mask.data());
+    std::vector<float> coarse((size_t)w_ * h_ * 4);
+    glBindTexture(GL_TEXTURE_2D, scanTex_);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, coarse.data());
+    std::vector<float> fine((size_t)w_ * h_ * 4);
+    glBindTexture(GL_TEXTURE_2D, fineField_);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, fine.data());
+    const int s = std::max(1, fieldScale_);
+    const int mw = (w_ + s - 1) / s;
+    double sumC = 0, sumF = 0;
+    long n = 0;
+    for (int y = 0; y < h_; y++)
+        for (int x = 0; x < w_; x++) {
+            const int mb = (y / s) * mw + (x / s);
+            // 掩码是逐层的：这里只看最后一层（scanTex_/fineField_ 里留的也是最后一层）
+            const int li = (layer >= 0 && layer < layers_) ? layer : layers_ - 1;
+            const size_t mo = (size_t)li * (size_t)fw_ * (size_t)fh_;
+            if (!(mask[mo + mb] > 127)) continue;
+            const size_t i = ((size_t)y * w_ + x) * 4;
+            // 粗场是 fw×fh：用同一 UV 取最近格
+            const size_t ci = ((size_t)(y / s) * fw_ + (x / s)) * 4;
+            sumC += coarse[ci] + coarse[ci + 1] + coarse[ci + 2];
+            sumF += fine[i] + fine[i + 1] + fine[i + 2];
+            ++n;
+        }
+    fprintf(stderr, "[fieldcmp] %s 细化像素 %ld 粗场均 %.4f 细场均 %.4f 比值 %.3f\n", tag, n,
+            n ? sumC / (3.0 * n) : 0.0, n ? sumF / (3.0 * n) : 0.0,
+            (n && sumC > 0) ? sumF / sumC : 0.0);
+}
+// 把这一层的 canvas/材质降采样到 (fw_,fh_)：扫描只在降采样副本上跑。
+// 合成阶段仍然用全分辨率 albedo/自发光，所以锐度不受影响。
+void LightSweep::downsampleField(int layer) {
+    if (fieldScale_ <= 1 || !fieldDownProg_ || !fieldCanvas_ || !fieldMat_) return;
+    glUseProgram(fieldDownProg_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, canvasArray_);
+    glUniform1i(glGetUniformLocation(fieldDownProg_, "u_cc"), 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, matArray_);
+    glUniform1i(glGetUniformLocation(fieldDownProg_, "u_mat"), 1);
+    glUniform2i(glGetUniformLocation(fieldDownProg_, "u_fcs"), fw_, fh_);
+    glUniform2i(glGetUniformLocation(fieldDownProg_, "u_cs"), w_, h_);
+    glUniform1i(glGetUniformLocation(fieldDownProg_, "u_s"), fieldScale_);
+    glUniform1i(glGetUniformLocation(fieldDownProg_, "u_layer"), layer);
+    glBindImageTexture(0, fieldCanvas_, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glBindImageTexture(1, fieldMat_, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glBindImageTexture(2, fieldMask_, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R8);
+    glDispatchCompute((GLuint)((fw_ + 7) / 8), (GLuint)((fh_ + 7) / 8), 1);
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    glUseProgram(0);
+}
+void LightSweep::renderLayerTiled(int layer) {
+    const int T = std::clamp(tileT_, 8, 32);
+    const int tilesX = (w_ + T - 1) / T;
+    const int nBlocks = (h_ + T - 1) / T + 2;   // 块号 B ∈ [-1, ceil(H/T)]
+    const int rays = paddedRays_ > 0 ? paddedRays_ : ((2 * h_ + 1 + 255) / 256) * 256;
+    const float invN = 1.0f / (float)std::max(1, dirCount_);
+
+    // 1) 累积缓冲清零 + 绑定
+    // 光场降采样：SSBO 只需覆盖 (fw_,fh_)，扫描成本按 1/s^2 下降
+    downsampleField(layer);
+    const int fW = (fieldScale_ > 1) ? fw_ : w_;
+    const int fH = (fieldScale_ > 1) ? fh_ : h_;
+    const GLsizeiptr accBytes = (GLsizeiptr)((size_t)fW * fH * 3 * sizeof(GLuint));
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, scanSSBO_);
+    glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, 0, accBytes, GL_RED_INTEGER,
+                         GL_UNSIGNED_INT, nullptr);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, scanSSBO_);
+
+    if (!dirPassSSBO_) {
+        glGenBuffers(1, &dirPassSSBO_);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, dirPassSSBO_);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(65535u * 2u * sizeof(GLint)), nullptr,
+                     GL_DYNAMIC_DRAW);
+    }
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, colStateSSBO_);
+
+    glUseProgram(tileProg_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, canvasArray_);
+    glUniform1i(uCol_.cc, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, matArray_);
+    glUniform1i(uCol_.mat, 1);
+    glUniform2i(uCol_.cs, w_, h_);
+    glUniform3fv(uCol_.ambient, 1, st_.ambient);
+    glUniform1f(uCol_.cp, st_.propagate);
+    glUniform1f(uCol_.emitScale, st_.emitScale);
+    glUniform1i(uCol_.layer, layer);
+    glUniform1i(uCol_.T, T);
+    glUniform1i(uCol_.rays, rays);
+    glUniform1f(uCol_.invN, invN);
+    const int G = dirGroup_;
+    glUniform1i(uCol_.group, G);
+
+    // 2) x 主方向：两趟（sx>0 左->右，sx<0 右->左），每趟按列波前
+    for (int pass = 0; pass < 2; pass++) {
+        const std::vector<GLint>& list = (pass == 0) ? dirsXPos_ : dirsXNeg_;
+        const int n = (int)(list.size() / 2);
+        if (n <= 0) continue;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, dirPassSSBO_);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(list.size() * sizeof(GLint)),
+                        list.data());
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, dirPassSSBO_);
+        glUniform1i(uCol_.dirCount, n);
+        glUniform1i(uCol_.sign, (pass == 0) ? 1 : -1);
+        const int groups = (n + G - 1) / G;
+        for (int c = 0; c < tilesX; c++) {
+            glUniform1i(uCol_.col, c);
+            glDispatchCompute((GLuint)nBlocks, (GLuint)groups, 1);
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        }
+    }
+
+    // 3) y 主方向：主内核只跑这一类（归一化仍是 1/D_total）
+    // 3) y 主方向：转置内核（按行波前），sy>0 / sy<0 两趟
+    if (rowProg_ && (dirsYPos_.size() > 0 || dirsYNeg_.size() > 0) &&
+        !getenv("PB_NO_YMAJOR")) {
+        if (!rowPhaseSSBO_) {
+            glGenBuffers(1, &rowPhaseSSBO_);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, rowPhaseSSBO_);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(65535u * 2u * sizeof(GLint)),
+                         nullptr, GL_DYNAMIC_DRAW);
+        }
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, rowPhaseSSBO_);
+        glUseProgram(rowProg_);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, canvasArray_);
+        glUniform1i(uRow_.cc, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, matArray_);
+        glUniform1i(uRow_.mat, 1);
+        glUniform2i(uRow_.cs, w_, h_);
+        glUniform3fv(uRow_.ambient, 1, st_.ambient);
+        glUniform1f(uRow_.cp, st_.propagate);
+        glUniform1f(uRow_.emitScale, st_.emitScale);
+        glUniform1i(uRow_.layer, layer);
+        const int TR = std::clamp(tileTRow_, 8, 32);
+        const int GY = std::max(1, dirGroupY_);
+        glUniform1i(uRow_.T, TR);
+        glUniform1i(uRow_.rays, ((2 * w_ + 1 + 255) / 256) * 256);   // y 主方向是 2W+1 条
+        glUniform1f(uRow_.invN, invN);
+        glUniform1i(uRow_.group, GY);
+        const int nBlocksX = (w_ + T - 1) / T + 2;
+        const int bandsY = (h_ + TR - 1) / TR;
+        for (int pass = 0; pass < 2; pass++) {
+            const std::vector<GLint>& list = (pass == 0) ? dirsYPos_ : dirsYNeg_;
+            const int n = (int)(list.size() / 2);
+            if (n <= 0) continue;
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, dirPassSSBO_);
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                            (GLsizeiptr)(list.size() * sizeof(GLint)), list.data());
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, dirPassSSBO_);
+            glUniform1i(uRow_.dirCount, n);
+            glUniform1i(uRow_.sign, (pass == 0) ? 1 : -1);
+            const int groups = (n + GY - 1) / GY;
+            for (int b = 0; b < bandsY; b++) {
+                glUniform1i(uRow_.row, b);
+                glDispatchCompute((GLuint)nBlocksX, (GLuint)groups, 1);
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            }
+        }
+    } else if (dirCountY_ > 0 && !getenv("PB_NO_YMAJOR")) {
+        const int ndirs = (dirLimit_ > 0 && dirLimit_ < dirCount_) ? dirLimit_ : dirCount_;
+        glUseProgram(scanProg_);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, canvasArray_);
+        glUniform1i(uScan_.cc, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, matArray_);
+        glUniform1i(uScan_.mat, 1);
+        glUniform2i(uScan_.cs, w_, h_);
+        glUniform3fv(uScan_.ambient, 1, st_.ambient);
+        glUniform1i(uScan_.ndirs, ndirs);
+        glUniform1f(uScan_.cp, st_.propagate);
+        glUniform1f(uScan_.emitScale, st_.emitScale);
+        glUniform1i(uScan_.layer, layer);
+        glUniform1i(uScan_.band, 0);
+        glUniform1i(uScan_.bandn, dirCount_);   // 归一化按 D_total
+        glUniform1i(uScan_.contig, 0);
+        glUniform1i(uScan_.noWrite, 0);
+        glUniform1i(uScan_.pack, 0);
+        glUniform1i(uScan_.major, 2);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, scanSSBO_);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, dirSSBO_);
+        const int chunks = (2 * std::max(w_, h_) + 1 + 255) / 256;
+        glDispatchCompute((GLuint)chunks, 1, (GLuint)ndirs);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        glUniform1i(uScan_.major, 0);           // 复位，别污染别的路径
+    }
+
+    // 4) SSBO -> scanTex_ -> 合成（与主路径相同）
+    glUseProgram(copyProg_);
+    glUniform2i(uCopy_.cs, fW, fH);
+    glUniform1i(uCopy_.pack, 0);
+    glBindImageTexture(0, scanTex_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glDispatchCompute((GLuint)((fW + 7) / 8), (GLuint)((fH + 7) / 8), 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    blendLayer(layer);
+    glUseProgram(0);
+}
+
 void LightSweep::renderLayer(int layer) {
     if (!valid() || layer < 0 || layer >= layers_) return;
     ensureDirectionTable();
     if (dirCount_ <= 0) return;
     if (progressive_) { renderLayerProgressive(layer); return; }
+    // 分块路径：x 主方向走列波前 + shared 合并，y 主方向仍走主内核。
+    // 两条路径写的是同一套整数定点值，所以结果逐位相同。
+    ensureFieldTextures();
+    if (autotunePending_ && layer == 0) autotune(layer);
+    if (tiledScan_ && tileProg_ && colStateSSBO_ && fieldScale_ <= 1) {
+        renderLayerTiled(layer);
+        return;
+    }
 
     // --- 1. 在 GPU 端清零累积缓冲（省掉每帧 CPU->GPU 上传） ---
-    const GLsizeiptr accBytes = (GLsizeiptr)((size_t)w_ * h_ * 3 * sizeof(GLuint));
+    // 光场降采样：SSBO 只需覆盖 (fw_,fh_)，扫描成本按 1/s^2 下降
+    downsampleField(layer);
+    const int fW = (fieldScale_ > 1) ? fw_ : w_;
+    const int fH = (fieldScale_ > 1) ? fh_ : h_;
+    const GLsizeiptr accBytes = (GLsizeiptr)((size_t)fW * fH * 3 * sizeof(GLuint));
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, scanSSBO_);
     glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, 0, accBytes, GL_RED_INTEGER,
                          GL_UNSIGNED_INT, nullptr);
@@ -823,14 +1928,19 @@ void LightSweep::renderLayer(int layer) {
     // --- 2. 一次 dispatch 覆盖所有方向（z 维 = 方向索引） ---
     // 诊断用的并行度上限：只跑前 n 个方向。射线长度不变，只有并行度变了。
     const int ndirs = (dirLimit_ > 0 && dirLimit_ < dirCount_) ? dirLimit_ : dirCount_;
-    glUseProgram(scanProg_);
+    // pack=3 = 64 位原子（21/21/21）。着色器没编出来（驱动不支持）就退回 2 原子路径。
+    const bool useU64 = (atomicPack_ == 3 && scanProgU64_ != 0 && copyProgU64_ != 0);
+    const int effPack = useU64 ? 3 : std::min(atomicPack_, 2);
+    glUseProgram(useU64 ? scanProgU64_ : scanProg_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D_ARRAY, canvasArray_);
     glUniform1i(uScan_.cc, 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D_ARRAY, matArray_);
     glUniform1i(uScan_.mat, 1);
-    glUniform2i(uScan_.cs, w_, h_);
+    glUniform2i(uScan_.cs, w_, h_);   // 射线是全分辨率
+    glUniform1i(uScan_.s, (fieldScale_ > 1) ? fieldScale_ : 1);
+    glUniform2i(uScan_.fcs, fW, fH);
     glUniform3fv(uScan_.ambient, 1, st_.ambient);
     glUniform1i(uScan_.ndirs, ndirs);
     glUniform1f(uScan_.cp, st_.propagate);
@@ -856,11 +1966,14 @@ void LightSweep::renderLayer(int layer) {
     glUniform1i(uScan_.band, dirBand_);
     glUniform1i(uScan_.bandn, bandn);
     glUniform1i(uScan_.contig, contiguousFetch_ ? 1 : 0);
+    glUniform1i(uScan_.noWrite, scanNoWrite_ ? 1 : 0);
+    glUniform1i(uScan_.pack, effPack);
+    glUniform1i(uScan_.major, 0);
 
     // 需要的射线数上限（与 kernel 里 rc 的定义一致）：
     //   dx>=dy 时射线横向走 -> 2*H+1 条；否则纵向走 -> 2*W+1 条。
     // 旧实现直接用了 2*max(W,H)+1（对两种情形都够大），这里保持一致。
-    const int chunks = (2 * std::max(w_, h_) + 1 + 255) / 256;
+    const int chunks = (2 * std::max(fW, fH) + 1 + 255) / 256;
 
     // --- 扩散路径（第二版：单次 dispatch + 全局暂存）---
     //
@@ -877,11 +1990,13 @@ void LightSweep::renderLayer(int layer) {
     diffuse_ = st_.diffusion;
     diffuseStep_ = st_.diffusionStep;
 
-    if (diffuseEnable_ && diffuse_ > 0.0f) {
+    // 光场降采样时先关掉扩散：细趟用的是普通扫描内核，两条路径混在一起会在块边界
+    // 出现明显接缝（实测块状台阶）。关掉扩散后粗/细两趟口径一致。
+    if (diffuseEnable_ && diffuse_ > 0.0f && fieldScale_ <= 1) {
         glUseProgram(scanDiffProg_);
         glUniform1i(uScan_.cc_d, 0);
         glUniform1i(uScan_.mat_d, 1);
-        glUniform2i(uScan_.cs_d, w_, h_);
+        glUniform2i(uScan_.cs_d, fW, fH);   // 必须与降采样后的光场一致
         glUniform3fv(uScan_.ambient_d, 1, st_.ambient);
         glUniform1i(uScan_.ndirs_d, ndirs);
         glUniform1f(uScan_.cp_d, st_.propagate);
@@ -916,8 +2031,9 @@ void LightSweep::renderLayer(int layer) {
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
     // --- 3. SSBO -> RGBA16F ---
-    glUseProgram(copyProg_);
+    glUseProgram(useU64 ? copyProgU64_ : copyProg_);
     glUniform2i(uCopy_.cs, w_, h_);
+    glUniform1i(uCopy_.pack, effPack);
     glBindImageTexture(0, scanTex_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
     glDispatchCompute((GLuint)((w_ + 7) / 8), (GLuint)((h_ + 7) / 8), 1);
     // copy 写的是 image2D，下一步 blend 用 texelFetch 读它 —— 只需要 image 写可见，
@@ -931,6 +2047,66 @@ void LightSweep::renderLayer(int layer) {
     // 所以那是纯粹的显存带宽浪费（5 层 320x180 约 1.2 MB/帧，2048² 时 168 MB/帧），
     // 已经连同 fieldArray_ 一起删除。见 light_sweep.h 的说明。
 
+    // --- 细趟：全分辨率扫描，但只在"细化块"内取样与沉积 ---
+    //
+    // 粗趟用块平均覆盖率表示遮挡，薄墙会把光挡得太狠（实测整幅暗 30%）。
+    // 这一趟按掩码筛一遍：命中的块按 1px 精度重算，未命中的块连取样都跳过，
+    // 代价 ≈ 细化块占比（实测 neon-rain 4.6% 边缘块 + 3.6% 光源块）。
+    // 只有 Adaptive 档才跑细趟（Coarse 档就是纯粗光场，Exact 档连粗光场都没有）。
+    if (refine_ && fieldMask_ && fineField_) {
+        const GLsizeiptr fullBytes = (GLsizeiptr)((size_t)w_ * h_ * 3 * sizeof(GLuint));
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, scanSSBO_);
+        glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, 0, fullBytes, GL_RED_INTEGER,
+                             GL_UNSIGNED_INT, nullptr);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, scanSSBO_);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, dirSSBO_);
+
+        glUseProgram(useU64 ? scanProgU64_ : scanProg_);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, canvasArray_);
+        glUniform1i(uScan_.cc, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, matArray_);
+        glUniform1i(uScan_.mat, 1);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, fieldMask_);
+        glUniform1i(glGetUniformLocation(useU64 ? scanProgU64_ : scanProg_, "u_mask"), 2);
+        glUniform1i(glGetUniformLocation(useU64 ? scanProgU64_ : scanProg_, "u_maskOn"), 1);
+        glUniform1i(glGetUniformLocation(useU64 ? scanProgU64_ : scanProg_, "u_ms"), fieldScale_);
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, fieldCanvas_);
+        glUniform1i(glGetUniformLocation(useU64 ? scanProgU64_ : scanProg_, "u_ccd"), 5);
+        glActiveTexture(GL_TEXTURE6);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, fieldMat_);
+        glUniform1i(glGetUniformLocation(useU64 ? scanProgU64_ : scanProg_, "u_matd"), 6);
+        glUniform1i(glGetUniformLocation(useU64 ? scanProgU64_ : scanProg_, "u_bs"), fieldScale_);
+        glUniform2i(uScan_.cs, w_, h_);
+        glUniform1i(uScan_.s, 1);
+        glUniform2i(uScan_.fcs, w_, h_);
+        glUniform3fv(uScan_.ambient, 1, st_.ambient);
+        glUniform1i(uScan_.ndirs, ndirs);
+        glUniform1f(uScan_.cp, st_.propagate);
+        glUniform1f(uScan_.emitScale, st_.emitScale);
+        glUniform1i(uScan_.layer, layer);
+        glUniform1i(uScan_.pack, effPack);
+        glUniform1i(uScan_.major, 0);
+        glUniform1i(uScan_.band, dirBand_);
+        glUniform1i(uScan_.bandn, bandn);
+        const int fullChunks = (2 * std::max(w_, h_) + 1 + 255) / 256;
+        const int chunkBytesF = sizeof(GLuint) * 2 * 256 * 3;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, scanSSBO_);
+        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 2, scanSSBO_, 0,
+                          (GLsizeiptr)fullChunks * chunkBytesF);
+        glDispatchCompute((GLuint)fullChunks, 1, (GLuint)ndirs);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glUseProgram(copyProg_);
+        glUniform2i(uCopy_.cs, w_, h_);
+        glUniform1i(uCopy_.pack, 0);
+        glBindImageTexture(0, fineField_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+        glDispatchCompute((GLuint)((w_ + 7) / 8), (GLuint)((h_ + 7) / 8), 1);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    }
     // --- 4. 合成这一层，写进结果数组纹理的第 layer 层 ---
     blendLayer(layer);
 
@@ -950,6 +2126,16 @@ void LightSweep::blendLayer(int layer) {
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D_ARRAY, matArray_);
     glUniform1i(uBlend_.mat, 2);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, fineField_ ? fineField_ : scanTex_);
+    glUniform1i(glGetUniformLocation(blendProg_, "u_fine"), 3);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, fieldMask_ ? fieldMask_ : canvasArray_);
+    glUniform1i(glGetUniformLocation(blendProg_, "u_mask"), 4);
+    const bool haveRefine = (refine_ && fieldMask_ && fineField_);
+    glUniform1i(glGetUniformLocation(blendProg_, "u_maskOn"), haveRefine ? 1 : 0);
+    glUniform1i(glGetUniformLocation(blendProg_, "u_exact"), fieldScale_ == 1 ? 1 : 0);
+    glUniform1i(glGetUniformLocation(blendProg_, "u_ms"), fieldScale_);
     glUniform2i(uBlend_.cs, w_, h_);
     glUniform1f(uBlend_.emitScale, st_.emitScale);
     glUniform1i(uBlend_.layer, layer);

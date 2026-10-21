@@ -94,14 +94,17 @@ public:
     void canvasToViewUV(double cx, double cy, double& u, double& v) const;
 
     // 把纹理画进绘制矩形（带 scissor，不会溢出到 UI 面板上）
-    void draw(GLuint texture);
+    // flipY：把纹理上下翻转后再画。基准场景（scenes/bench_scene）是按"y=0 在顶部"写的，
+    // 而本视口的画布坐标约定是 y 向上（screenToCanvasF 用 1-v），两者朝向相反，
+    // 不翻转就会让同一个场景在 paintboard 与 bench_view 里一个正一个倒。
+    void draw(GLuint texture, bool flipY = false);
 
     // 矩形的逻辑坐标 -> 帧缓冲像素
     void viewRectToFramebuffer(double& fx, double& fy, double& fw, double& fh) const;
 
 private:
     GLuint prog_ = 0, vao_ = 0, vbo_ = 0;
-    GLint uTex_ = -1, uCenter_ = -1, uViewUV_ = -1;
+    GLint uTex_ = -1, uCenter_ = -1, uViewUV_ = -1, uFlipY_ = -1;
     int cw_ = 1, ch_ = 1;
     Camera cam_;
     FitMode fit_ = FitMode::Contain;

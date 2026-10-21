@@ -196,20 +196,25 @@ function Invoke-Compile {
 # ---------------------------------------------------------------------------
 # source sets
 # ---------------------------------------------------------------------------
-$libSources = @()
-$libSources += @(Get-ChildItem -Path (Join-Path $root 'core') -Filter '*.cpp' | ForEach-Object { $_.FullName })
-$libSources += @(Get-ChildItem -Path (Join-Path $root 'gfx')  -Filter '*.cpp' | ForEach-Object { $_.FullName })
-$libSources += @(Get-ChildItem -Path (Join-Path $root 'ui')   -Filter '*.cpp' | ForEach-Object { $_.FullName })
-# app/bench_scene.cpp only depends on Document (not on App), but TWO executables
-# need it: paintboard's --bench-scene, and tools/bench_view. So it belongs to the
-# shared library objects, not to the app-only objects -- otherwise bench_view
-# fails to link.
-$libSources += @(Join-Path $root 'app\bench_scene.cpp')
-# app/light_settings_io.cpp only depends on core/paths + gfx/light_sweep (not on
-# App), so it also goes into the shared objects -- tools that load lighting
-# settings (e.g. dir_probe) can use it without pulling in the whole app.
-$libSources += @(Join-Path $root 'app\light_settings_io.cpp')
-if ($libSources.Count -eq 0) { Write-Error "no library sources found"; exit 1 }
+# ---------------------------------------------------------------------------
+# 三个静态库 + 前端
+#
+#   libpb_render.a   core/ + gfx/      渲染器本体：不依赖 app/ui/ImGui
+#   libpb_scenes.a   scenes/           示例内容（bench 场景）
+#   libpb_ui.a       ui/ + Dear ImGui  前端控件
+#
+# 前端（paintboard）与工具（bench_view / render_cli / ...）只链接这三个库，
+# 不再共享零散的 .o —— **库边界就是依赖边界**：哪天 gfx 里偷偷 include 了
+# app/ 的头，链接期就会缺符号，而不是靠人盯。
+# ---------------------------------------------------------------------------
+$renderSources = @()
+$renderSources += @(Get-ChildItem -Path (Join-Path $root 'core') -Filter '*.cpp' | ForEach-Object { $_.FullName })
+$renderSources += @(Get-ChildItem -Path (Join-Path $root 'gfx')  -Filter '*.cpp' | ForEach-Object { $_.FullName })
+$sceneSources = @(Get-ChildItem -Path (Join-Path $root 'scenes') -Filter '*.cpp' -ErrorAction SilentlyContinue |
+                  ForEach-Object { $_.FullName })
+$uiSources = @(Get-ChildItem -Path (Join-Path $root 'ui') -Filter '*.cpp' | ForEach-Object { $_.FullName })
+if ($renderSources.Count -eq 0) { Write-Error "no renderer sources found"; exit 1 }
+
 # Dear ImGui is compiled as its own set of translation units with -w: it is
 # upstream code we do not modify, and its warnings would drown out ours.
 $imguiSources = @(
@@ -231,59 +236,79 @@ $buildCli = -not $App
 if (-not $App -and -not $Cli) { $buildApp = $true; $buildCli = $true }
 
 $t0 = Get-Date
+$ar = Join-Path $gxxDir 'ar.exe'
+if (-not (Test-Path -LiteralPath $ar)) { $ar = 'ar' }
 
-Write-Host "[1/3] compiling core + gfx + ui ($($libSources.Count) files)"
-$libObjs = @()
-foreach ($s in $libSources) { $libObjs += (Invoke-Compile $s) }
+function New-StaticLib($name, $objs) {
+    if ($objs.Count -eq 0) { return $null }
+    $lib = Join-Path $buildDir ($name + '.a')
+    if (Test-Path -LiteralPath $lib) { Remove-Item -LiteralPath $lib -Force }
+    $code = Invoke-Tool -Exe $ar -ToolArgs (@('rcs', $lib) + $objs)
+    if ($code -ne 0) { throw "ar failed: $name" }
+    Write-Host ("  AR   " + $lib)
+    return $lib
+}
 
-Write-Host "      compiling vendored Dear ImGui ($($imguiSources.Count) files)"
-foreach ($s in $imguiSources) { $libObjs += (Invoke-Compile $s @('-w')) }
+Write-Host "[1/4] renderer (core + gfx): $($renderSources.Count) files"
+$renderObjs = @()
+foreach ($s in $renderSources) { $renderObjs += (Invoke-Compile $s) }
+$renderLib = New-StaticLib 'libpb_render' $renderObjs
+
+$sceneLib = $null
+if ($sceneSources.Count -gt 0) {
+    Write-Host "[2/4] scenes: $($sceneSources.Count) files"
+    $sceneObjs = @()
+    foreach ($s in $sceneSources) { $sceneObjs += (Invoke-Compile $s) }
+    $sceneLib = New-StaticLib 'libpb_scenes' $sceneObjs
+} else {
+    Write-Host "[2/4] scenes: none"
+}
+
+Write-Host "[3/4] ui + Dear ImGui: $($uiSources.Count + $imguiSources.Count) files"
+$uiObjs = @()
+foreach ($s in $uiSources) { $uiObjs += (Invoke-Compile $s) }
+foreach ($s in $imguiSources) { $uiObjs += (Invoke-Compile $s @('-w')) }
+$uiLib = New-StaticLib 'libpb_ui' $uiObjs
+
+# 链接顺序：前端对象 -> ui -> scenes -> render（被依赖的库放后面）
+$libLinkFlags = @()
+if ($uiLib) { $libLinkFlags += $uiLib }
+if ($sceneLib) { $libLinkFlags += $sceneLib }
+$libLinkFlags += $renderLib
 
 if ($buildApp) {
-    Write-Host "[2/3] building app"
-    # bench_scene.cpp and light_settings_io.cpp are already compiled via
-    # $libSources; exclude them here or the same TU gets linked twice and the
-    # link reports "multiple definition of ...".  (Adding light_settings_io.cpp
-    # to $libSources without updating this filter is exactly how that happened.)
+    Write-Host "[4/4] link app"
     $appSources = @(Get-ChildItem -Path (Join-Path $root 'app') -Filter '*.cpp' |
-                    Where-Object { $_.Name -ne 'bench_scene.cpp' -and
-                                   $_.Name -ne 'light_settings_io.cpp' } |
                     Sort-Object Name | ForEach-Object { $_.FullName })
     $appObjs = @()
     foreach ($s in $appSources) { $appObjs += (Invoke-Compile $s) }
     $exe = Join-Path $buildDir 'paintboard.exe'
-    # Build the argument list explicitly. Writing `@($libObjs + $appObjs, '-o', $exe)`
-    # creates a NESTED array, and PowerShell splats a nested element as a single
-    # space-joined argument -- ld then reports "cannot find a.o b.o c.o".
+    # 参数列表必须显式拼：`@($libObjs + $appObjs, '-o', $exe)` 会变成嵌套数组，
+    # PowerShell 把它当一个空格分隔的参数传给 ld，报 "cannot find a.o b.o"。
     $linkArgs = @()
-    $linkArgs += $libObjs
     $linkArgs += $appObjs
+    $linkArgs += $libLinkFlags
     $linkArgs += @('-o', $exe)
     $linkArgs += $linkFlags
     $code = Invoke-Tool -Exe $gxx -ToolArgs $linkArgs
     if ($code -ne 0) { throw "link failed: paintboard.exe" }
     Write-Host ("  LINK " + $exe)
 } else {
-    Write-Host "[2/3] app skipped"
+    Write-Host "[4/4] app skipped"
 }
 
 if ($buildCli) {
     # every tools/*.cpp becomes its own executable (offline renderer, core tests, ...)
     $toolSources = @(Get-ChildItem -Path (Join-Path $root 'tools') -Filter '*.cpp' |
                      Sort-Object Name | ForEach-Object { $_.FullName })
-    Write-Host "[3/3] building tools ($($toolSources.Count))"
-    # app\main.cpp defines its own main(), so it must NOT be linked into a tool
-    # that has its own main() -- the linker reports "multiple definition of main".
-    # (bench_view.cpp and render_cli.cpp both bring their own main.)
-    # Dropping app_main.o is safe: no tool references paintboard's entry point.
-    $toolLibs = @($libObjs | Where-Object { [System.IO.Path]::GetFileName($_) -ne 'app_main.o' })
+    Write-Host ("      building tools ($($toolSources.Count))")
     foreach ($t in $toolSources) {
         $obj = Invoke-Compile $t
         $name = [System.IO.Path]::GetFileNameWithoutExtension($t)
         $exe = Join-Path $buildDir ($name + '.exe')
         $linkArgs = @()
-        $linkArgs += $toolLibs
         $linkArgs += $obj
+        $linkArgs += $libLinkFlags
         $linkArgs += @('-o', $exe)
         $linkArgs += $linkFlags
         $code = Invoke-Tool -Exe $gxx -ToolArgs $linkArgs
@@ -291,9 +316,8 @@ if ($buildCli) {
         Write-Host ("  LINK " + $exe)
     }
 } else {
-    Write-Host "[3/3] tools skipped"
+    Write-Host "      tools skipped"
 }
-
 # --- 把运行期资源复制到 build\ 旁边 ---
 #
 # 为什么必须做这一步：UI 字体是在**运行时**从磁盘读的（core/paths.cpp 的

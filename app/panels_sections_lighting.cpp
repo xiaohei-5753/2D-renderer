@@ -106,8 +106,37 @@ void drawLightingSection(App& a) {
             s.rayRadius = r;
             actLightSettingsChanged(a);
         }
+        // 光场降采样：光照低频 -> 只在 1/s 分辨率上算光场，合成时双线性放大。
+        // albedo / 自发光保持全分辨率，所以 1px 霓虹不会被糊掉（实测最大差 7 级、
+        // 平均差 <0.1 级；5 层 R=64 的耗时 4.08 ms -> 0.53 ms）。
+        {
+            static const char* kFieldLabels[4] = {"光场降采样：关（1×）", "光场降采样：2×（约 2.5×）",
+                                                  "光场降采样：3×", "光场降采样：4×（约 7.7×）"};
+            int fs = std::clamp(a.fieldScale, 1, 4);
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##fieldscale", &fs, kFieldLabels, 4)) {
+                a.fieldScale = fs;
+                actLightSettingsChanged(a);
+            }
+        }
+        if (ImGui::Checkbox("分块合并扫描（实验：x 主方向走 shared 合并）", &a.tiledScan))
+            actLightSettingsChanged(a);
         ImGui::TextDisabled("当前 %d 个方向（半径越大越平滑、越慢）",
                             a.sweep->directionCount());
+
+        // 每像素原子加次数：占整帧耗时的 83%（见 BENCHMARK.md），这里给个开关。
+        // 2 次与 3 次的结果差 ≤2 级（不可见）；1 次是 10/10/10，亮部会有色带。
+        {
+            static const char* kPackLabels[3] = {"3 次（默认，最精确）", "2 次（R|G 打包，快 1.5×）",
+                                                 "1 次（10/10/10，快 2.6×，有色带）"};
+            int pk = a.sweep->atomicPack();
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##pack", &pk, kPackLabels, 3)) {
+                a.sweep->setAtomicPack(pk);
+                actLightSettingsChanged(a);
+            }
+            ImGui::TextDisabled("写入打包：占整帧 83%%，2 次档肉眼无差");
+        }
 
         // ------------------------------------------------------------------
         // 画质档位：一次把"半径 + 扩散"配对设好

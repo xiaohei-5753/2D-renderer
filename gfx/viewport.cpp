@@ -15,10 +15,11 @@ out vec2 vU;
 void main(){gl_Position=vec4(aP,0,1);vU=aU;})";
 
 static const char* kFrag = R"(#version 330 core
-uniform sampler2D u_t;uniform vec2 u_cp;uniform vec2 u_uv;
+uniform sampler2D u_t;uniform vec2 u_cp;uniform vec2 u_uv;uniform float u_flipY;
 in vec2 vU;out vec4 oC;
 void main(){
-  vec2 ab=u_uv*(vU-0.5)+u_cp;
+  vec2 vv=mix(vU, vec2(vU.x, 1.0-vU.y), u_flipY);
+  vec2 ab=u_uv*(vv-0.5)+u_cp;
   // 画布以外的像素直接丢弃，露出 glClear 填的**纯黑**背景
   // （缩得比面板小的时候，四周留边就是这块）。
   // 不丢弃的话，纹理是 GL_REPEAT/CLAMP 采样，边缘会被拉伸成一圈假像素。
@@ -36,6 +37,7 @@ bool Viewport::init() {
     uTex_ = glGetUniformLocation(prog_, "u_t");
     uCenter_ = glGetUniformLocation(prog_, "u_cp");
     uViewUV_ = glGetUniformLocation(prog_, "u_uv");
+    uFlipY_ = glGetUniformLocation(prog_, "u_flipY");
 
     // 一个覆盖整个裁剪空间的大三角形（比两个三角形少一次光栅化接缝）
     const float verts[] = {
@@ -63,7 +65,7 @@ void Viewport::shutdown() {
     if (vao_) glDeleteVertexArrays(1, &vao_);
     if (prog_) glDeleteProgram(prog_);
     vbo_ = vao_ = prog_ = 0;
-    uTex_ = uCenter_ = uViewUV_ = -1;
+    uTex_ = uCenter_ = uViewUV_ = uFlipY_ = -1;
 }
 
 void Viewport::setCanvasSize(int w, int h) {
@@ -159,7 +161,7 @@ void Viewport::viewRectToFramebuffer(double& fx, double& fy, double& fw, double&
     fh = vh_ * fbScale_;
 }
 
-void Viewport::draw(GLuint texture) {
+void Viewport::draw(GLuint texture, bool flipY) {
     if (!prog_ || !viewRectValid() || fbHeight_ <= 0) return;
 
     double fx = 0.0, fy = 0.0, fw = 0.0, fh = 0.0;
@@ -192,6 +194,7 @@ void Viewport::draw(GLuint texture) {
     glUniform1i(uTex_, 0);
     glUniform2f(uCenter_, (float)cam_.x, (float)cam_.y);
     glUniform2f(uViewUV_, du, dv);
+    glUniform1f(uFlipY_, flipY ? 1.0f : 0.0f);
 
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);

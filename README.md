@@ -10,62 +10,28 @@
 
 ## 模块结构
 
+> 模块边界、三个静态库、画质档位的说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 > **实机性能基准见 [BENCHMARK.md](BENCHMARK.md)** —— 固定场景 + 各设备记录表。
 
+渲染器是**独立库**：`libpb_render.a` = `core/` + `gfx/`，不依赖画板前端。
+
 ```
-core/    纯 C++，零 OpenGL / 零 GLFW —— 可 headless 测试，游戏侧复用
-  types.h        RGBA8 / Rect / CoordI 等基础类型
-  material.h     每像素光学属性：自发光(独立 RGB) / 折射率（4 字节；已删冗余的实心标志）
-  image.{h,cpp}  RGBA8 图像缓冲 + PNG 导出（stb_image_write）
-  layer.{h,cpp}  **图层**（可绘制表面：albedo + 材质 + 脏矩形 + 绘制原语）与**文档**（图层栈）
-  canvas.{h,cpp} 压平用的合成表面（独立于图层，用作无 GPU 的单层绘制/测试载体）
-  composite.{h,cpp} 图层压平（source-over），导出 PNG 用
-  palette.{h,cpp} 调色板：内置标准色板 + 自定义色
-  history.{h,cpp} 撤销/重做：图层感知的补丁栈（改前 + 改后，行为对称）
-  tool.{h,cpp}   绘图工具：铅笔/直线/矩形/椭圆/油漆桶/抖动/橡皮/取色/加光/减光
-  console.h      Windows 控制台 UTF-8 设置
-gfx/     OpenGL，但 GLFW-agnostic —— 这就是游戏要复用的渲染库
-  gl_common.h    统一 GLEW 包含（GLEW_STATIC 必须先行定义）
-  gl_context.{h,cpp}  窗口/上下文（离线渲染用隐藏窗口）
-  shader.{h,cpp}      着色器编译链接 + 错误上报
-  gl_texture.{h,cpp}  纹理分配 + 脏矩形上传 + 回读
-  gl_timer.{h,cpp}    GPU 侧计时（TIME_ELAPSED 查询，不阻塞管线）
-  material_pack.h     材质 -> 纹理的打包格式（4 float/像素）
-  light_sweep.{h,cpp} 方向扫描式全局光照（实时，唯一的照明模式）
-  denoise.{h,cpp}    渐进哈希采样的 à-trous 联合双边去噪
-  layer_composite.{h,cpp} 逐层光场合成（上层的光场乘到下层颜色上）
-  viewport.{h,cpp}    相机、适配模式、显示到指定矩形、屏幕↔画布坐标换算
-ui/      通用 ImGui 管线（**不认识画板**）
-  ui_context.{h,cpp}  ImGui 生命周期、字体（unifont + 全量中文）、像素风主题、DPI
-  widgets.{h,cpp}     可拖拽分隔条、色块、工具按钮、状态点、带独立标签的滑块
-app/     画板应用本体
-  app.h           统一的 App 状态结构（面板直接读写它）
-  main.cpp        入口 + 主循环（每帧的顺序见文件头注释）
-  panels.h        面板与动作的对外接口（各文件的划分见文件头）
-  panels_internal.h  仅面板实现之间共享的状态（分区折叠 / 标题栏捕获）
-  panels_state.cpp   上述状态的实现 + setUiSections / 自动点击钩子
-  panels_actions.cpp 菜单 / 快捷键 / 面板按钮共用的**动作**
-  panels_canvas.cpp  工作区三栏 + 左栏工具栏 + 中栏画布与叠加层
-  panels_menu.cpp    顶部主菜单栏 + 底部状态栏
-  panels_dialogs.cpp 三个模态对话框 + 字体缺失警告
-  panels_properties.cpp 右栏属性面板（提交四个可折叠分区）
-  panels_sections_*.cpp 调色板 / 材质 / 光照三个分区的内容
-  layer_panel.cpp 图层面板：缩略图缓存 / 眼睛 / 锁定 / 拖拽排序 / 增删移并
-  layer_actions.cpp 图层动作（菜单、快捷键、面板三个入口共用同一套实现）
-  input.{h,cpp}   GLFW 回调 + 键盘快捷键
-  lighting.cpp    逐层光照的编排（只重算脏层）
-tools/   每个 .cpp 编译成一个独立可执行文件
-  common.h       三个诊断程序**确实重复**的那点样板（隐藏窗口上下文 / 尺寸解析 / 亮度统计）
-  render_cli.cpp 离线渲染器（出 PNG，渲染效果的验证回路 + 游戏侧素材烘焙）
-  core_test.cpp  core 层的 headless 测试（317 项断言）
-  png_stat.cpp / scan_dump.cpp / comp_test.cpp  图像与合成的诊断工具
-third_party/  Dear ImGui v1.92.9b + stb_image_write（源码内置，见其 README）
-_attic/  改造前的原始代码与实验残骸，不参与编译（被 gitignore）
-unifont-17.0.04.otf  UI 字体（中文界面用）
+core/    数据模型（纯 C++，零 OpenGL）—— 库的一部分
+          types / material / image / layer / document / canvas / composite
+          palette / history / tool / project / paths / console
+gfx/     渲染器（OpenGL，GLFW-agnostic）—— 库的一部分，公开入口 gfx/renderer.h
+          gl_common / gl_context / shader / gl_texture / gl_timer
+          material_pack / light_sweep / denoise / layer_composite / viewport
+          light_settings_io（光照设置读写）
+scenes/  示例内容：bench 场景（按 Document 作图，确定性动画）
+          bench_scene（neon-city / neon-rain / lantern-fog / ...）
+ui/      通用 ImGui 管线（不认识画板）：ui_context / widgets
+app/     画板前端：main / panels_* / app.h / input / layer_*
+tools/   独立工具：render_cli / bench_view / perf_probe / png_stat / *_test ...
 ```
 
-**边界约束**：`core` 不 include GL，`gfx` 不 include GLFW（宿主提供上下文和尺寸）。
-游戏侧只需 link `core` + `gfx`，自己驱动主循环。
+构建产物：`build/libpb_render.a`、`build/libpb_scenes.a`、`build/libpb_ui.a`，
+加 `paintboard.exe`，以及 `tools/` 下每个工具一个 exe。
 
 ## 构建
 

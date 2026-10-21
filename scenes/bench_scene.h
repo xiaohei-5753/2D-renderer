@@ -1,4 +1,4 @@
-// app/bench_scene.h — 实时性能基准 / 渲染器视觉测试集
+// scenes/bench_scene.h — 实时性能基准 / 渲染器视觉测试集
 //
 // ## 设计目标（两件事同时成立）
 //
@@ -38,6 +38,7 @@ enum class SceneId {
     LanternFog,    // 垂直光路：光要穿过上方多层半透明雾
     StainedGlass,  // 半透明染色 + 硬阴影 + 彩色光互染
     Chromatic,     // 自发光与 albedo 解耦（"暗表面发绿光"）
+    NeonRain,      // 雨夜霓虹街景：长焦平面构图 / 5 层 / 实时动画（性能 + 审美）
     GridLab,       // 定量诊断：点/线/网格/方块（dir_probe 专用，静止）
     Legacy,        // 旧的 5 层动画基准（保持历史数字可复现）
     LowEnd,        // 低配档：单层 + R=32 + 扩散 w=0.1/K=8（集显可玩）

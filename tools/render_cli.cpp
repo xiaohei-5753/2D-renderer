@@ -44,6 +44,9 @@ struct Options {
     // 渐进哈希采样（扫描 GI 的可选路径）：每帧每像素采一个方向，跨帧累积
     bool progressive = false;
     int progFrames = 184;          // 默认一个完整周期（R=32 时 D=184）
+    int pack = 0;                  // 每像素原子加次数：0=3 次 1=2 次 2=1 次
+    int fieldScale = 1;            // 光场降采样倍率（1=关，2/3/4）
+    bool tiled = false;            // 分块 + shared 合并（列波前）
     // 角度可压缩性实验：只用前 N 个方向渲染，然后按 K/N 放大以便与全量对比。
     // 误差越小 -> 有效角度自由度越少 -> 低阶角度基/降方向数越有希望。
 };
@@ -110,6 +113,12 @@ bool parseArgs(int argc, char** argv, Options& o) {
         } else if (a == "--progressive") {
             o.progressive = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') o.progFrames = atoi(argv[++i]);
+        } else if (a == "--field-scale") {
+            const char* v = next("--field-scale"); if (!v) return false; o.fieldScale = atoi(v);
+        } else if (a == "--tiled") {
+            o.tiled = true;
+        } else if (a == "--pack") {
+            const char* v = next("--pack"); if (!v) return false; o.pack = atoi(v);
         } else {
             fprintf(stderr, "[cli] 未知参数: %s\n", a.c_str());
             usage();
@@ -346,6 +355,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     sweep.settings().rayRadius = opt.radius;
+    sweep.setAtomicPack(opt.pack);
+    sweep.setFieldScale(opt.fieldScale);
+    if (opt.tiled) sweep.setTiledScan(true);   // 不显式指定时让 autotune 自己选
     sweep.settings().emitScale = opt.emit;
     // 诊断开关（见 LightSettings::debugScan）。留一个环境变量入口，
     // 是为了在排查光照问题时不必每次改代码重编。

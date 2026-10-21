@@ -367,7 +367,6 @@ private:
     void renderLayerTiled(int layer);        // 分块 + shared 合并（列波前）
     void downsampleField(int layer);         // 生成 (fw_,fh_) 的光场输入副本
     void ensureFieldTextures();              // 按 fieldScale_ 懒分配光场副本
-    void applyFieldBlur();                   // 方向扩散：对光场做可分离模糊
     // 诊断：回读掩码，打印每层"需要细化"的块占比（与 CPU 统计对齐用）
     void clearAccumLayer(int layer);
 
@@ -408,11 +407,6 @@ private:
     GLuint fieldCanvas_ = 0, fieldMat_ = 0, fieldDownProg_ = 0;
     GLuint fieldMask_ = 0;      // (fw_,fh_): 1 = 该块需要全分辨率细化
     GLuint fineField_ = 0;      // 全分辨率细算结果（仅细化块内有效）
-    // 方向扩散的新实现：光场算完后做一次可分离模糊（替代扫描内核里"沿射线
-    // 每 K 步交换相邻射线"的旧做法 —— 那个做法会在大面积渐变上留下横向带纹）。
-    GLuint scanTmp_ = 0;        // 模糊用的中转纹理（与 scanTex_ 同尺寸）
-    GLuint blurProg_ = 0;
-    GLint uBlur_cs = -1, uBlur_src = -1, uBlur_dir = -1, uBlur_w = -1, uBlur_r = -1;
     int fieldScale_ = 1;
     bool refine_ = false;   // Adaptive：粗趟 + 细趟（实验）
     int scanW_ = 0, scanH_ = 0;   // scanTex_ 当前的实际尺寸（必须等于光场尺寸）

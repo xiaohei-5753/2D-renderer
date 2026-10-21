@@ -104,23 +104,29 @@ layout(std430,binding=1)readonly buffer DirBuf{ivec2 dirs[];};
 // 改成全局暂存后，就能**一次 dispatch 覆盖所有方向**（z 维 = 方向），
 // 代价是每个片段边界要写/读一次显存。实测这一版明显更快。
 //
-// 注意：这里**不需要 barrier** —— 每个线程只写自己的槽、只读邻居的槽，
-// 而邻居的槽在它的片段里已经写过了（同一片段内不互相依赖）。
+// ## 同步（2026-10 修正）
+// 旧注释说"不需要 barrier"是**错的**：写自己的槽之后立刻读邻居，跨 warp /
+// 跨 workgroup 的邻居会读到上一片段的值，混入比例随 warp 变化 = 横向带纹。
+// 现在改成**双缓冲 + 每片段一道 barrier**（见文件末尾的交换段），既消除竞争，
+// 又比对就地缓冲做两道 barrier 便宜。
 layout(std430,binding=2)buffer CarBuf{vec4 carry[];};
 // 每个方向的射线数上限（与 host 的 chunks 计算一致）。暂存按
 // [方向][射线] 排布，所以这个常量必须是两个 kernel 都认同的值。
-const int HRAYS=65536;
+// 每个方向的射线数上限：由 host 传入（原来是常量 65536，按 368 方向会白占 386MB）。
+uniform int u_hrays;
 void main(){
   int ri=int(gl_GlobalInvocationID.x);
   int dz=int(gl_GlobalInvocationID.z);          // 方向索引（单次 dispatch，z 维 = 方向）
   ivec2 ud=dirs[dz];
-  if(u_band==1&&!(ud.x==0||ud.y==0))return;
-  if(u_band==2&&(ud.x==0||ud.y==0))return;
+  // 早退会让 workgroup 里部分 lane 跳过 barrier（UB），改成标志位
+  const bool bandOk = !(u_band==1&&!(ud.x==0||ud.y==0)) && !(u_band==2&&(ud.x==0||ud.y==0));
   int dx=abs(ud.x),dy=abs(ud.y);
   int sx=(ud.x>=0)?1:-1,sy=(ud.y>=0)?1:-1,W=u_cs.x,H=u_cs.y;
   int rc=(dx>=dy)?(2*H+1):(2*W+1);
+  const bool inRange = ri < ((rc+255)/256)*256;   // 早退的等价物（barrier 要求全体到达）
+  const bool laneOk = bandOk && inRange;
   // 与 kScanComp 完全相同的线程集合（补齐到 256 的整数倍）
-  if(ri>=((rc+255)/256)*256)return;
+
   int x,y;if(dx>=dy){x=(sx>0)?0:W-1;y=-H+ri;}else{x=-W+ri;y=(sy>0)?0:H-1;}
   vec3 lt=u_ambient;float invN=1.0/float(max(1,u_bandn));int er=dx-dy;
   int lastKey=-1;
@@ -153,6 +159,7 @@ void main(){
   bool alive=true;
   for(int it=0;it<iters;it++){
     // --- 走 step 步（与 kScanComp 的内层相同，只多一个 alive 守卫）---
+    if(laneOk){
     for(int s=0;s<step;s++){
       if(alive&&x>=0&&x<W&&y>=0&&y<H){
         ivec3 sp;
@@ -168,10 +175,13 @@ void main(){
         vec3 em=mt.rgb*u_emit_scale;
         lt=lt*mix(vec3(1.0),cc.rgb,cov)*(1.0-cov)+em;
         lt+=em*(1.0-cov)*u_cp;
-        int bi=(y*W+x)*3;
+        // ⚠️ 必须和主内核/copy 一致用 **SoA**（三个通道各占一个 W*H 平面）。
+        // 原来这里是 AoS（bi=(y*W+x)*3），而 copy 按 SoA 解码 —— 开扩散时
+        // 光场被写乱，表现为整幅横向带纹；关扩散走主内核所以干净。
+        int bi=y*W+x;int wh=W*H;
         vec3 add=lt*invN;
-        atomicAdd(d[bi  ],uint(clamp(add.r,0.0,1.0)*65535.0));
-        atomicAdd(d[bi+1],uint(clamp(add.g,0.0,1.0)*65535.0));
+        atomicAdd(d[bi+wh],uint(clamp(add.g,0.0,1.0)*65535.0));
+        atomicAdd(d[bi+2*wh],uint(clamp(add.b,0.0,1.0)*65535.0));
         atomicAdd(d[bi+2],uint(clamp(add.b,0.0,1.0)*65535.0));
       }
       if(!alive)break;
@@ -188,19 +198,34 @@ void main(){
     //     L_i' = (1 - 2g)L_i + g(L_{i-1} + L_{i+1}),   g = w/(1+2w)
     // 权重和恒为 1 → **总能量守恒**（可测：与基线一致）。
     //
-    // 为什么不需要 barrier：每个线程只写**自己**的槽、只读邻居的槽；
-    // 邻居的槽由它在**本片段**里写入（先写槽、再读邻居，同一片段内不循环
-    // 依赖）。暂存数组按 (方向, 射线) 索引，不同方向互不干扰。
+    }   // if(laneOk)
     if(u_diff>0.0){
-      const int base=dz*HRAYS;
-      carry[base+ri]=vec4(lt,1.0);
-      const float g=u_diff/(1.0+2.0*u_diff);
-      // 邻居 = 相邻射线（射线是平行线，索引相邻即沿垂直方向相邻）
-      const int r0=(ri>0)?ri-1:ri;
-      const int r1=ri+1;
-      vec3 t0=carry[base+r0].xyz;
-      vec3 t1=(r1<HRAYS)?carry[base+r1].xyz:t0;
-      lt=(1.0-2.0*g)*lt+g*(t0+t1);
+      // ## 双缓冲交换（每个片段一道 barrier）
+      //
+      // 就地缓冲需要"写 -> barrier -> 读 -> barrier"两道同步，而且跨 workgroup 的
+      // 邻居本来就同步不到。改成两份缓冲交替：本片段写 cur，读 prev（上一片段已
+      // 全部写完，且中间有 barrier），所以每片段只要一道 barrier。
+      //
+      // 权重（用户规格）：L_i <- (L_i + w*L_{i-1} + w*L_{i+1}) / (1+2w)
+      //     L_i' = (1 - 2g)L_i + g(L_{i-1} + L_{i+1}),  g = w/(1+2w)
+      // 权重和恒为 1 → 总能量守恒。
+      const int base=dz*u_hrays;
+      const int halfSize=u_hrays*u_ndirs;          // 一份缓冲的大小（方向 × 射线）
+      const int cur=(it&1)*halfSize;
+      const int prev=(1-(it&1))*halfSize;
+      if(laneOk)carry[cur+base+ri]=vec4(lt,1.0);
+      // 只同步"本片段写完了"，读的是上一片段的数据（天然不冲突）
+      memoryBarrier();
+      barrier();
+      if(it>0&&laneOk){
+        const float g=u_diff/(1.0+2.0*u_diff);
+        // 邻居 = 相邻射线（射线是平行线，索引相邻即沿垂直方向相邻）
+        const int r0=(ri>0)?ri-1:ri;
+        const int r1=ri+1;
+        vec3 t0=carry[prev+base+r0].xyz;
+        vec3 t1=(r1<u_hrays)?carry[prev+base+r1].xyz:t0;
+        lt=(1.0-2.0*g)*lt+g*(t0+t1);
+      }
     }
   }
 })";
@@ -2017,10 +2042,14 @@ void LightSweep::renderLayer(int layer) {
         glUniform1i(uScan_.contig_d, contiguousFetch_ ? 1 : 0);
         glUniform1f(uScan_.diff, diffuse_);
         glUniform1i(uScan_.diffstep, std::max(1, diffuseStep_));
+        // 双缓冲 carry：每个方向的射线数上限（补齐到 256 的倍数，和 kernel 的 rc 一致）
+        const int hrays = ((2 * std::max(w_, h_) + 1 + 255) / 256) * 256;
+        glUniform1i(glGetUniformLocation(scanDiffProg_, "u_hrays"), hrays);
         glUniform1i(uScan_.diffdbg, diffuseDbg_);
         // 暂存：[方向][射线] 各一个 vec4。按需扩容，避免每帧重分配。
         {
-            const size_t need = (size_t)ndirs * (size_t)kCarryRays;
+            // 两份缓冲交替（双缓冲交换），每份 ndirs × hrays 个 vec4。
+            const size_t need = (size_t)ndirs * (size_t)hrays * 2;
             if (need > carryCap_) {
                 if (carrySSBO_) glDeleteBuffers(1, &carrySSBO_);
                 glGenBuffers(1, &carrySSBO_);

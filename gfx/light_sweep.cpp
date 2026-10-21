@@ -424,6 +424,32 @@ void main(){
 })";
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 方向扩散的后置实现：对光场做一次可分离模糊
+//
+// 旧做法是在扫描内核里"沿射线每 K 步交换相邻射线的 lt"。它在大面积渐变上会留下
+// 横向带纹（实测：渐变画布 + 扩散，相邻行跳变从 7 次涨到 20 次；K 改成 1/2/4/8
+// 都一样 —— 问题在**交换本身**，不是节奏）。扩散的本意是抹平"离散方向数造成的
+// 辐条"，那本质是光场上的低通滤波，所以在光场算完后做一次可分离模糊即可：
+// 只有 O(W*H)，且不可能产生沿射线的节奏类伪影。
+static const char* kFieldBlurComp = R"(#version 430 core
+layout(local_size_x=8,local_size_y=8)in;
+uniform sampler2D u_src;
+uniform ivec2 u_cs;
+uniform int u_dir;     // 0 = 横向，1 = 纵向
+uniform float u_w;     // 给邻居的比例（0..0.5）
+layout(rgba16f,binding=0)writeonly uniform image2D u_dst;
+void main(){
+  ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+  if(p.x>=u_cs.x||p.y>=u_cs.y)return;
+  ivec2 d=(u_dir==0)?ivec2(1,0):ivec2(0,1);
+  vec3 c=texelFetch(u_src,p,0).rgb;
+  vec3 a=texelFetch(u_src,clamp(p-d,ivec2(0),u_cs-1),0).rgb;
+  vec3 b=texelFetch(u_src,clamp(p+d,ivec2(0),u_cs-1),0).rgb;
+  vec3 r=c*(1.0-u_w)+(a+b)*(u_w*0.5);
+  imageStore(u_dst,p,vec4(r,1.0));
+})";
+
 // 光场降采样：把 canvas（albedo+覆盖率）与材质（自发光）按 s×s 盒式平均
 //
 // 为什么只降这两张而不降整个画面：扫描只在"光场"上跑，它输出的是**低频**的
@@ -1014,6 +1040,13 @@ bool LightSweep::init(int w, int h) {
     clearAccumProg_ = createComputeProgram("sweep/clear_accum", kClearAccumComp);
     hashCopyProg_ = createComputeProgram("sweep/hash_copy", kHashCopyComp);
     tileProg_ = createComputeProgram("sweep/scan_col", kScanColComp);
+    blurProg_ = createComputeProgram("sweep/field_blur", kFieldBlurComp);
+    if (blurProg_) {
+        uBlur_cs = glGetUniformLocation(blurProg_, "u_cs");
+        uBlur_src = glGetUniformLocation(blurProg_, "u_src");
+        uBlur_dir = glGetUniformLocation(blurProg_, "u_dir");
+        uBlur_w = glGetUniformLocation(blurProg_, "u_w");
+    }
     fieldDownProg_ = createComputeProgram("sweep/field_down", kFieldDownComp);
     rowProg_ = createComputeProgram("sweep/scan_row", kScanRowComp);
     if (!scanProg_ || !scanDiffProg_ || !copyProg_ || !blendProg_ || !hashProg_ ||
@@ -1905,6 +1938,7 @@ void LightSweep::renderLayerTiled(int layer) {
     glDispatchCompute((GLuint)((fW + 7) / 8), (GLuint)((fH + 7) / 8), 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
+    applyFieldBlur();          // 方向扩散（后置模糊，替代旧的射线内交换）
     blendLayer(layer);
     glUseProgram(0);
 }
@@ -2002,7 +2036,9 @@ void LightSweep::renderLayer(int layer) {
 
     // 光场降采样时先关掉扩散：细趟用的是普通扫描内核，两条路径混在一起会在块边界
     // 出现明显接缝（实测块状台阶）。关掉扩散后粗/细两趟口径一致。
-    if (diffuseEnable_ && diffuse_ > 0.0f && fieldScale_ <= 1) {
+    // 旧的"沿射线每 K 步交换"实现已停用：它在大面积渐变上会留下横向带纹。
+    // 现在扩散由 applyFieldBlur() 在光场算完后做一次可分离模糊（见该函数注释）。
+    if (false && diffuseEnable_ && diffuse_ > 0.0f) {
         glUseProgram(scanDiffProg_);
         glUniform1i(uScan_.cc_d, 0);
         glUniform1i(uScan_.mat_d, 1);
@@ -2118,6 +2154,7 @@ void LightSweep::renderLayer(int layer) {
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
     }
     // --- 4. 合成这一层，写进结果数组纹理的第 layer 层 ---
+    applyFieldBlur();          // 方向扩散（后置模糊，替代旧的射线内交换）
     blendLayer(layer);
 
     glUseProgram(0);
@@ -2125,6 +2162,41 @@ void LightSweep::renderLayer(int layer) {
 
 // 把 scanTex_（这一层的平面内光场）与自发光合成进 litArray_ 的第 layer 层。
 // 确定性扫描与"渐进哈希采样"两条路径共用它 —— 上游怎么算出 scanTex_ 不影响这里。
+// 方向扩散：光场 (scanTex_) -> 横向模糊 -> scanTmp_ -> 纵向模糊 -> scanTex_
+//
+// 只在 diffusionOn 且 w>0 时跑；两次 dispatch，成本 O(W*H)，比原来在射线里
+// 每 K 步交换便宜得多，也不会产生横向带纹。
+void LightSweep::applyFieldBlur() {
+    if (!blurProg_ || !scanTex_ || st_.diffusion <= 0.0f) return;
+    if (!scanTmp_) {
+        scanTmp_ = createTexture(GL_RGBA16F, w_, h_, GL_RGBA, GL_HALF_FLOAT);
+        glBindTexture(GL_TEXTURE_2D, scanTmp_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    // w 的含义沿用旧参数：0.02 轻 / 0.1 均衡 / 0.25 强
+    const float wgt = std::clamp(st_.diffusion * 2.0f, 0.0f, 0.5f);
+    glUseProgram(blurProg_);
+    glUniform2i(uBlur_cs, w_, h_);
+    glUniform1f(uBlur_w, wgt);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(uBlur_src, 0);
+
+    glBindTexture(GL_TEXTURE_2D, scanTex_);
+    glUniform1i(uBlur_dir, 0);
+    glBindImageTexture(0, scanTmp_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glDispatchCompute((GLuint)((w_ + 7) / 8), (GLuint)((h_ + 7) / 8), 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    glBindTexture(GL_TEXTURE_2D, scanTmp_);
+    glUniform1i(uBlur_dir, 1);
+    glBindImageTexture(0, scanTex_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glDispatchCompute((GLuint)((w_ + 7) / 8), (GLuint)((h_ + 7) / 8), 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    glUseProgram(0);
+}
+
 void LightSweep::blendLayer(int layer) {
     glUseProgram(blendProg_);
     glActiveTexture(GL_TEXTURE0);
@@ -2258,6 +2330,7 @@ void LightSweep::renderLayerProgressive(int layer) {
     glMemoryBarrier(GL_ALL_BARRIER_BITS);
 
     // --- 4. 与自发光合成（与确定性扫描共用）---
+    applyFieldBlur();          // 方向扩散（后置模糊，替代旧的射线内交换）
     blendLayer(layer);
     glUseProgram(0);
 }
